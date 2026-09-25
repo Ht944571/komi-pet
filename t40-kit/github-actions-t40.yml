@@ -1,0 +1,33 @@
+# T4.0 在 CI 的 macOS runner 上跑（可选路径；真机仍需确认 Retina DPI）
+# 用法：把本文件放进仓库 .github/workflows/t40.yml，push 触发，产物在 artifacts
+name: t40-probe
+on:
+  workflow_dispatch:
+  push:
+    paths: ["t40-kit/**"]
+
+jobs:
+  probe:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译并启动探针（后台 30s）
+        working-directory: t40-kit/tauri-app
+        run: |
+          npm install
+          npm run tauri build -- --no-bundle &
+          APP_PID=$!
+          sleep 420        # 首次拉 crates + 编译，macOS runner 约几分钟
+          wait $APP_PID
+      - name: 截屏（编译产物存在性 + 运行截图）
+        run: |
+          mkdir -p report
+          screencapture -x report/ci-screen.png || true
+          find t40-kit/tauri-app/src-tauri/target -name "t40-probe" -o -name "*.app" | tee report/artifacts.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: t40-report
+          path: t40-kit/report/

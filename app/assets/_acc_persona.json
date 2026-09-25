@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "note": "配件 persona 声明：哪个 agent 让古见佩戴什么、以及怎么判定它『正在使用』。新增 agent 只加一行，不要改代码。",
+  "presence_note": "procs=进程名精确匹配；ports=本机监听端口（给没有独立窗口的 web 型 agent，如 DSH）。任一命中即视为活跃。",
+  "agents": {
+    "workbuddy": {
+      "accessory": "cat",
+      "label": "WorkBuddy",
+      "accent": "#F2A0AE",
+      "why": "小黑猫在古见身边溜达玩耍",
+      "presence": { "procs": ["WorkBuddy.exe"] }
+    },
+    "zcode": {
+      "accessory": "beret",
+      "label": "ZCode",
+      "accent": "#39406B",
+      "why": "古见自己戴上复古小纽扣贝雷帽",
+      "presence": { "procs": ["ZCode.exe"] }
+    },
+    "deepseek-harness": {
+      "accessory": "whale_plush",
+      "label": "DeepSeek Harness",
+      "accent": "#5B7CFA",
+      "why": "古见抱着鲸鱼玩偶",
+      "presence": { "ports": [3080] }
+    }
+  }
+}

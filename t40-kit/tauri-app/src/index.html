@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>T4.0 probe</title>
+<style>
+  /* 棋盘格：透明是否生效一眼可见（透出桌面 = 达标） */
+  html,body{margin:0;height:100%;
+    background:repeating-conic-gradient(#888 0 25%,#fff 0 50%) 0 0/28px 28px;
+    font:15px/1.5 -apple-system,"PingFang SC",sans-serif;color:#111}
+  #box{position:absolute;inset:14px;padding:14px;border-radius:14px;
+    background:rgba(20,24,40,.82);color:#eef}
+  b{color:#7fd} h1{font-size:18px;margin:0 0 8px}
+  code{background:#0008;padding:1px 6px;border-radius:6px}
+  #hint{color:#ffd27f}
+</style>
+</head>
+<body>
+<div id="box">
+  <h1>T4.0 选型验证探针</h1>
+  <div>① 透明：<b id="t1">目测 —— 棋盘格处应透出桌面背景</b></div>
+  <div>② 穿透：<b id="t2">初始「开」：鼠标点此窗口应落到下层</b></div>
+  <div style="margin:8px 0"><code>空格</code> = 切换点击穿透（穿透时键盘仍可用）</div>
+  <div>③ DPI：<b id="dpi">…</b></div>
+  <div id="hint">状态：穿透中 —— 把鼠标移到本窗口上试试，再看下层是否响应</div>
+</div>
+<script>
+  const { invoke } = window.__TAURI__.core;
+  const win = window.__TAURI__.window.getCurrentWindow();
+  let through = true;
+
+  function render() {
+    document.getElementById("t2").textContent =
+      through ? "初始「开」：鼠标点此窗口应落到下层"
+              : "已「关」：鼠标可以点中本窗口的按钮/文字";
+    document.getElementById("hint").textContent =
+      through ? "状态：穿透中 —— 把鼠标移到本窗口上试试，再看下层是否响应"
+              : "状态：可交互 —— 现在点击窗口，按钮应有反应";
+  }
+  async function apply() {
+    await invoke("set_click_through", { enabled: through });
+    render();
+  }
+  window.addEventListener("keydown", async (e) => {
+    if (e.code === "Space") { e.preventDefault(); through = !through; await apply(); }
+  });
+  // 一个可点击元素：穿透关掉后点它应有弹窗，证明窗口真正接收输入
+  function poke() { alert("窗口收到了点击 —— 穿透关闭 ✓"); }
+  document.getElementById("t2").addEventListener("click", poke);
+
+  async function dpi() {
+    const info = await invoke("dpi_info");
+    const dpr = window.devicePixelRatio;
+    document.getElementById("dpi").textContent =
+      `devicePixelRatio=${dpr}  scale_factor=${info.scale_factor}  ` +
+      `物理=${info.physical.w}×${info.physical.h}  逻辑=${Math.round(info.logical.w)}×${Math.round(info.logical.h)}` +
+      `（Retina 屏应为 2.0；窗口拖到外接屏后数值应随屏变化）`;
+  }
+  win.onResized(() => { dpi(); });
+  dpi();
+  apply();
+</script>
+</body>
+</html>

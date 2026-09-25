@@ -1,0 +1,18 @@
+# ---- 大文件 / 本地状态（绝不上传）----
+# 注意：.gitignore 不支持行内注释，注释必须独立成行（踩过一次）
+app/wb_usage/data/
+app/.whale_settings.json
+app/.whale_pos.json
+app/wb_paths.json
+*.db
+*.db-wal
+*.db-shm
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- 临时 / 测试残留 ----
+app/tools/_tmp_*
+_tmp_*
+*.log
