@@ -19,6 +19,7 @@ CLI:
 
 import ctypes
 import ctypes.wintypes as wt
+import json  # 供 _pet_entry() 读取 pet_mode
 import os
 import subprocess
 import sys
@@ -30,6 +31,32 @@ import time
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 HOVER_ENTRY = os.path.join(SCRIPTS_DIR, "hover.py")
+PET3D_ENTRY = os.path.join(SCRIPTS_DIR, "wb_pet3d.py")
+
+
+def _pet_entry():
+    """选择桌宠入口：默认 2D（`hover.py`）；设置 `pet_mode: "3d"` 时改为 3D（`wb_pet3d.py`）。
+
+    为什么要这样做：自启项里已经有守望在拉桌宠，如果再单独给 3D 加一条 Run，
+    就会**同时跑起两个桌宠**。用模式切换可以保证只起一个，且仍然由守望托管（崩溃自愈）。
+    """
+    # ⚠️ 不要静默吞异常：缺 import / 键名写错都会悄悄退回 2D，很难查。明确打印原因。
+    path = os.path.join(SCRIPTS_DIR, ".whale_settings.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        mode = str(st.get("pet_mode", "2d")).lower()
+        if mode == "3d":
+            if os.path.isfile(PET3D_ENTRY):
+                return PET3D_ENTRY
+            print(f"[watcher] pet_mode=3d 但找不到 {PET3D_ENTRY}，回退 2D", file=sys.stderr)
+        elif mode != "2d":
+            print(f"[watcher] pet_mode 非法: {mode!r}（只支持 2d/3d），回退 2D", file=sys.stderr)
+    except FileNotFoundError:
+        pass                                   # 没设置文件 = 默认 2D，正常
+    except Exception as e:
+        print(f"[watcher] 读取 pet_mode 失败({type(e).__name__}: {e})，回退 2D", file=sys.stderr)
+    return HOVER_ENTRY
 
 WORKBUDDY_EXE = "WorkBuddy.exe"
 WHALE_CLASS = "WBWhalePetClass"      # 桌宠主窗口类名（wb_whale_win.py 注册，历史名保留）
@@ -109,7 +136,7 @@ def spawn_whale():
     env = dict(os.environ)
     env["WB_PET_LINKED"] = "1"
     subprocess.Popen(
-        [pythonw, HOVER_ENTRY],
+        [pythonw, _pet_entry()],
         cwd=SCRIPTS_DIR, close_fds=True,
         creationflags=flags, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

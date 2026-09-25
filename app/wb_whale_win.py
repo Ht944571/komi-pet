@@ -270,7 +270,9 @@ IDM_PIN = 1009                 # 锁定聚焦（pin）开关（跟随模式 P3�
 IDM_TIMELINE0 = 1400           # 1400：今日时间线摘要项；1401+i ↔ 最近轮次[i]
 IDM_FOCUS0 = 1450              # 1450+i ↔ 手动聚焦候选[i]（登记册启用 agent）
 IDM_HANDOFF = 1010             # 生成接续摘要 → 剪贴板（跟随模式 P4；仅角标活跃时出现）
+IDM_MODE3D = 1011              # 切换到 3D 桌宠（P0-②：写 pet_mode → 退出 → 守望拉起 3D）
 ID_HOTKEY_FOLLOW = 1           # 全局热键 id（RegisterHotKey 的 id 命名空间独立于定时器）
+PET_MODE = "2d"                # 本文件的形态标识（wb_pet3d.py 为 "3d"；pet_mode 在共享设置里）
 IDM_SCALE0 = 1100              # 1100+i ↔ SCALES[i]
 SCALES = (0.6, 0.8, 1.0, 1.5, 2.0, 2.5)
 IDM_QUALITY0 = 1200            # 1200+i ↔ QUALITY_CHOICES[i]
@@ -994,6 +996,8 @@ class WhalePet:
             self._follow_focus = {"key": self._focus_pin_key,
                                   "accent": _spec.get("accent"),
                                   "kind": "pin", "t0": 0.0}
+        # ---- P0-② 实时切换：轮询共享设置的 pet_mode，变了 → 优雅退出 → 守望拉起新形态 ----
+        self._mode_check_at = 0.0
         # ---- P4 接续：刚离开的 agent"似乎未结束" → 领结徽章角标；摘要用户触发 ----
         self._handoff = None            # {"key","title","since"} 或 None
         self._follow_hook = None
@@ -1074,17 +1078,28 @@ class WhalePet:
 
     def _save_settings(self):
         try:
+            # 合并写入：.whale_settings.json 里还有 pet_mode（守望/3D 共享），
+            # 整体重写会把别人的键抹掉（踩过：2D 保存后 pet_mode 丢失 → 切换失效）
+            data = {}
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                pass
+            data.update({"sound": self.sound_on, "scale": self.scale,
+                         "bubble": self.bubble_on,
+                         "quality": self._quality,
+                         "style": self.style,
+                         "accessories": self.acc_on,
+                         "ok_autodismiss": self.ok_autodismiss_on,
+                         "linked_close": self.linked_close_on,
+                         "follow": self.follow_on,
+                         "focus_pin": self.focus_pin,
+                         "focus_pin_key": self._focus_pin_key})
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump({"sound": self.sound_on, "scale": self.scale,
-                           "bubble": self.bubble_on,
-                           "quality": self._quality,
-                           "style": self.style,
-                           "accessories": self.acc_on,
-                           "ok_autodismiss": self.ok_autodismiss_on,
-                           "linked_close": self.linked_close_on,
-                           "follow": self.follow_on,
-                           "focus_pin": self.focus_pin,
-                           "focus_pin_key": self._focus_pin_key}, f)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -1184,6 +1199,53 @@ class WhalePet:
         self._follow_tracker.force(key)
         self._report_event("follow_manual", detail=key)
         self._drawn_sig = None
+
+    # ---- P0-② 实时切换：读共享设置的 pet_mode，与本形态不同 → 优雅退出 ----
+    def _check_pet_mode(self, settings=None):
+        """读共享设置；pet_mode 与本形态不同 → True（调用方优雅退出，
+        守望 5s 内拉起新形态）。settings 传 dict 供测试注入。"""
+        try:
+            data = settings
+            if data is None:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            mode = str((data or {}).get("pet_mode", PET_MODE)).lower()
+            return mode not in ("", PET_MODE)
+        except Exception:
+            return False
+
+    def _switch_mode_quit(self):
+        """写回本形态无关（pet_mode 已由菜单/外部改好）→ 事件 + 退出。
+        PostQuitMessage 走 tick 的正常收尾（保存设置等）。"""
+        self._report_event("pet_mode_switch", detail="3d")
+        _user32.PostQuitMessage(0)
+
+    def _check_pet_mode_tick(self, now):
+        """每 2s 轮询一次（tick 每秒都在跑，用时间分频）。
+        ⚠️ 只对**守望拉起**的桌宠生效（linked_expected）——手动启动的 2D 不该被
+        设置文件隐式杀掉；测试里未设 WB_PET_LINKED → 自动跳过。"""
+        if not self._linked_expected:
+            return
+        if now >= self._mode_check_at:
+            self._mode_check_at = now + 2.0
+            if self._check_pet_mode():
+                self._switch_mode_quit()
+
+    def _switch_to_3d(self):
+        """P0-②：写 pet_mode="3d" → 优雅退出 → 守望 5s 内拉起 3D。"""
+        try:
+            data = {}
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+            data["pet_mode"] = "3d"
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        self._report_event("pet_mode_switch", detail="3d")
+        _user32.PostQuitMessage(0)
 
     # ---- P4 接续：摘要生成（用户触发才生成；必过脱敏；复制到剪贴板）----
     def _copy_to_clipboard(self, text):
@@ -2143,6 +2205,8 @@ class WhalePet:
             self._set_bubble_mode(BUBBLE_DEFAULT, now)
         # ③.6 OK 态自动消失：用户回到对话窗口 + 窗口重新获得焦点 → 平滑淡出
         self._ok_focus_check(now)
+        # P0-② 实时切换：pet_mode 变了 → 优雅退出（守望拉起新形态）
+        self._check_pet_mode_tick(now)
         # ③.7 跟随模式：前台 → agent（钩子即时/轮询兜底 → 解析 → 去抖 → 徽章）
         self._follow_tick(now)
         # ④ 空闲自主行为调度（用户交互/反应期间暂停）
@@ -3414,6 +3478,9 @@ class WhalePet:
         _user32.AppendMenuW(
             menu, MF_STRING | (MF_CHECKED if self.focus_pin else 0),
             IDM_PIN, "锁定聚焦（pin）")
+        _user32.AppendMenuW(
+            menu, MF_STRING,
+            IDM_MODE3D, "切换到 3D 桌宠")
         # P2 连续锚点：今日时间线（跨 agent 轮次，点条目开看板）
         _tl_summary, _tl_recent = self._today_timeline()
         subt = _user32.CreatePopupMenu()
@@ -3520,6 +3587,8 @@ class WhalePet:
             self._toggle_focus_pin()
         elif cmd == IDM_HANDOFF:
             self._gen_handoff()
+        elif cmd == IDM_MODE3D:
+            self._switch_to_3d()
         elif cmd == IDM_QUIT:
             self._report_event("menu_quit")
             _user32.PostQuitMessage(0)

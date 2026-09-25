@@ -46,7 +46,17 @@ check("A2: 空数据 → 空串（调用方回退）", W.format_timeline_summary
 print("\n[B] today_timeline 数据层（真库只读，v_turn_total 零新链路）")
 db = os.path.join(APP, "wb_usage", "data", "wb_usage_dw.db")
 summary, recent = today_timeline(db)
-check("B1: 本机有今日数据 → summary 非空", len(summary) > 0, f"summary={summary}")
+import sqlite3 as _s3
+_c = _s3.connect(f"file:{db}?mode=ro", uri=True)
+_today_n = _c.execute(
+    "SELECT COUNT(*) FROM v_turn_total WHERE day = date('now','localtime') AND agent != ''"
+).fetchone()[0]
+_c.close()
+if _today_n:
+    check("B1: 今日有轮次 → summary 非空", len(summary) > 0, f"summary={summary}")
+else:
+    check("B1: 今日暂无轮次 → summary 为空也一致（午夜跨天不误报）",
+          summary == [], f"summary={summary}")
 check("B2: summary 形状 = (agent, int 轮次)",
       all(isinstance(k, str) and isinstance(n, int) for k, n in summary))
 check("B3: recent 形状 = (HH:MM, agent, 标题)",

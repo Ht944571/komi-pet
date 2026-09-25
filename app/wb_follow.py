@@ -105,6 +105,26 @@ def handoff_last_turn(db_path, agent_key, now, window_s=None):
         return None
 
 
+def linked_should_quit(seen, empty_since, agents, now, grace_s,
+                       linked_expected=False):
+    """联动关闭判定（纯函数；三值语义对齐 2D：宁可留着，不误杀）。
+
+    agents = 本轮探测到的活跃 agent 集合；None 表示探测失败（保持原状不判定）。
+    linked_expected：守望拉起时为 True——此时即使从未探测到 agent，
+    宽限后也自退（防孤儿；2D 的 B9 语义）。
+    返回 (quit, seen', empty_since')。
+    """
+    if agents is None:
+        return False, seen, empty_since
+    if agents:
+        return False, True, None
+    if not (seen or linked_expected):
+        return False, seen, empty_since          # 手动跑（非守望拉起）不误杀
+    if empty_since is None:
+        empty_since = now
+    return (now - empty_since >= grace_s), seen, empty_since
+
+
 def cycle_next(keys, current):
     """P3 全局热键的手动聚焦轮换：返回下一个聚焦 key。
 

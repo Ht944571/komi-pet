@@ -197,7 +197,10 @@ check("E2: completion/thinking/total 映射", u["completion_tokens"] == 40
 check("E3: cost_usd 随行", row["cost_usd"] == 0.5)
 check("E4: line_no 稳定（幂等）",
       row["line_no"] == CC._stable_line_no("ccusage:claude:2026-09-24"))
-check("E5: 日期 → 当日中午 ts", abs(row["ts_ms"] - (NOW - DAY) * 1000) < 13 * 3600 * 1000)
+import time as _t
+_noon = _t.mktime((2026, 9, 24, 12, 0, 0, 0, 0, -1)) * 1000   # 固定日期正午（本地）
+check("E5: 日期 → 当日中午 ts（确定性比较）",
+      abs(row["ts_ms"] - _noon) < 60 * 1000)
 
 cdir = os.path.join(tmpdir, "ccusage-cache")
 os.makedirs(cdir, exist_ok=True)

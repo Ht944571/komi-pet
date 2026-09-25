@@ -1,0 +1,12 @@
+{
+  "yaw": 8.0,
+  "pitch": 4.0,
+  "dist": 3.85,
+  "pos": [
+    1290.5947908342666,
+    328.6691824935063
+  ],
+  "wander": true,
+  "follow": true,
+  "bubble": true
+}
