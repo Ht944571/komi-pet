@@ -459,3 +459,15 @@ T1 / T2 / T3 与关键路径**并行**，互不阻塞
 > ② GitHub 仓库/账号确认 → 启用 `t40-kit/github-actions-t40.yml`；
 > ③ 用户重新登录 → 迁移收尾（`py wb_whale_watcher.py --status` 核查遗留
 >   归零，删除旧技能目录及其 2.4GB 旧库）。
+>
+> 🟢 **2026-09-25 仓库已创建并推送**：https://github.com/Ht944571/komi-pet
+> （公开，MIT，231 文件，主分支 main；.gitignore 已排除 989MB 数仓与本机
+> 设置/路径文件）。**CI 启用差最后一步**：推送时令牌缺 `workflow` scope
+> （refusing to allow a Personal Access Token to create or update workflow），
+> `.github/workflows/t40.yml` 尚未入仓——二选一：
+> a) 给令牌补 `workflow` scope（token 编辑页勾选 workflow → Update），说一声
+>    后由会话推送 `t40-kit/github-actions-t40.yml`；
+> b) 网页操作：仓库 Add file → 创建 `.github/workflows/t40.yml`，内容拷自
+>    `t40-kit/github-actions-t40.yml` → Actions 页签 Run workflow。
+> 本地仓库已 `git remote add origin`（推送用一次性令牌 URL，未存进 .git/config；
+> 令牌用完请撤销）。
