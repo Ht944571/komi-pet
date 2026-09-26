@@ -1026,7 +1026,8 @@ class WhalePet:
         self._follow_seen_seq = -1      # 动画帧已消费的序号（-1 → 首帧即解析一次）
         self._follow_poll_n = 0         # 轮询兜底分频
         # ---- P2 连续锚点：跨 agent 统一时间线（10s 缓存，纯查询零新链路）----
-        self._timeline_cache = None     # (at, (summary, recent))
+        self._timeline_cache = None     # (at, (summary, recent)) 只读缓存，UI 线程绝不查库
+        self._timeline_busy = False     # 后台刷新进行中
         # ---- P3 pin：锁定聚焦（锁定后跟随不覆盖；手动切换走「手动聚焦」子菜单）----
         self.focus_pin = bool(self._settings.get("focus_pin", False))
         self._focus_pin_key = self._settings.get("focus_pin_key") or None
@@ -1086,6 +1087,8 @@ class WhalePet:
         self._recreate_window(place=True)
         self.tick()
         self._arm_timers()                # 统一挂载定时器（hwnd 变化后需重新挂载）
+        # 启动时后台预热时间线：首次右键/首批气泡就不用等（查库 3.6s 全在后台线程）
+        self._kick_timeline_refresh()
         # P3 全局热键（Ctrl+Alt+F9 手动聚焦轮换）：绑定桌宠 hwnd，
         # WM_HOTKEY 走既有消息泵；组合被占用 → 静默降级（右键菜单仍是兜底）
         self._install_follow_hotkey()
@@ -2631,13 +2634,42 @@ class WhalePet:
 
     # ---- 跟随模式（设计文档 P1）：前台 → agent，去抖 + 未知态 ----
     def _today_timeline(self):
-        """P2 连续锚点：今天跨 agent 轮次统计 + 最近轮次（10s 缓存）。"""
+        """P2 连续锚点：今天跨 agent 轮次统计 + 最近轮次。
+
+        ⚠️ **绝不在 UI 线程查库**（2026-09-26 性能修复）。
+        原来这里是 10s 缓存 + 过期就同步查；但 `today_timeline()` 打在一个**视图**
+        `v_turn_total` 上（视图无法建索引 → 跨 1GB 基础表扫描），实测**单次 3.4~3.7 秒**。
+        而这个函数被两处 UI 线程调用：
+          · 右键菜单构建（`context_menu`）
+          · 气泡文案构建（row3 副标）
+        后果：右键要等 3.6 秒才弹菜单；气泡刷新时只要缓存过期同样冻 3.6 秒
+        —— 用户反馈的"右键卡顿"与"平时卡"就是这个。
+
+        现在的策略：**只读缓存，过期就丢给后台线程去刷**，本函数立即返回。
+        代价是数据最多晚一轮（第一次打开可能显示"统计中"），换来 UI 永不卡。
+        """
         now = time.time()
-        if self._timeline_cache and now - self._timeline_cache[0] < 10.0:
-            return self._timeline_cache[1]
-        data = today_timeline(self.db_path)
-        self._timeline_cache = (now, data)
-        return data
+        cached = self._timeline_cache
+        if not cached or now - cached[0] > 10.0:
+            self._kick_timeline_refresh()        # 后台去查（非阻塞）
+        return cached[1] if cached else ([], [])
+
+    def _kick_timeline_refresh(self):
+        """在后台线程刷新时间线缓存（同一时刻只跑一个）。"""
+        if self._timeline_busy:
+            return
+        self._timeline_busy = True
+
+        def work():
+            try:
+                data = today_timeline(self.db_path)
+                self._timeline_cache = (time.time(), data)
+            except Exception:
+                pass
+            finally:
+                self._timeline_busy = False
+
+        threading.Thread(target=work, daemon=True, name="timeline-refresh").start()
 
     def _install_follow_hook(self):
         """前台切换事件钩子（设计 §2.2 首选）。装不上 → 动画帧轮询兜底。"""
