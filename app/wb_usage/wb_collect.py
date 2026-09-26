@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import time
 
 from wb_common import extract_user_prompt          # noqa: F401  （供 WorkBuddy 源使用）
@@ -532,6 +533,18 @@ def collect_once(db_path=None, sources=None, full=False, verbose=True):
                 conn.execute("DELETE FROM meta WHERE key=?", (f"bhash:{path}",))
         meta_set(conn, "last_collect", time.strftime("%Y-%m-%d %H:%M:%S"))
         conn.commit()
+        # 物化 v_turn_total → dws_turn（2026-09-26 性能修复）。
+        # 采集循环几秒一轮，全量物化一次约 4s，所以：**只在真有新数据时**才刷新，
+        # 且 refresh_dws_turn 内部还有 30s 节流。读取方（桌宠/看板）只读这张表，
+        # 从 1.6~3.7 秒降到 ~0ms。
+        if inserted:
+            try:
+                from wb_dw import refresh_dws_turn
+                refresh_dws_turn(conn=conn, verbose=verbose)
+            except Exception as _e:
+                # 物化失败不能影响采集本身（注意：本模块没有 log_exception，别调用它）
+                if verbose:
+                    sys.stderr.write(f"[collect] dws_turn 物化失败：{_e}\n")
     finally:
         conn.close()
     if verbose:

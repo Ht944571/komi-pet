@@ -20,6 +20,7 @@ VIEW 实时查询，ODS 增量入库后聚合自动反映最新数据，无需�
 import argparse
 import os
 import sqlite3
+import time
 
 from wb_common import day_of, ts_to_str
 
@@ -259,6 +260,11 @@ def _ensure_views_conn(conn):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    # 物化表 dws_turn 的结构（空表，秒级）：读取方优先读它，避免每次全量算 v_turn_total
+    try:
+        ensure_dws_turn(conn)
+    except Exception:
+        pass          # 视图尚未建好等情况：不影响主流程，读取方会退回视图
     # 全新库兜底：ODS 表结构定义在 wb_collect；尚未采集过（表不存在）时按同一
     # schema 建空表，保证 VIEW 层可直接查询（README 直接启动场景不再报 no such table）
     ods_exists = conn.execute(
@@ -391,11 +397,93 @@ def session_latest_turns(conn, session_id, limit=10):
     return out
 
 
+# ---------------------------------------------------------------------------
+# dws_turn —— v_turn_total 的**物化快照**（2026-09-26 性能修复）
+# ---------------------------------------------------------------------------
+# 为什么需要它：
+#   v_turn_total 是「v_call → v_turn → UNION ALL」的多层视图，而 v_call 的 WHERE 里有
+#   json_extract(...)（每行 8 次 JSON 解析，**无法走索引**），且 day 是算出来的、
+#   过滤条件无法下推 —— 所以**任何**查询都是对 32 万行 ODS 的全量计算。
+#   实测同一条「今日各 agent 轮次数」：
+#       v_turn_total  1646 ~ 3700 ms     （取决于页缓存冷暖）
+#       dws_turn          0.0 ms
+#   数据一致性（行数 / credit / total_tokens 三项逐项核对）完全一致。
+#
+# 用法：ensure_dws_turn 建结构（秒级、幂等）；refresh_dws_turn 灌数据（一次全量 ~4s）。
+#   读取方 **应先读 dws_turn**，读不到再退回 v_turn_total。
+_DWS_TURN_BUILT_KEY = "dws_turn_built_at"
+
+
+def ensure_dws_turn(conn):
+    """保证物化表**结构**存在（空表；秒级、幂等）。不灌数据。"""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dws_turn'").fetchone()
+    if not row:
+        # CREATE TABLE AS ... WHERE 0：借视图拿列名与类型，但不产生行（快）
+        conn.execute("CREATE TABLE dws_turn AS SELECT * FROM v_turn_total WHERE 0")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dws_turn_day ON dws_turn(day)")
+    conn.commit()
+    return True
+
+
+def dws_turn_age(conn):
+    """距上次物化的秒数；从未物化 → None。"""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?",
+                           (_DWS_TURN_BUILT_KEY,)).fetchone()
+        if not row:
+            return None
+        return max(0.0, time.time() - float(row[0]))
+    except Exception:
+        return None
+
+
+def refresh_dws_turn(conn=None, db_path=None, min_interval_s=30.0, force=False,
+                     verbose=False):
+    """把 v_turn_total 重新物化进 dws_turn。
+
+    - min_interval_s：距上次物化不足这么久就跳过（采集循环每几秒跑一次，
+      不加节流会把 4s 的全量计算打得太频繁）
+    - 返回 True=本次真的重建了，False=跳过（未到间隔）
+    """
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(db_path or DEFAULT_DB, timeout=10)
+    try:
+        ensure_dws_turn(conn)
+        if not force:
+            age = dws_turn_age(conn)
+            if age is not None and age < min_interval_s:
+                return False
+        t0 = time.time()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM dws_turn")
+            conn.execute("INSERT INTO dws_turn SELECT * FROM v_turn_total")
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                         (_DWS_TURN_BUILT_KEY, str(time.time())))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        if verbose:
+            n = conn.execute("SELECT COUNT(*) FROM dws_turn").fetchone()[0]
+            print(f"[dw] dws_turn 已物化 {n} 行，用时 {time.time()-t0:.1f}s")
+        return True
+    finally:
+        if own:
+            conn.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description="WorkBuddy 数仓视图初始化")
     ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--refresh-dws", action="store_true",
+                    help="同时物化 dws_turn（v_turn_total 的快照）")
     args = ap.parse_args()
     ensure_views(args.db)
+    if args.refresh_dws:
+        refresh_dws_turn(db_path=args.db, force=True, verbose=True)
     print("[dw] VIEW 层就绪（ODS 增量入库后聚合自动最新）")
 
 

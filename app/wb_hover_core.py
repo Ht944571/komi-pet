@@ -369,14 +369,25 @@ def today_timeline(db_path, limit=8):
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
         try:
             day = conn.execute("SELECT date('now','localtime')").fetchone()[0]
+            # 优先读**物化表** dws_turn（v_turn_total 的快照，2026-09-26 性能修复）：
+            # 原视图是多层 VIEW + 每行 json_extract，实测 1646~3700ms；物化表 0.0ms。
+            # 退回条件：表不存在、或表还是空的（尚未物化）→ 用原视图，避免读到"假空"。
+            src = "v_turn_total"
+            try:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                "AND name='dws_turn'").fetchone() \
+                   and conn.execute("SELECT 1 FROM dws_turn LIMIT 1").fetchone():
+                    src = "dws_turn"
+            except Exception:
+                src = "v_turn_total"
             summary = conn.execute(
-                """SELECT agent, COUNT(*) FROM v_turn_total
+                f"""SELECT agent, COUNT(*) FROM {src}
                    WHERE day = ? AND agent != '' GROUP BY agent
                    ORDER BY 2 DESC LIMIT 3""", (day,)).fetchall()
             recent = conn.execute(
-                """SELECT agent, first_time,
+                f"""SELECT agent, first_time,
                           COALESCE(NULLIF(title, ''), NULLIF(project, ''), '')
-                     FROM v_turn_total WHERE day = ? AND agent != ''
+                     FROM {src} WHERE day = ? AND agent != ''
                      ORDER BY first_time DESC LIMIT ?""", (day, limit)).fetchall()
         finally:
             conn.close()
