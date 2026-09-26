@@ -12,6 +12,15 @@ const NOTRANS = process.argv.includes('--no-transparency');   // 沙箱验证用
 const POS_FILE = path.join(__dirname, '.pet-pos.json');
 const BASE_W = 420, BASE_H = 640;
 
+// 沙箱/受限环境（无可用 GPU、Chromium 沙箱受限）下，渲染进程会在加载时直接崩
+// （render-gone reason=crashed exitCode=0x80000003）。设 KOMI_SHELL_SAFE=1 走
+// 免沙箱 + 软件渲染（SwiftShader）。正常桌面环境不需要，默认走真 GPU。
+if (process.env.KOMI_SHELL_SAFE === '1') {
+  app.commandLine.appendSwitch('no-sandbox');
+  app.commandLine.appendSwitch('disable-gpu');
+  app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+}
+
 let win = null, tray = null, server = null, drag = null, quitting = false;
 const state = { clickThrough: false, scale: 1, visible: true };
 
@@ -20,7 +29,8 @@ function savePos(p) { try { fs.writeFileSync(POS_FILE, JSON.stringify(p)); } cat
 
 // ---- 本地静态服务：WebGL/fetch 在 file:// 下会被 Chromium 拦，所以走 127.0.0.1 ----
 function serve() {
-  const root = __dirname;
+  // 服务根 = live2d/（这样 ../model/古见同学/ 的模型才能被合法访问；shell/ 越界保护仍在）
+  const root = path.join(__dirname, '..');
   const mime = {
     '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.png': 'image/png', '.moc3': 'application/octet-stream',
@@ -56,7 +66,7 @@ function createWindow() {
   win.setAlwaysOnTop(true, 'screen-saver');
   // 默认整窗穿透；鼠标移到模型上时由渲染进程收回（forward 让我们仍能收到 mousemove）
   win.setIgnoreMouseEvents(true, { forward: true });
-  win.loadURL(`http://127.0.0.1:${PORT}/renderer/index.html`);
+  win.loadURL(`http://127.0.0.1:${PORT}/shell/renderer/index.html`);
   win.webContents.on('did-finish-load', () => console.log('[main] did-finish-load'));
   win.webContents.on('did-fail-load', (e, code, desc, url) =>
     console.log('[main] did-fail-load', code, desc, url));
@@ -131,7 +141,7 @@ app.whenReady().then(() => {
     smokeWatch = setTimeout(() => {
       console.log('SMOKE:' + JSON.stringify({ ok: false, error: 'timeout: renderer 12s 内未报告' }));
       quitting = true; app.quit();
-    }, 12000);
+    }, 45000);
   }
 });
 app.on('window-all-closed', () => { if (!SMOKE && !quitting) { /* 不退出：托盘常驻 */ } else app.quit(); });

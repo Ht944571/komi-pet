@@ -3,7 +3,10 @@
 const canvas = document.getElementById('cv');
 const bubble = document.getElementById('bubble');
 const qs = new URLSearchParams(location.search);
-const MODEL = qs.get('model') || '../models/Hiyori/Hiyori.model3.json';
+// 默认加载「古见同学」新模型（15 部件版，绑骨后导出）。
+// 仍可用 ?model=<相对路径> 覆盖，方便临时换回 samples 或旧版最小模型。
+const MODEL = qs.get('model') ||
+  '../../model/古见同学/拆层_古见同学_对齐裁切.model3.json';
 
 function report(d) { try { window.pet.report(d); } catch { } }
 // 渲染进程的报错要能浮到主进程（否则单进程/无头模式下完全不可见）
