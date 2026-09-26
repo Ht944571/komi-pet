@@ -1,26 +1,38 @@
 # -*- coding: utf-8 -*-
 r"""calib_face.py — 眼部/脸颊锚点的目视标定工具（网格叠加 → 人工读数 → 校验图）。
 
-为什么需要它：detect_face.py 的虹膜特征色检测对高冷版（全身立绘、头部占比小、
-每张姿势不同、刘海投影压眼）失效率过高（6 态里 4 态检不出、检出的也有 junk）。
-项目已有先例是「目视标定」（配件 pivot_y / ratio 就是这么标的），本工具把
-眼部锚点纳入同一方法论：
+**2026-09-26 起作用于 v3 立绘**（`app/assets/pet_v3/`，8 态）。
+旧立绘（`app/assets/pet_*.png`，24 张含高冷版）已随 v3 上线而删除，本工具随之改指向。
+> ⚠️ **常规改动不需要跑本工具**：缩放/贴图偏移变了，用 `remap_eye_config_v3.py`
+> 做几何换算是零误差的。本工具只在**新增一个立绘态**（源图没有旧锚点可换算）时才需要。
 
-  1) --grid STATE   ：立绘叠加归一化网格（0.05 细线 / 0.1 粗线带标注）出图，
-                      人工读出眼缝框 (cx, cy, w, h) 与（alt 的）腮红框。
+为什么需要它：自动检测眼位在这套画上**走不通** —— 头发 `#504259` 与眼睛 `#4A3A45`
+亮度分不开（脸框内最大暗块是"刘海+眼睛连成一块"）。项目既有做法是「目视标定」
+（配件 pivot_y / ratio 就是这么标的），本工具把眼部锚点纳入同一方法论：
+
+  1) grid STATE     ：立绘叠加归一化网格（0.05 细线 / 0.1 粗线带标注）出图，
+                      人工读出眼缝框 (cx, cy, w, h) 与腮红框。
   2) 读数写进 tools/_eye_calib.json。
-  3) --verify       ：把标定框画回立绘（2× 头部裁切），逐状态目视核对。
-  4) --write        ：生成 assets/_eye_config.json v4：
+  3) verify         ：把标定框画回立绘（2× 头部裁切），逐状态目视核对。
+  4) write          ：生成 pet_v3/_eye_config.json v4：
                       · 有标定的状态用标定值（可见眼缝约定：框 = 上下睑缘之间的
                         可见暗区，眨眼行程直接发生在其上——部分眨眼才可见）
-                      · 未标定状态沿用 v3 值（Q 版 6 态已真机验证）
-                      · 每状态自动采样 lid_skin（眼底下方皮肤带均值，盖板用，
-                        解决"平涂亮肤色盖板"与发影区不融合的问题）
+                      · 未标定状态沿用既有值
+                      · **`skip` 标记原样保留**（`joy` 的眼睛本就是闭的，运行时不画眼睑）
+                      · 每状态自动采样 lid_skin（眼底下方皮肤带均值）
+
+⚠️ **`write` 会重算 `lid_skin`**，可能与 `remap_eye_config_v3.py` 的产物不同
+（实测：`surprise` 会被采到腮红 → 变成偏粉的 `#F8E0D9`）。而 v3 的**权威配置来自 remap**。
+所以：**除非真的新增了一个立绘态，否则别跑 `write`** —— 它会覆盖 `lid_skin`。
+（`eyes`/`cheeks`/`skip` 是等价保留的，只有 `lid_skin` 会被重采样。）
+另外：旧的 `_eye_calib.json`（对应已删除的旧立绘）已改名为
+`_eye_calib.json.old-sprites.bak` —— 它若被 `write` 读到，会**把旧坐标系的值套到 v3 上**
+（实测最大偏移 0.24 归一化单位 ≈ 画布 370px），所以必须留在那个名字下不再被自动加载。
 
 用法：
-  python tools/calib_face.py --grid alt_idle [--crop 0.30,0.10,0.75,0.40] [--zoom 3]
-  python tools/calib_face.py --verify [STATE ...]
-  python tools/calib_face.py --write
+  python tools/calib_face.py grid idle [--crop 0.30,0.10,0.75,0.40] [--zoom 3]
+  python tools/calib_face.py verify [STATE ...]
+  python tools/calib_face.py write
 """
 import argparse
 import json
@@ -31,14 +43,16 @@ from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.dirname(HERE)
-ASSETS = os.path.join(APP, "assets")
+# 2026-09-26：旧立绘（app/assets/pet_*.png，24 张）已随 v3 上线而删除，
+# 本工具改为作用于 **v3 立绘**（app/assets/pet_v3/）。旧锚点表 `assets/_eye_config.json`
+# 仍保留，因为 `remap_eye_config_v3.py` 靠它做几何换算。
+ASSETS = os.path.join(APP, "assets", "pet_v3")
+LEGACY_CFG = os.path.join(APP, "assets", "_eye_config.json")
+CFG_FILE = os.path.join(ASSETS, "_eye_config.json")
 CALIB_FILE = os.path.join(HERE, "_eye_calib.json")
 OUT_DIR = os.path.join(os.path.dirname(APP), "docs", "face_calib")
 
-STATES = (
-    "idle", "happy", "shy", "pout", "blush", "stone",
-    "alt_idle", "alt_happy", "alt_shy", "alt_pout", "alt_blush", "alt_stone",
-)
+STATES = ("idle", "happy", "pout", "shy", "blush", "stone", "joy", "surprise")
 
 
 def load(state):
@@ -362,20 +376,27 @@ def cmd_auto(args):
 
 def cmd_write(args):
     calib = json.load(open(CALIB_FILE, encoding="utf-8")) if os.path.isfile(CALIB_FILE) else {}
-    old = json.load(open(os.path.join(ASSETS, "_eye_config.json"), encoding="utf-8"))
+    base_path = CFG_FILE if os.path.isfile(CFG_FILE) else LEGACY_CFG
+    old = json.load(open(base_path, encoding="utf-8"))
     out = {"version": 4, "eyelid_color": old.get("eyelid_color", "#2A2438"),
            "fallback": "idle", "states": {}}
     for st in STATES:
+        ent = dict((old.get("states") or {}).get(st) or {})
+        # ⚠️ 必须原样保留 `skip`：`joy` 的眼睛本来就是闭的，运行时不画眼睑。
+        # 旧逻辑只认"有 eyes"，会把 joy 直接丢掉 → 眨眼会在闭眼立绘上盖出错误眼睑。
+        if ent.get("skip"):
+            out["states"][st] = ent
+            print(f"[{st}] skip（眼睛本就是闭的，原样保留）")
+            continue
         img = load(st)
         mask = skin_mask(img)
-        ent = dict((old.get("states") or {}).get(st) or {})
         cal = calib.get(st) or {}
         if cal.get("eyes"):
             ent["eyes"] = cal["eyes"]
         if cal.get("cheeks"):
             ent["cheeks"] = cal["cheeks"]
         if not ent.get("eyes"):
-            print(f"[{st}] 无 eyes（标定与 v3 都没有），跳过")
+            print(f"[{st}] 无 eyes（标定与既有配置都没有），跳过")
             continue
         lids = []
         for key in ("left", "right"):
@@ -388,16 +409,16 @@ def cmd_write(args):
             # 双眼取较暗的一个（盖板偏向发影档，避免"亮胶带"）
             ent["lid_skin"] = min(lids, key=lambda c: int(c[1:3], 16) + int(c[3:5], 16) + int(c[5:7], 16))
         out["states"][st] = ent
-        print(f"[{st}] eyes={'calib' if cal.get('eyes') else 'v3'} "
-              f"cheeks={'calib' if cal.get('cheeks') else ('v3' if ent.get('cheeks') else '-')} "
+        print(f"[{st}] eyes={'calib' if cal.get('eyes') else '既有'} "
+              f"cheeks={'calib' if cal.get('cheeks') else ('既有' if ent.get('cheeks') else '-')} "
               f"lid_skin={ent.get('lid_skin')}")
-    out["notes"] = ("v4：alt 6 态眼部/腮红锚点经 calib_face.py 网格目视标定（可见眼缝约定："
-                    "框=上下睑缘之间的可见暗区，眨眼行程发生在其上）；Q 版沿用 v3 实测值；"
-                    "lid_skin 为眼底皮肤带实测均值（眨眼盖板色，与发影融合）。")
-    dst = os.path.join(ASSETS, "_eye_config.json")
-    with open(dst, "w", encoding="utf-8") as f:
+    out["notes"] = ("v4（v3 立绘）：8 态眼部/腮红锚点。框 = 上下睑缘之间的**可见暗区**"
+                    "（眨眼行程发生在其上）；lid_skin 为眼底皮肤带实测均值。"
+                    "joy 标 skip —— 它的眼睛本就是闭的。"
+                    "常规改动请走 `remap_eye_config_v3.py` 几何换算，不必重跑本工具。")
+    with open(CFG_FILE, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
-    print("written:", dst)
+    print("written:", CFG_FILE)
 
 
 def main():

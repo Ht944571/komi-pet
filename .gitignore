@@ -16,3 +16,21 @@ __pycache__/
 app/tools/_tmp_*
 _tmp_*
 *.log
+
+# ---- 生成式素材源图（不进仓库；可直接重新生成的中间产物）----
+# README「素材与角色说明」声明仓库不含原始生成图 —— 这里保持这条口径。
+# 成品（立绘 / 眨眼贴片）在 app/assets/pet_v3/，那才是运行期资产。
+app/assets/_gen3/
+
+# ---- Live2D 线（2026-09-26）----
+# 只提交：脚本（app/tools/*live2d*、assemble/psd 相关）、交付文档、参考图、分层 PSD/ORA
+# 其余一律不提交（都是可再生的中间物/第三方大件）
+live2d/shell/node_modules/
+live2d/shell/.pet-pos.json
+live2d/vendor/
+live2d/shell/models/
+live2d/_work/
+live2d/model/
+
+# 备份文件（*.bak / *.pre_*）不进仓库
+*.bak

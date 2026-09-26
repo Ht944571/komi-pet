@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - uses: dtolnay/rust-toolchain@stable
-      - name: 编译并启动探针（后台 30s）
+      - name: 编译（后台，首次拉 crates 约几分钟）
         working-directory: t40-kit/tauri-app
         run: |
           npm install
@@ -30,4 +30,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: t40-report
-          path: t40-kit/report/
+          # ⚠️ 必须与 `mkdir -p report` 的实际位置一致：那一步没有 working-directory，
+          # report/ 建在仓库根目录。原先写 t40-kit/report/ → 路径不存在，
+          # upload-artifact 只 warn 不报错 → **任务"成功"但产物为空**。
+          path: report/
+          if-no-files-found: error

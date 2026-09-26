@@ -3,8 +3,11 @@
 """
 wb_whale_win.py — WorkBuddy 用量看板 · 古见同学桌宠（Windows 原生，纯 ctypes + GDI+）
 =====================================================================================
-路线 3 v2：按参考图重设计 ——
-  · 桌宠本体 = 古见同学 Q 版立绘 PNG（scripts/assets/pet_idle/pet_happy/pet_pout，透明底）
+路线 3 v3：按参考视频重做美术 ——
+  · 桌宠本体 = v3 立绘 PNG（`assets/pet_v3/pet_<state>.png`，Q 版 8 态 × 双朝向，
+    统一画布 + 按脸宽归一 → 切表情不跳尺寸；旧的 `assets/pet_*.png` 24 张已删除）
+  · 眨眼 = 分层差分贴片（`pet_v3/blink/`，真实像素，按闭合度取 6 档）
+  · 状态切换 = 交叉溶解（对齐参考视频）
   · 气泡 = 深蓝描边椭圆想法框 + 双小圆点（对齐 195012 系列参考图样式）
   · 状态立绘：有活跃会话/说话 → 开心脸；空闲 → 文静脸；贴左/右边缘自动镜像朝向屏幕中心
   · 交互对齐 DeepSeek-Balance-Whale-Widget：拖拽四边吸附、按压 Q 弹、
@@ -20,6 +23,7 @@ import json
 import math
 import os
 import random
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -69,7 +73,10 @@ except Exception as _e:                                       # pragma: no cover
 BASE_W = 300                   # 窗口宽
 BASE_BUB_H = 128               # 气泡椭圆高
 BASE_BUBBLE_H = 162            # 气泡区总高（含想法小圆）
-BASE_PET_H = 210               # 立绘区高
+# 立绘区高。v3 立绘是**统一画布 1191×1627**（内容只占约 60% 高，见 tools/build_pet_v3.py），
+# 若仍用旧的 210，角色会比旧版小约 40%。按内容反算：
+#   旧 823×981 画到 210px → 角色实高 ≈ 207px；新 idle 内容 999/1627 → 210×1627/999 ≈ 342
+BASE_PET_H = 342               # 立绘区高（v3 统一画布）
 DRAG_EDGE = 24                 # 距屏幕边缘 24px 内松手 → 贴边吸附
 TICK_MS = int(POLL_SEC * 1000)
 WATCH_MS = 60
@@ -81,7 +88,25 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 POS_FILE = os.path.join(_HERE, ".whale_pos.json")
 SETTINGS_FILE = os.path.join(_HERE, ".whale_settings.json")
 ASSETS_DIR = os.path.join(_HERE, "assets")
-EYE_CFG_FILE = os.path.join(ASSETS_DIR, "_eye_config.json")
+# v3 立绘目录（8 态、统一画布、按脸宽归一）——由 tools/build_pet_v3.py 生成。
+# 高冷版（alt_*）已停用：审美线统一到 v3 的 Q 版，见 docs/眨眼重构交接-2026-09-26.md。
+SPRITE_DIR = os.path.join(ASSETS_DIR, "pet_v3")
+EYE_CFG_FILE = os.path.join(SPRITE_DIR, "_eye_config.json")
+# 眨眼贴片（分层差分）：每个态一张「闭眼」贴片 + 在画布里的矩形。
+# 由 tools/build_blink_patches.py 从 ImageGen 的闭眼变体里抠出（alpha = 与睁眼图的 diff 幅度）。
+BLINK_DIR = os.path.join(SPRITE_DIR, "blink")
+BLINK_MANIFEST = os.path.join(BLINK_DIR, "_patches.json")
+# 立绘几何元数据（构建期产出）：内容框 content_box = 角色本体在画布里的归一化矩形。
+# 点击分区要用它 —— v3 是统一画布 + 底部对齐，角色上方留空，按「立绘区高度的百分比」
+# 分区会让"点头顶判成 face、点眼睛判成 body"（实测 8 态里 7 态错）。
+META_FILE = os.path.join(SPRITE_DIR, "_build_meta.json")
+
+# 反应态集合：与立绘态同名，_draw_pet 直接取用（v3 新增 joy / surprise）
+REACT_FACES = ("blush", "pout", "stone", "joy", "surprise")
+
+# 配件总开关：2026-09-26 用户要求「帽子（贝雷帽）/小猫/鲸鱼玩偶都不进桌宠」→ 置 True。
+# 代码与素材都保留（不删），随时可恢复；菜单项与 persona 表也随之失效。
+ACCESSORIES_OFF = True
 
 # ---------- 配色（古见同学主题：制服蓝 / 领结红 / 深紫黑 / 灰紫，对齐古见同学展示页）----------
 C_BUBBLE = 0xFFFDFBF6          # 气泡米白底（展示页 --bg #F7F4EE 的亮阶）
@@ -270,9 +295,7 @@ IDM_PIN = 1009                 # 锁定聚焦（pin）开关（跟随模式 P3�
 IDM_TIMELINE0 = 1400           # 1400：今日时间线摘要项；1401+i ↔ 最近轮次[i]
 IDM_FOCUS0 = 1450              # 1450+i ↔ 手动聚焦候选[i]（登记册启用 agent）
 IDM_HANDOFF = 1010             # 生成接续摘要 → 剪贴板（跟随模式 P4；仅角标活跃时出现）
-IDM_MODE3D = 1011              # 切换到 3D 桌宠（P0-②：写 pet_mode → 退出 → 守望拉起 3D）
 ID_HOTKEY_FOLLOW = 1           # 全局热键 id（RegisterHotKey 的 id 命名空间独立于定时器）
-PET_MODE = "2d"                # 本文件的形态标识（wb_pet3d.py 为 "3d"；pet_mode 在共享设置里）
 IDM_SCALE0 = 1100              # 1100+i ↔ SCALES[i]
 SCALES = (0.6, 0.8, 1.0, 1.5, 2.0, 2.5)
 IDM_QUALITY0 = 1200            # 1200+i ↔ QUALITY_CHOICES[i]
@@ -649,6 +672,22 @@ class Surface:
         _msimg32.AlphaBlend(self.hdc, int(x), int(self._fy(y, h)), int(w), int(h),
                             src.hdc, 0, 0, int(sw), int(sh), _ALPHABLEND_BF)
 
+    def blit_a(self, src, x, y, w, h, alpha):
+        """带**全局 alpha** 的 alpha 合成（当前未使用，保留给需要真正淡入淡出的场景）。
+
+        BLENDFUNCTION 是 4 字节小端 DWORD：`AlphaFormat<<24 | SourceConstantAlpha<<16 |
+        BlendFlags<<8 | BlendOp`。项目原有的 `_ALPHABLEND_BF = 0x01FF0000` 就是
+        `AC_SRC_ALPHA` + `SCA=255`，所以**只改第 3 个字节即可拿到全局透明度**——
+        （早先"GDI 的 AlphaBlend 没有全局 alpha"的说法不准确：是没暴露，不是没有）。
+        最终 alpha = 源像素 alpha × SCA/255。
+
+        眨眼**没有**用它：两张差异很大的图做 alpha 交叉会重影（睁眼暗瞳透过半透明闭眼图
+        显出来）。半闭改用离线「按眼睑位置做垂直遮罩的多档贴片」，见 build_blink_patches.py。
+        """
+        bf = (0x01 << 24) | ((int(max(0, min(255, alpha))) & 0xFF) << 16)
+        _msimg32.AlphaBlend(self.hdc, int(x), int(self._fy(y, h)), int(w), int(h),
+                            src.hdc, 0, 0, int(src.w), int(src.h), bf)
+
     def blit_part(self, src, dx, dy, dw, dh, sx, sy, sw, sh):
         """从 src 的局部矩形合成到本画布指定位置（尾鳍摆动 / 头部倾斜的分层位移用）。
 
@@ -996,8 +1035,6 @@ class WhalePet:
             self._follow_focus = {"key": self._focus_pin_key,
                                   "accent": _spec.get("accent"),
                                   "kind": "pin", "t0": 0.0}
-        # ---- P0-② 实时切换：轮询共享设置的 pet_mode，变了 → 优雅退出 → 守望拉起新形态 ----
-        self._mode_check_at = 0.0
         # ---- P4 接续：刚离开的 agent"似乎未结束" → 领结徽章角标；摘要用户触发 ----
         self._handoff = None            # {"key","title","since"} 或 None
         self._follow_hook = None
@@ -1011,6 +1048,9 @@ class WhalePet:
         self._gaze_target = 0.0
         self._hovering = False
         self._hover_t = 0.0           # hover 淡入淡出进度 0..1
+        self._pose_masks = {}         # {sprite_key: 32×48 灰度缩略} 供状态过渡差异判定
+        self._pose_diff_cache = {}    # {(k1,k2): 局部最大差异}
+        self._pose_wh = (0, 0)
         self._squash = 1.0            # 点击压缩曲线值（1.0 = 常态）
         self._squash_t0 = 0.0
         self._drag_tilt = 0.0         # 拖拽倾斜
@@ -1031,6 +1071,11 @@ class WhalePet:
         self._last_quote = ""
 
         self._sprites = self._load_sprites()
+        self._spr_cbox = self._load_sprite_boxes()         # {state: 内容框(归一化)}
+        self._blink_patches = self._load_blink_patches()   # {state: (img, (x,y,w,h))}
+        self._blink_cache = {}           # 按当前 scale 预缩放的贴片
+        self._shown_key = None           # 上一帧实际画出的立绘 key（状态切换渐变用）
+        self._fade = None                # {"from":key,"to":key,"t0":ts}
         self._ok_img = self._load_ok_glyph()
         self._ok_glyph_cache = None       # (Surface, w, h) 按当前 scale 预缩放
         self._register_class()
@@ -1078,8 +1123,7 @@ class WhalePet:
 
     def _save_settings(self):
         try:
-            # 合并写入：.whale_settings.json 里还有 pet_mode（守望/3D 共享），
-            # 整体重写会把别人的键抹掉（踩过：2D 保存后 pet_mode 丢失 → 切换失效）
+            # 合并写入：整体重写会抹掉本文件之外的键（踩过：保存后别人的键丢失）
             data = {}
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -1200,58 +1244,12 @@ class WhalePet:
         self._report_event("follow_manual", detail=key)
         self._drawn_sig = None
 
-    # ---- P0-② 实时切换：读共享设置的 pet_mode，与本形态不同 → 优雅退出 ----
+    # ---- 环境联动 ----
     def _night_mode(self):
         """夜间联动（跟随 P4 同族的"环境联动"）：23:00–07:00 → 眨眼频率降低
         + 渲染层半眯眼慵懒态。屏幕亮度读取不可移植，用本地时段替代。"""
         h = time.localtime().tm_hour
         return h >= 23 or h < 7
-
-    def _check_pet_mode(self, settings=None):
-        """读共享设置；pet_mode 与本形态不同 → True（调用方优雅退出，
-        守望 5s 内拉起新形态）。settings 传 dict 供测试注入。"""
-        try:
-            data = settings
-            if data is None:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            mode = str((data or {}).get("pet_mode", PET_MODE)).lower()
-            return mode not in ("", PET_MODE)
-        except Exception:
-            return False
-
-    def _switch_mode_quit(self):
-        """写回本形态无关（pet_mode 已由菜单/外部改好）→ 事件 + 退出。
-        PostQuitMessage 走 tick 的正常收尾（保存设置等）。"""
-        self._report_event("pet_mode_switch", detail="3d")
-        _user32.PostQuitMessage(0)
-
-    def _check_pet_mode_tick(self, now):
-        """每 2s 轮询一次（tick 每秒都在跑，用时间分频）。
-        ⚠️ 只对**守望拉起**的桌宠生效（linked_expected）——手动启动的 2D 不该被
-        设置文件隐式杀掉；测试里未设 WB_PET_LINKED → 自动跳过。"""
-        if not self._linked_expected:
-            return
-        if now >= self._mode_check_at:
-            self._mode_check_at = now + 2.0
-            if self._check_pet_mode():
-                self._switch_mode_quit()
-
-    def _switch_to_3d(self):
-        """P0-②：写 pet_mode="3d" → 优雅退出 → 守望 5s 内拉起 3D。"""
-        try:
-            data = {}
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = {}
-            data["pet_mode"] = "3d"
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        self._report_event("pet_mode_switch", detail="3d")
-        _user32.PostQuitMessage(0)
 
     # ---- P4 接续：摘要生成（用户触发才生成；必过脱敏；复制到剪贴板）----
     def _copy_to_clipboard(self, text):
@@ -1404,16 +1402,15 @@ class WhalePet:
             return None
         states = cfg.get("states")
         if isinstance(states, dict) and states:
-            # state key 直接查；查不到回退到 fallback / 同版本 idle / Q 版 idle
+            # state key 直接查；查不到剥离 alt_ 前缀再查
             st = states.get(state)
             if st is None:
-                # 剥离 alt_ 前缀回退
                 base = state.removeprefix("alt_") if state.startswith("alt_") else state
                 st = states.get(base)
-            if st is None:
-                st = states.get(cfg.get("fallback") or "idle") \
-                    or next(iter(states.values()), None)
-            if not st:
+            if not st or st.get("skip"):
+                # 2026-09-26 v3：**未标定的态就返回 None，不再回退到 idle**。
+                # 回退会把 idle 的眼睑坐标画到别的姿态上（明显错位）；
+                # 现在只给显式标定过的态画眼睑，`skip: true` 用于「眼睛本就是闭的」态（joy）。
                 return None
             out = {"eyes": st.get("eyes") or {},
                    "cheeks": st.get("cheeks") or {},
@@ -1437,33 +1434,116 @@ class WhalePet:
 
     # ---- 立绘资源 ----
     def _load_sprites(self):
-        """加载双版本立绘：Q 版（萌系）/ 高冷版（清冷疏离），各 6 表情 × 正反 = 12 张。
+        """加载 v3 立绘：8 表情 × 正反 = 16 张（统一画布 1191×1627）。
 
-        命名约定：{state} / {state}_f（state ∈ idle/happy/shy/pout/blush/stone）
-        高冷版前缀：alt_{state} / alt_{state}_f
-        sprite key 形如 'q.idle' / 'alt.idle' / 'q.idle_f' / 'alt.idle_f'。
+        命名约定：{state} / {state}_f
+            state ∈ idle/happy/pout/shy/blush/stone/joy/surprise
+        sprite key 形如 'q.idle' / 'q.idle_f'。
+        高冷版（alt_*）与配件已停用（2026-09-26 决策：审美线统一到 v3 Q 版）。
         """
         sprites = {}
-        states = ("idle", "happy", "shy", "pout", "blush", "stone")
-        for style_prefix, name_prefix in (("q", ""), ("alt", "alt_")):
-            for state in states:
-                for suffix, mirror in (("", False), ("_f", True)):
-                    key = f"{style_prefix}.{state}{suffix}"
-                    fname = f"pet_{name_prefix}{state}{suffix}.png"
-                    path = os.path.join(ASSETS_DIR, fname)
-                    if not os.path.isfile(path):
-                        continue
-                    img = P()
-                    if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
-                        log_exception(f"[sprite] 加载失败 {path}")
-                        continue
-                    w, h = U32(0), U32(0)
-                    _GetImageW(img, ctypes.byref(w))
-                    _GetImageH(img, ctypes.byref(h))
-                    sprites[key] = (img, w.value, h.value)
+        states = ("idle", "happy", "pout", "shy", "blush", "stone", "joy", "surprise")
+        for state in states:
+            for suffix, mirror in (("", False), ("_f", True)):
+                key = f"q.{state}{suffix}"
+                path = os.path.join(SPRITE_DIR, f"pet_{state}{suffix}.png")
+                if not os.path.isfile(path):
+                    continue
+                img = P()
+                if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
+                    log_exception(f"[sprite] 加载失败 {path}")
+                    continue
+                w, h = U32(0), U32(0)
+                _GetImageW(img, ctypes.byref(w))
+                _GetImageH(img, ctypes.byref(h))
+                sprites[key] = (img, w.value, h.value)
         if "q.idle" not in sprites:
-            log_exception(f"[sprite] 未找到立绘资源目录 {ASSETS_DIR}")
+            log_exception(f"[sprite] 未找到 v3 立绘目录 {SPRITE_DIR}"
+                          f"（请先跑 tools/build_pet_v3.py）")
+        # 姿态掩码（构建期由 tools/build_pose_masks.py 生成）：状态过渡差异判定用
+        self._pose_masks = {}
+        self._pose_wh = (0, 0)
+        try:
+            with open(os.path.join(SPRITE_DIR, "_pose_masks.json"), encoding="utf-8") as fp:
+                pm = json.load(fp)
+            self._pose_masks = pm.get("states") or {}
+            self._pose_wh = (int(pm.get("w") or 0), int(pm.get("h") or 0))
+        except Exception:
+            pass          # 缺文件不报错：_pose_local_diff 会退回"不限制"的原行为
         return sprites
+
+    def _load_sprite_boxes(self):
+        """读各态立绘的**内容框**（角色本体在画布里的归一化矩形），点击分区要用。
+
+        为什么离线算好再读：2D 运行时**刻意零依赖**（不 import numpy / PIL），
+        没法在运行时对位图求 bbox。构建期（tools/build_pet_v3.py 有 numpy）算进
+        `_build_meta.json` 即可。
+        """
+        out = {}
+        if not os.path.isfile(META_FILE):
+            log_exception(f"[sprite] 未找到几何元数据 {META_FILE}"
+                          f"（点击分区会退回按立绘区百分比估算）")
+            return out
+        try:
+            with open(META_FILE, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            log_exception(f"[sprite] 几何元数据解析失败 {META_FILE}")
+            return out
+        for state, ent in meta.items():
+            b = ent.get("content_box")
+            if b and len(b) == 4:
+                out[state] = tuple(float(v) for v in b)
+        return out
+
+    def _load_blink_patches(self):
+        """加载分层差分的**闭眼贴片**（每态一组「半闭档」+ 它在画布里的矩形）。
+
+        贴片由 `tools/build_blink_patches.py` 生成：拿 ImageGen 的「只闭眼」变体与睁眼立绘
+        做像素差分，**diff 区域就是眼睛**（所以既不用重新标定眼位，也不用猜），
+        贴片 alpha 取自 diff 幅度。
+
+        为什么要多档而不是一张图配全局 alpha：半闭**不是两张图混合**——那样睁眼的暗瞳会
+        透过半透明闭眼图显出来（实测 ratio=0.5 重影明显）。真实半闭是**上睑从上往下压住眼球**，
+        所以离线按「眼睑下落位置」做出 N 档垂直遮罩，运行时按闭合度取档。
+
+        缺贴片的态自动退回旧的椭圆眼睑盖板（见 `_draw_blink`），不会因为没素材而坏掉。
+        """
+        out = {}
+        if not os.path.isfile(BLINK_MANIFEST):
+            log_exception(f"[blink] 未找到贴片清单 {BLINK_MANIFEST}"
+                          f"（可跑 tools/build_blink_patches.py；缺失时回退椭圆盖板）")
+            return out
+        try:
+            with open(BLINK_MANIFEST, encoding="utf-8") as f:
+                man = json.load(f)
+        except Exception:
+            log_exception(f"[blink] 贴片清单解析失败 {BLINK_MANIFEST}")
+            return out
+
+        def _load(p):
+            img = P()
+            if _LoadImage(p, ctypes.byref(img)) != 0 or not img:
+                return None
+            return img
+
+        for state, ent in man.items():
+            slots = []
+            n = int(ent.get("slots") or 0)
+            for i in range(1, n + 1):
+                g = _load(os.path.join(BLINK_DIR, f"{state}_c{i}.png"))
+                if g is not None:
+                    slots.append(g)
+            if not slots:                       # 只有整张贴片时退化为单档
+                g = _load(os.path.join(BLINK_DIR, f"{state}.png"))
+                if g is not None:
+                    slots.append(g)
+            if not slots:
+                continue
+            out[state] = {"slots": slots,
+                          "rect": tuple(ent.get("rect") or (0, 0, 0, 0)),
+                          "canvas": tuple(ent.get("canvas") or (0, 0))}
+        return out
 
     def _load_ok_glyph(self):
         """加载「OK」完成态字形（透明 PNG）。
@@ -1486,8 +1566,9 @@ class WhalePet:
         sc = self.scale
         bub_h = int(BASE_BUB_H * sc)
         bubble_h = int(BASE_BUBBLE_H * sc) if self.bubble_on else 0
-        # 配件净空：插在气泡区与立绘区之间，供贝雷帽占用头顶上方的空间（见 wb_motion）
-        hr = int(MOTION.ACC_HEADROOM * sc)
+        # 配件净空：插在气泡区与立绘区之间，供贝雷帽占用头顶上方的空间（见 wb_motion）。
+        # 配件停用后这块就是纯空白（气泡与角色之间一条 58px 的缝），故归零。
+        hr = 0 if ACCESSORIES_OFF else int(MOTION.ACC_HEADROOM * sc)
         pet_h = int(BASE_PET_H * sc)
         return {"W": int(BASE_W * sc), "H": bubble_h + hr + pet_h,
                 "bub_h": bub_h, "bubble_h": bubble_h, "hr": hr,
@@ -1603,6 +1684,30 @@ class WhalePet:
             tmp.image(img, 0, 0, gw, gh)
             self._ok_glyph_cache = (tmp, gw, gh)
             self._cache_surfs.append(tmp)
+
+        # 眨眼贴片同样预缩放到显示尺寸：贴片坐标在「画布坐标系」里，而立绘按画布高 ph 绘制，
+        # 所以换算系数 k = ph / 画布高。每帧只做一次 1:1 AlphaBlend（带全局 alpha）。
+        self._blink_cache = {}
+        for state, ent in getattr(self, "_blink_patches", {}).items():
+            rect = ent["rect"]; cw, ch = ent["canvas"]
+            if cw <= 0 or ch <= 0 or rect[2] <= 0 or rect[3] <= 0:
+                continue
+            k = ph / ch
+            pw2 = max(1, round(rect[2] * k))
+            ph2 = max(1, round(rect[3] * k))
+            x_disp = round(rect[0] * k)
+            y_disp = round(rect[1] * k)
+            # 贴片矩形在画布坐标系里；镜像立绘（_f）时左右翻转 → 预算一份镜像 x
+            x_mirror = round((cw - (rect[0] + rect[2])) * k)
+            scaled = []
+            for g in ent["slots"]:
+                tmp = Surface(pw2, ph2)
+                tmp.clear()
+                tmp.image(g, 0, 0, pw2, ph2)
+                scaled.append(tmp)
+                self._cache_surfs.append(tmp)
+            self._blink_cache[state] = {"slots": scaled, "x": x_disp, "y": y_disp,
+                                        "w": pw2, "h": ph2, "x_mirror": x_mirror}
 
     def _place(self):
         lay = self._layout()
@@ -2106,7 +2211,9 @@ class WhalePet:
             tier, pool, face, snd = 3, QUOTES_POUT, "pout", "hmph"
             hearts, spray, wamp, wdur, rdur = 0, 0, 6.0, 0.7, 3.2
         else:
-            tier, pool, face, snd = 4, QUOTES_OUTBURST, "pout", "splash"
+            # 2026-09-26 v3：第四档 face 由 "pout" 改为 "stone"——它的文案标签本来就写着
+            # 「石化」，旧值与标签自相矛盾（改后 stone 态也有了稳定触发入口）
+            tier, pool, face, snd = 4, QUOTES_OUTBURST, "stone", "splash"
             hearts, spray, wamp, wdur, rdur = 0, 12, 7.0, 0.9, 3.5
         q = random.choice(pool)
         while q == self._last_quote and len(pool) > 1:
@@ -2211,8 +2318,6 @@ class WhalePet:
             self._set_bubble_mode(BUBBLE_DEFAULT, now)
         # ③.6 OK 态自动消失：用户回到对话窗口 + 窗口重新获得焦点 → 平滑淡出
         self._ok_focus_check(now)
-        # P0-② 实时切换：pet_mode 变了 → 优雅退出（守望拉起新形态）
-        self._check_pet_mode_tick(now)
         # ③.7 跟随模式：前台 → agent（钩子即时/轮询兜底 → 解析 → 去抖 → 徽章）
         self._follow_tick(now)
         # ④ 空闲自主行为调度（用户交互/反应期间暂停）
@@ -2231,6 +2336,7 @@ class WhalePet:
         dirty = (bool(self._particles) or self._drift is not None
                  or now < self._wobble_until or now < self._react_until
                  or self._ok_animating(now)          # 气泡形态切换 / 点击脉冲 / 完成保持
+                 or self._fade is not None           # ★ 状态切换过渡期间必须每帧重绘
                  or msig != self._motion_sig
                  or facing != getattr(self, "_facing_drawn", None)
                  or sig != self._drawn_sig)
@@ -2243,25 +2349,95 @@ class WhalePet:
             self._auto_degrade(now)
 
     # ---- 提案 §3：点击身体部位切形态 ----
-    def _body_region(self, x, y, lay):
-        """将立绘点击坐标映射到 4 个部位之一。
+    def _face_metrics(self, state, cbox):
+        """把眼部锚点换算成「内容框内的相对坐标」，供点击分区用。
 
-        立绘区域 = bubble_h ~ bubble_h + pet_h；按垂直 1/3 分头/身/裙摆；
-        中心水平窄条作为"脸部"。返回 'head' / 'face' / 'body' / 'skirt'。
+        返回 (ey, eh, ux0, ux1)：眼心在角色高度上的位置、眼高、脸列（左右眼外扩 35%）。
+        无锚点的态（如 joy，眼睛本就是闭的）返回 None，调用方走兜底比例。
         """
+        fc = self._face_cfg(state, "")          # 用未镜像锚点：调用方已把坐标统一回未镜像系
+        eyes = (fc or {}).get("eyes") or {}
+        if len(eyes) < 2:
+            return None
+        vals = list(eyes.values())
+        cy = sum(v["cy"] for v in vals) / len(vals)
+        h = sum(v["h"] for v in vals) / len(vals)
+        left = min(v["cx"] - v["w"] / 2 for v in vals)
+        right = max(v["cx"] + v["w"] / 2 for v in vals)
+        x0, y0, x1, y1 = cbox
+        cw, ch = max(1e-6, x1 - x0), max(1e-6, y1 - y0)
+        mid = (left + right) / 2
+        half = (right - left) * 0.85            # 眼跨 + 两侧外扩
+        # 脸列宽度上限 = 角色宽度的 62%：紧凑趴姿的眼跨占身体比例极大，不夹的话
+        # 整条身体都会被判成 face，body 区消失（blush/stone 实测 body 只剩 1%）
+        half = min(half, 0.31 * cw)
+        return ((cy - y0) / ch, h / ch,
+                max(0.0, (mid - half - x0) / cw), min(1.0, (mid + half - x0) / cw))
+
+    def _body_region(self, x, y, lay):
+        """将立绘点击坐标映射到 4 个部位之一：'head' / 'face' / 'body' / 'skirt'。
+
+        2026-09-26 重写：旧实现按「立绘区高度的百分比」分区，前提是**立绘填满立绘区**。
+        v3 立绘是统一画布 + 底部对齐（角色上方留空，各态内容高只占画布 50%~95%），
+        那个前提不成立 —— 实测 8 态里 7 态错位：**点头顶判成 face、点眼睛判成 body**，
+        导致「摸头→joy」「戳脸→surprise」两个交互根本点不出来。
+
+        现在按**真实几何**分区：立绘实际绘制矩形（self._spr_rect，每帧记录）→
+        换算到画布归一化坐标 → 与该态的内容框、眼部锚点比对。
+        拿不到矩形时（首帧之前）退回旧口径，保证不会因为顺序问题崩。
+        """
+        rect = getattr(self, "_spr_rect", None)
+        key = getattr(self, "_spr_key", None)
+        if rect and key:
+            state, facing = key
+            cbox = getattr(self, "_spr_cbox", {}).get(state)
+            if cbox:
+                sx, sy, sw, sh = rect
+                # 点击点 → 画布归一化坐标；镜像立绘翻回未镜像系（与内容框、锚点一致）
+                cx = (x - sx) / max(1.0, sw)
+                cy = (y - sy) / max(1.0, sh)
+                if facing == "_f":
+                    cx = 1.0 - cx
+                x0, y0, x1, y1 = cbox
+                # ⚠️ 边界判定必须留**亚像素容差**：点击坐标来自 int() 取整（鼠标/测试都一样），
+                # 而取整会向下截断最多 1px。若某态内容框的上边缘离采样行不足 1px（实测 stone
+                # 只有约 0.7px），"点头发最顶上那一两个像素"就会被判成框外 → 返回 body，
+                # 表现为「点头顶没反应/反应不对」（test_hit_regions 的 stone 用例就是这么挂的）。
+                eps_x = 1.5 / max(1.0, sw)
+                eps_y = 1.5 / max(1.0, sh)
+                if not (x0 - eps_x <= cx <= x1 + eps_x and y0 - eps_y <= cy <= y1 + eps_y):
+                    return "body"           # 落在角色本体之外（画布留白，通常已被穿透）
+                ux = min(1.0, max(0.0, (cx - x0) / max(1e-6, x1 - x0)))   # 钳制：容差区按边界算
+                uy = min(1.0, max(0.0, (cy - y0) / max(1e-6, y1 - y0)))
+                fm = self._face_metrics(state, cbox)
+                if fm:
+                    ey, eh, ux0, ux1 = fm
+                    if ux0 <= ux <= ux1 and (ey - 0.60 * eh) < uy <= (ey + 1.40 * eh):
+                        return "face"       # 眼→嘴那一段，且限定在脸的窄列里
+                    if uy <= max(0.35, min(0.62, ey + 1.60 * eh)):
+                        return "head"       # 眼线以上：头发/刘海/额头
+                else:
+                    if uy <= 0.20:
+                        return "head"
+                    if 0.20 <= uy <= 0.45 and 0.35 <= ux <= 0.65:
+                        return "face"
+                if uy >= 0.78:
+                    return "skirt"          # 裙摆/膝
+                return "body"
+        # ---- 兜底：拿不到立绘矩形时按旧口径 ----
         ph = lay["pet_h"]
         bh = lay["bubble_h"]
         if not (bh <= y <= bh + ph):
-            return "body"                  # 兜底
+            return "body"
         ry = (y - bh) / max(1.0, ph)
         rw = x / max(1.0, lay["W"])
         if 0.00 <= ry <= 0.18:
-            return "head"                   # 头顶（头发/刘海）
+            return "head"
         if 0.18 <= ry <= 0.45 and 0.35 <= rw <= 0.65:
-            return "face"                   # 中部居中（眼睛/嘴）
+            return "face"
         if ry >= 0.78:
-            return "skirt"                  # 下部（裙摆/膝盖）
-        return "body"                       # 其余（胸口/西装外套/手臂）
+            return "skirt"
+        return "body"
 
     def _morph_by_region(self, region):
         """根据点击部位切形态 + 写人设台词（摸头害羞/戳脸石化/戳身互动/戳裙委屈）。
@@ -2273,11 +2449,15 @@ class WhalePet:
             # 交互级 §三.2：点击头部/脸部 → 受惊连眨（快速双连眨）
             self._blinker.startle(time.time())
         if region == "head":
-            pool, face, snd, state = QUOTES_HEAD, "blush", "chirp", "blush"
+            # 2026-09-26 v3：摸头顶 → joy（比耶开心），替代旧的 blush；
+            # blush 仍由 _react 一/二档（戳身）与打招呼触发，不会失联
+            pool, face, snd, state = QUOTES_HEAD, "joy", "chirp", "joy"
             hearts = 3; spray = 0; wamp = 0.0; wdur = 0.0; rdur = 0.0
             self._react_until = now + MORPH_HOLD_S   # 抑制 _react 重入
         elif region == "face":
-            pool, face, snd, state = QUOTES_FACE, "stone", "splash", "stone"
+            # 2026-09-26 v3：戳脸 → surprise（睁大眼+张嘴，被戳一下愣住）；
+            # 旧映射是 stone（石化），现由 _react 第四档承接（其标签本就叫"石化"）
+            pool, face, snd, state = QUOTES_FACE, "surprise", "splash", "surprise"
             hearts = 0; spray = 0; wamp = 6.0; wdur = 0.6; rdur = MORPH_HOLD_S
             self._react_until = now + MORPH_HOLD_S
         elif region == "skirt":
@@ -2293,8 +2473,8 @@ class WhalePet:
             q = random.choice(pool)
         self._last_quote = q
         self._quote = q
-        # 文案标签：摸头→害羞 / 戳脸→石化 / 戳裙→委屈
-        labels = {"head": "摸头", "face": "石化", "skirt": "委屈"}
+        # 文案标签：摸头→开心 / 戳脸→愣住 / 戳裙→委屈
+        labels = {"head": "开心", "face": "愣住", "skirt": "委屈"}
         self._quote_dur = labels.get(region, region)
         self._talk_until = now + MORPH_HOLD_S
         self._react_face = face
@@ -2973,6 +3153,82 @@ class WhalePet:
         # 整张平移：单次 blit 走 GDI 硬件 alpha 混合，自带抗锯齿，不存在接缝。
         s.blit(cached, x + head_dx, y, w, h)
 
+    def _pose_local_diff(self, k1, k2):
+        """两张立绘的"局部最大差异"（3×3 块的灰度均差最大值）。
+
+        为什么不用全图均值：均值会被大面积同色区（头发/外套）稀释——
+        实测 idle↔surprise 的全图均值只有 2.8（看不见差异），
+        但它俩的脸（半眯 vs 瞪眼张嘴）恰恰是双重曝光最刺眼的地方。
+        改用局部最大：能抓到"任何一小块是否差异够大"。
+        """
+        if not self._pose_masks:
+            return 0.0            # 没有掩码数据 → 不做限制（退回原行为）
+        key = (k1, k2) if k1 <= k2 else (k2, k1)
+        hit = self._pose_diff_cache.get(key)
+        if hit is not None:
+            return hit
+        a, b = self._pose_masks.get(k1), self._pose_masks.get(k2)
+        w, h = self._pose_wh
+        if not a or not b or w <= 0:
+            self._pose_diff_cache[key] = 0.0
+            return 0.0
+        best = 0.0
+        for y in range(0, h - 2, 2):
+            row = y * w
+            for x in range(0, w - 2, 2):
+                s = 0
+                for dy in (0, 1, 2):
+                    o = row + dy * w + x
+                    s += abs(a[o] - b[o]) + abs(a[o + 1] - b[o + 1]) + abs(a[o + 2] - b[o + 2])
+                if s / 9.0 > best:
+                    best = s / 9.0
+        self._pose_diff_cache[key] = best
+        return best
+
+    def _draw_state_fade(self, s, key, x, y, w, h, now, state):
+        """状态切换的**交叉溶解**：把上一张立绘以递减 alpha 叠在新立绘之上。
+
+        为什么做：参考视频里姿态切换是**交叉溶解**而非硬切；本项目 09-25 的设计稿
+        也明确要求"2 帧渐入 / 2 帧渐出"，但当时因为「GDI 的 AlphaBlend 没有全局 alpha」
+        而改成"只用位移+缩放表达出现"。
+        **那个结论不准确** —— BLENDFUNCTION 的第 3 字节就是 SourceConstantAlpha，
+        `Surface.blit_a` 用的就是它（2026-09-26 实测确认）。
+
+        实现前提：v3 立绘**同画布、同底边**，所以两张图直接叠即可，无需额外对齐。
+        另：从反应态回到待机时先让角色眨一次眼（"回神"，设计稿 §4.3）。
+        """
+        prev = getattr(self, "_shown_key", None)
+        if not prev or prev == key:
+            self._fade = None
+            self._shown_key = key
+            return
+        # ★ 溶解闸门：两张立绘差异够大时**直接硬切**，不做交叉溶解。
+        # 为什么：交叉溶解只在两帧姿态/表情相近时才好看（参考视频就是如此）。
+        # 这套 8 态 Q 版姿态与表情差异都很大（实测局部最大差异 78~218，阈值 60），
+        # 硬做溶解 = 两张脸叠在一起的双重曝光 —— 用户反馈的"点击时多个重叠"就是它。
+        if self._pose_local_diff(prev, key) > MOTION.POSE_FADE_MAX_DIFF:
+            self._fade = None
+            self._shown_key = key
+            return
+        fade = getattr(self, "_fade", None)
+        if not fade or fade.get("from") != prev or fade.get("to") != key:
+            self._fade = fade = {"from": prev, "to": key, "t0": now}
+            prev_state = prev.split(".")[-1].replace("_f", "")
+            if state == "idle" and prev_state in REACT_FACES:
+                self._blinker.blink_now(now)   # 反应态回待机 → 先眨一次再回神
+        self._shown_key = key
+        p = (now - fade["t0"]) / max(1e-3, MOTION.STATE_FADE_S)
+        if p >= 1.0:
+            self._fade = None
+            return
+        src = self._sprite_cache.get(fade["from"])
+        if not src:
+            self._fade = None
+            return
+        a = int(round(255 * (1.0 - p)))        # 旧图淡出，露出新图
+        if a > 2:
+            s.blit_a(src[0], x, y, w, h, a)
+
     def _draw_blink(self, s, x, y, w, h, now, state="idle", facing=""):
         """三段式拟真眨眼绘制（依赖 BlinkScheduler 三段缓动）。
 
@@ -3003,6 +3259,23 @@ class WhalePet:
             else:
                 return
         phase = self._blinker.blink_phase(now) if not droop else "droop"
+
+        # ---- 分层差分：有闭眼贴片的态直接合成**真实像素**（不再是椭圆盖板）----
+        # 按闭合度取「半闭档」：贴片是离线按"眼睑下落位置"做的垂直遮罩，
+        # 睑线以上用闭眼像素、以下保留睁眼像素 —— 这才是半闭，不是两张图混合。
+        # 夜间慵懒态（droop）仍走下面的椭圆路径：它是常驻半眯、不是眨眼。
+        patch = None if droop else self._blink_cache.get(state)
+        if patch:
+            slots = patch["slots"]
+            n = len(slots)
+            closure = 1.0 - max(0.0, min(1.0, ratio))
+            idx = int(round(closure * n))          # 0 = 完全睁眼（不画）
+            if idx >= 1:
+                idx = min(idx, n) - 1
+                px = patch["x_mirror"] if facing == "_f" else patch["x"]
+                s.blit(slots[idx], x + px, y + patch["y"], patch["w"], patch["h"])
+            return
+
         skin = _lerp_argb(_argb(fc.get("lid_skin") or fc.get("skin_color")
                                 or "#FFF2EA"), _argb(fc.get("eyelid_color", "#2A2438")),
                           MOTION.BLINK_LID_SHADE)
@@ -3040,7 +3313,7 @@ class WhalePet:
                           ew * 1.04 * width_factor,
                           cover_h + pad * 0.6)
 
-            # === 下睑微抬：真实眨眼下睑轻抬 ~22%（上睑主导 80%）===
+            # === 下睑微抬：量取 BLINK_LOWER_LID=10%（上睑主导，下睑轻辅助）===
             low_h = (bot - top) * MOTION.BLINK_LOWER_LID * close_p
             if low_h > 0.5:
                 s.ellipse(skin,
@@ -3169,7 +3442,12 @@ class WhalePet:
         说明：GDI 的 AlphaBlend 走的是 1:1 直拷，**没有全局 alpha**，
         所以入退场不靠淡入淡出，而是靠位移 + 缩放（drop / hug / walk_in 三种曲线）
         ——视觉上一样读得出"出现了"，且不必为透明度再引入一遍重采样。
+
+        ⚠️ 2026-09-26 起**整体停用**：用户明确要求帽子（贝雷帽）/小猫/鲸鱼玩偶都不进桌宠，
+        切到 v3 统一审美线。这里保留代码（不删）以便随时恢复，由 OFF 开关控制。
         """
+        if ACCESSORIES_OFF:
+            return
         acc = getattr(self, "_acc", None)
         rect = getattr(self, "_spr_rect", None)
         if not acc or not rect:                     # 早期 draw（__init__）直接跳过
@@ -3242,12 +3520,9 @@ class WhalePet:
         # 部位点击触发的临时形态切换：self._morph_state 非空时优先
         if self._morph_state and self._morph_until > now:
             state = self._morph_state
-        elif reacting and self._react_face == "pout":
-            state = "pout"                  # 嘟嘴档：无语表情
-        elif reacting and self._react_face == "blush":
-            state = "blush"
-        elif reacting and self._react_face == "stone":
-            state = "stone"
+        elif reacting and self._react_face in REACT_FACES:
+            # 反应态与立绘态同名，直接取用（含 v3 新增的 joy / surprise）
+            state = self._react_face
         elif self._emotion in (MOTION.EMOTION_SUCCESS, MOTION.EMOTION_WELCOME):
             state = "happy"
         elif self._emotion == MOTION.EMOTION_FAIL:
@@ -3291,6 +3566,9 @@ class WhalePet:
                 self._blit_pet(s, cached[0], img, x, y_bottom - ph_draw, pw, ph_draw)
             else:
                 self._blit_pet(s, None, img, x, y_bottom - ph_draw, pw, ph_draw)
+            # 状态切换交叉溶解（对齐参考视频；见 _draw_state_fade）
+            self._draw_state_fade(s, cache_key, x, y_bottom - ph_draw,
+                                  pw, ph_draw, now, state)
             # 立绘整体平移量（视线跟随 + 拖拽倾斜）——表情贴图必须同步平移，
             # 否则凝视/拖拽时眼睑、腮红会与眼睛、脸颊错位
             face_x = x + self._gaze_dx + self._drag_tilt
@@ -3500,9 +3778,7 @@ class WhalePet:
         _user32.AppendMenuW(
             menu, MF_STRING | (MF_CHECKED if self.focus_pin else 0),
             IDM_PIN, "锁定聚焦（pin）")
-        _user32.AppendMenuW(
-            menu, MF_STRING,
-            IDM_MODE3D, "切换到 3D 桌宠")
+        # （早期此处有「切换到 3D 桌宠」菜单项；3D 线已于 2026-09-26 退役移除）
         # P2 连续锚点：今日时间线（跨 agent 轮次，点条目开看板）
         _tl_summary, _tl_recent = self._today_timeline()
         subt = _user32.CreatePopupMenu()
@@ -3609,8 +3885,6 @@ class WhalePet:
             self._toggle_focus_pin()
         elif cmd == IDM_HANDOFF:
             self._gen_handoff()
-        elif cmd == IDM_MODE3D:
-            self._switch_to_3d()
         elif cmd == IDM_QUIT:
             self._report_event("menu_quit")
             _user32.PostQuitMessage(0)
@@ -3752,7 +4026,7 @@ class WhalePet:
             # live 模式下"用时"按 first_ts → now 算，每秒要 +1s 实时跳动
             # 强制每 tick 重绘（开销可忽略；只在 latest_turn 存在时）
             live_tick = bool(self.latest_turn and self.active)
-            if live_tick or sig != self._drawn_sig:
+            if live_tick or self._fade is not None or sig != self._drawn_sig:
                 self.draw()
                 self._drawn_sig = sig
             _user32.SetWindowPos(self.hwnd, ctypes.c_void_p(HWND_TOPMOST),
@@ -3789,6 +4063,42 @@ class WhalePet:
             pass
 
 
+# ---------------------------------------------------------------------------
+# 单实例保护
+# ---------------------------------------------------------------------------
+MUTEX_NAME = "Local\\KomiPetWhaleSingleInstance"
+ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance():
+    """抢单实例互斥量。返回 True = 我是唯一实例；False = 已有实例在跑。
+
+    为什么必须有：桌宠**本来没有任何单实例保护**（本项目 2026-09-26 实测发现）。
+    而守望进程 wb_whale_watcher.py（登录自启）会"检测到桌宠没跑就拉起"，
+    加上用户手动启动/快捷方式，就很容易出现**两个桌宠窗口几乎完全重叠**——
+    平时看不出（位置相同、同用一份位置存档），一旦各自随机相位（眨眼/摇摆）不同步，
+    就表现为用户反馈的"点击时出现多个重叠"。
+    有了它：无论谁来启动第二次，都只会安静退出，并把已有窗口拉到前台给个反馈。
+    """
+    k32 = ctypes.windll.kernel32
+    k32.CreateMutexW.restype = wt.HANDLE
+    h = k32.CreateMutexW(None, False, MUTEX_NAME)
+    if not h:
+        return True                      # 创建失败就不拦（宁可多开，不可开不了）
+    if k32.GetLastError() == ERROR_ALREADY_EXISTS:
+        # 已有实例：把它的窗口拉到前台闪一下，让用户知道"已经开着了"
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.FindWindowW(CLASS_NAME, None)
+            if hwnd:
+                u.ShowWindow(hwnd, 9)    # SW_RESTORE
+                u.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        return False
+    return True
+
+
 def main():
     seconds = None
     if "--seconds" in sys.argv:
@@ -3799,6 +4109,10 @@ def main():
     if os.name != "nt":
         sys.stderr.write("[wb-whale] 本脚本仅适用于 Windows，其他平台请运行 hover.py。\n")
         return 2
+    # ★ 单实例：已有桌宠在跑 → 安静退出（并把已有窗口拉前台），避免"多个重叠"
+    if not _acquire_single_instance():
+        sys.stderr.write("[wb-whale] 已有桌宠实例在运行，本次启动退出。\n")
+        return 0
     app = None
     try:
         app = WhalePet(run_seconds=seconds)

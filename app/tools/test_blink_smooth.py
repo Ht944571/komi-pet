@@ -5,10 +5,10 @@ r"""眨眼动画拟真化专项测试
   A. BlinkScheduler 三段时间划分正确（close / hold / open）
   B. 闭眼段缓动曲线 ease-in_quad（开始慢→结束快，验证加速度感）
   C. 睁眼段缓动曲线 ease-out_cubic（开始快→结束慢，验证刹停感）
-  D. 总时长 ~330ms，节奏自然（符合真人眨眼 250-400ms 范围）
+  D. 总时长 ~230ms（快闭慢睁），符合三层标准 150~250ms
   E. phase 标识在每段正确切换
   F. 眨眼结束后 ratio 回到 1.0（正确复位）
-  G. 双眨机制（15% 概率 + 间隔）正常工作
+  G. 双眨机制（12% 概率 + 间隔）正常工作
   H. 闭眼段 + 睁眼段都调用 _draw_blink（ratio < 1.0 触发绘制）
   I. idle 状态下不绘制（ratio = 1 时跳过）
 
@@ -146,7 +146,7 @@ check("F4: 复位后 is_active=False",
 
 
 # ===== G. 双眨机制 =====
-print("\n[G] 双眨机制（15% 概率 + BLINK_DOUBLE_GAP_S 间隔）")
+print("\n[G] 双眨机制（12% 概率 + BLINK_DOUBLE_GAP_S 间隔）")
 import random
 random.seed(0)  # 固定种子便于测试
 # 本段验证的是双眨调度公式（next_at = t0 + total + GAP），与眨眼形态无关；
@@ -169,7 +169,7 @@ try:
         break
     # next_at 应该在 blink_t0 + total + DOUBLE_GAP_S 左右
     expected = 0.0 + MOTION.BLINK_TOTAL_S + MOTION.BLINK_DOUBLE_GAP_S
-    check("G1: 双眨 next_at 距开始 ≤ ~330ms+200ms",
+    check("G1: 双眨 next_at ≈ 230ms + 0.18s（≈0.41s）",
           abs(next_at - expected) < 0.01, f"got {next_at:.3f}")
 finally:
     MOTION.BLINK_PARTIAL_PROB = _partial_prob_saved
@@ -194,18 +194,18 @@ check("H2: 全开时 ratio = 1（跳过绘制）",
 
 
 # ===== I. 随机性 =====
-print("\n[I] 随机眨眼间隔（高斯分布 2.5-9s）")
+print("\n[I] 随机眨眼间隔（常态 3~8s 随机）")
 import random
 for _ in range(20):
     wait = MOTION._next_blink_wait(0.0)
     assert MOTION.BLINK_MIN_S <= wait <= MOTION.BLINK_MAX_S, \
         f"wait out of range: {wait}"
-check("I1: 20 次随机间隔均在 [2.5, 9]s 范围", True)
+check("I1: 20 次随机间隔均在 [3, 8]s 范围", True)
 # 高斯分布中心应接近均值（采样验证，不要求精确）
 random.seed(42)
 samples = [MOTION._next_blink_wait(0.0) for _ in range(1000)]
 mean = sum(samples) / len(samples)
-check("I2: 采样均值接近 BLINK_MEAN_S(5.5)", abs(mean - MOTION.BLINK_MEAN_S) < 0.3)
+check("I2: 采样均值接近 BLINK_MEAN_S(3.6)", abs(mean - MOTION.BLINK_MEAN_S) < 0.3)
 
 
 # ===== J. 缓动函数本身 =====

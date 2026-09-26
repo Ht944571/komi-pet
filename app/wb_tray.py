@@ -36,7 +36,6 @@ TPM_RIGHTALIGN, TPM_BOTTOMALIGN = 0x0008, 0x0020
 TPM_RETURNCMD = 0x0100
 MF_STRING, MF_SEPARATOR, MF_CHECKED, MF_UNCHECKED = 0x0000, 0x0800, 0x0008, 0x0000
 ID_SAY, ID_WANDER, ID_FOLLOW, ID_QUIT = 1001, 1002, 1003, 1099
-ID_MODE2D = 1004               # P0-②：切换到 2D 桌宠（写 pet_mode → 优雅退出 → 守望拉起）
 
 
 class NOTIFYICONDATAW(ctypes.Structure):
@@ -111,8 +110,6 @@ class Tray:
         u32.AppendMenuW(self.menu, MF_STRING, ID_WANDER, "随机走动")
         u32.AppendMenuW(self.menu, MF_STRING, ID_FOLLOW, "跟随鼠标")
         u32.AppendMenuW(self.menu, MF_SEPARATOR, 0, None)
-        u32.AppendMenuW(self.menu, MF_STRING, ID_MODE2D, "切换到 2D 桌宠")
-        u32.AppendMenuW(self.menu, MF_SEPARATOR, 0, None)
         u32.AppendMenuW(self.menu, MF_STRING, ID_QUIT, "退出古见同学")
         self._sync_checks()
 
@@ -142,10 +139,6 @@ class Tray:
             self.pet.enable_follow = not self.pet.enable_follow
             self._sync_checks()
             self.pet.say("跟随鼠标：" + ("开" if self.pet.enable_follow else "关"), 1.8)
-        elif cmd == ID_MODE2D:
-            # P0-②：写 pet_mode → 优雅退出 → 守望 5s 内拉起 2D
-            if hasattr(self.pet, "switch_to"):
-                self.pet.switch_to("2d")
         elif cmd == ID_QUIT:
             self.pet.running = False
 

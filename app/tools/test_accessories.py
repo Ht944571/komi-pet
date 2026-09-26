@@ -207,21 +207,37 @@ def part_f():
             app.draw()
             return surf_to_image(app.surf).convert("RGB").copy()
 
-        base = snap([])
-        diffs = {}
-        for name, act in (("cat", ["workbuddy"]), ("beret", ["zcode"]),
-                          ("plush", ["deepseek-harness"]),
-                          ("all3", ["workbuddy", "zcode", "deepseek-harness"])):
-            diffs[name] = Chops.difference(base, snap(act)).getbbox()
-        for k, v in diffs.items():
-            check(f"{k}: 渲染像素相对'无配件'有变化", v is not None, "完全一致（没画上去）")
+        # ---- 2026-09-26 v3：配件默认停用 ----
+        # 用户明确要求「帽子（贝雷帽）/小猫/鲸鱼玩偶都不进桌宠」，故加了总开关
+        # ACCESSORIES_OFF。代码与素材都保留（不删），下面两段分别守住：
+        #   ① 关着的时候真的什么都不画  ② 打开时休眠代码的入退场几何仍然正确
+        _saved_off = W.ACCESSORIES_OFF
+        check("OFF: ACCESSORIES_OFF 默认 True（配件不进桌宠）", _saved_off is True)
+        base_off = snap([])
+        all_off = snap(["workbuddy", "zcode", "deepseek-harness"])
+        check("OFF: 开关关闭时激活全部配件也不改变画面（停用确实生效）",
+              Chops.difference(base_off, all_off).getbbox() is None,
+              str(Chops.difference(base_off, all_off).getbbox()))
 
-        # 三件必须落在不同区域：帽在头顶（上）、玩偶在中、猫在底
-        allb = diffs.get("all3")
-        check("三者同时：差异区域覆盖到窗口上部（帽子）", allb is not None and allb[1] < 260,
-              str(allb))
-        check("三者同时：差异区域覆盖到窗口下部（猫）", allb is not None and allb[3] > 380,
-              str(allb))
+        try:
+            W.ACCESSORIES_OFF = False          # 临时打开，测休眠代码
+            base = snap([])
+            diffs = {}
+            for name, act in (("cat", ["workbuddy"]), ("beret", ["zcode"]),
+                              ("plush", ["deepseek-harness"]),
+                              ("all3", ["workbuddy", "zcode", "deepseek-harness"])):
+                diffs[name] = Chops.difference(base, snap(act)).getbbox()
+            for k, v in diffs.items():
+                check(f"{k}: 渲染像素相对'无配件'有变化", v is not None, "完全一致（没画上去）")
+
+            # 三件必须落在不同区域：帽在头顶（上）、玩偶在中、猫在底
+            allb = diffs.get("all3")
+            check("三者同时：差异区域覆盖到窗口上部（帽子）", allb is not None and allb[1] < 260,
+                  str(allb))
+            check("三者同时：差异区域覆盖到窗口下部（猫）", allb is not None and allb[3] > 380,
+                  str(allb))
+        finally:
+            W.ACCESSORIES_OFF = _saved_off     # 还原总开关
     finally:
         try:
             app.close()
