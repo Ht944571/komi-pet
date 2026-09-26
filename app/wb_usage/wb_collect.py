@@ -367,13 +367,30 @@ def vacuum_db(conn):
     """回收已删除页（auto_vacuum=0 库的 DELETE 不缩文件，必须 VACUUM）。
     需无其他连接持有写事务；WAL 读连接一般不阻塞，失败时由调用方重试。
     VACUUM 的产出先进 WAL，追加 TRUNCATE checkpoint 让主文件体积立即落地
-    （否则要等最后一个连接关闭）。"""
-    conn.commit()
-    conn.execute("VACUUM")
+    （否则要等最后一个连接关闭）。
+
+    2026-09-26：VACUUM 会**长时间独占写锁**（1GB 库数分钟），期间服务健康自检可能
+    被卡超时 → 被看门狗误判成"服务假死"。所以这里置上 wb_dw.DB_BUSY，
+    让 wb_api._watchdog 在这段时间不计失败。
+    """
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        from wb_dw import DB_BUSY
+        DB_BUSY.set()
     except Exception:
         pass
+    try:
+        conn.commit()
+        conn.execute("VACUUM")
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+    finally:
+        try:
+            from wb_dw import DB_BUSY
+            DB_BUSY.clear()
+        except Exception:
+            pass
 
 
 def _meta_update(conn, path, cursor, bcursor, last_raw, state, seq, pdigest):

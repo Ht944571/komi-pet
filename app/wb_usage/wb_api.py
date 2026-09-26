@@ -242,17 +242,37 @@ class Api:
         # 整个 v_call（26 万行 × json_extract），实测 3.9s → 10.3s。CTE 版一次。
         where, _ = self._conds(self._day_cond(days, col="t.day"),
                                self._agent_cond(agent, col="t.agent"))
-        sub = ("SELECT c.model AS model, COUNT(*) AS api_calls, SUM(c.credit) AS credit,"
-               " SUM(c.total_tokens) AS total_tokens"
-               " FROM v_call c JOIN v_turn t ON t.turn_id = c.turn_id"
-               + (" " + where if where else "") + " GROUP BY c.model")
-        sql = ("WITH agg AS (" + sub + ")"
-               " SELECT model, api_calls, credit, total_tokens,"
-               " ROUND(100.0*credit/(SELECT SUM(credit) FROM agg),2) AS credit_pct,"
-               " ROUND(100.0*total_tokens/(SELECT SUM(total_tokens) FROM agg),2) AS token_pct"
-               " FROM agg ORDER BY credit DESC, total_tokens DESC")
         with closing(get_conn(self.db_path)) as c:
-            rows = c.execute(sql).fetchall()
+            src = self._src(c)
+            rows = None
+            if src == "dws_turn":
+                # 走预聚合表 dws_model（日×agent×模型 粒度，几百行）：
+                # 不再每次 `v_call JOIN v_turn`（26 万行 × json_extract，实测 2.5~10s）。
+                # 去掉 where 里的 t. 别名前缀（dws_model 无别名）。
+                w = (where or "").replace("t.day", "day").replace("t.agent", "agent")
+                sub = ("SELECT model AS model, SUM(api_calls) AS api_calls,"
+                       " SUM(credit) AS credit, SUM(total_tokens) AS total_tokens"
+                       " FROM dws_model" + ((" " + w) if w else "") + " GROUP BY model")
+                sql = ("WITH agg AS (" + sub + ")"
+                       " SELECT model, api_calls, credit, total_tokens,"
+                       " ROUND(100.0*credit/(SELECT SUM(credit) FROM agg),2) AS credit_pct,"
+                       " ROUND(100.0*total_tokens/(SELECT SUM(total_tokens) FROM agg),2) AS token_pct"
+                       " FROM agg ORDER BY credit DESC, total_tokens DESC")
+                try:
+                    rows = c.execute(sql).fetchall()
+                except Exception:
+                    rows = None      # 预聚合表还没建/被删 → 优雅退回原查询，绝不 500
+            if rows is None:
+                sub = ("SELECT c.model AS model, COUNT(*) AS api_calls, SUM(c.credit) AS credit,"
+                       " SUM(c.total_tokens) AS total_tokens"
+                       " FROM v_call c JOIN v_turn t ON t.turn_id = c.turn_id"
+                       + (" " + where if where else "") + " GROUP BY c.model")
+                sql = ("WITH agg AS (" + sub + ")"
+                       " SELECT model, api_calls, credit, total_tokens,"
+                       " ROUND(100.0*credit/(SELECT SUM(credit) FROM agg),2) AS credit_pct,"
+                       " ROUND(100.0*total_tokens/(SELECT SUM(total_tokens) FROM agg),2) AS token_pct"
+                       " FROM agg ORDER BY credit DESC, total_tokens DESC")
+                rows = c.execute(sql).fetchall()
         return {"ok": True, "data": [dict(r) for r in rows]}
 
     def projects(self, agent="all"):
@@ -269,7 +289,18 @@ class Api:
 
     def _agents(self):
         with closing(get_conn(self.db_path)) as c:
-            rows = c.execute("SELECT * FROM v_agent").fetchall()
+            # 优先读物化表 dws_agent（由刷新统一灌，口径取自 v_agent 定义）。
+            # 早期用的是"孪生视图 v_agent_ft"，但 SQLite 的 CREATE VIEW 需要独占锁，
+            # 刷新时 DROP+CREATE 一旦失败视图就没了（实测踩到两次，且还有旧进程会删它）。
+            # 换成表之后没有任何 DDL 抖动；表还没建/被删 → 优雅退回原视图，绝不 500。
+            rows = None
+            if self._src(c) == "dws_turn":
+                try:
+                    rows = c.execute("SELECT * FROM dws_agent").fetchall()
+                except Exception:
+                    rows = None
+            if rows is None:
+                rows = c.execute("SELECT * FROM v_agent").fetchall()
         data = []
         for r in rows:
             d = dict(r)
@@ -378,7 +409,17 @@ class Api:
     def sessions(self):
         """会话维度（标题/项目），供前端补全会话名（含 CodeBuddy 官方会话）。"""
         with closing(get_conn(self.db_path)) as c:
-            rows = c.execute("SELECT session_id, title, project FROM v_session").fetchall()
+            # 优先读物化表 dws_session（v_session 带窗口函数，每次算约 500ms）。
+            # 表还没建/被删 → 优雅退回原视图，绝不 500。
+            rows = None
+            try:
+                if self._src(c) == "dws_turn":
+                    rows = c.execute("SELECT session_id, title, project FROM dws_session"
+                                     ).fetchall()
+            except Exception:
+                rows = None
+            if rows is None:
+                rows = c.execute("SELECT session_id, title, project FROM v_session").fetchall()
             cb = c.execute(
                 """SELECT 'official:'||request_id AS session_id,
                           COALESCE(NULLIF(substr(user_prompt,1,40),''),'(无输入)') AS title,
@@ -642,21 +683,37 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _watchdog(port, interval=30):
-    """自检看门狗：每 interval 秒自连 /api/health，连续失败 2 次则自杀退出。
-    解决"进程活着但 HTTP 卡死"的服务假死（launchd KeepAlive 只在进程退出时重启）。"""
+    """自检看门狗：每 interval 秒自连 /api/health，连续失败到阈值则自杀退出。
+
+    2026-09-26 加固（此前设计有缺陷，实测导致 API 无提示消失）：
+      · 原为「超时 3s + 连续失败 2 次即 os._exit(1)」，注释写"launchd 自动拉起"——
+        但**本机是 Windows，没有 launchd**，自杀后无人拉起，只有用户下次开看板时
+        才被桌宠的自愈（_ensure_dashboard_server）重启。表现为"看板偶尔打不开"。
+      · 而 3s 超时太紧：当时 2.4s 的慢查询一挤就误判（现已随物化优化消失）。
+    改动：
+      · 超时 3s → 10s；连续失败 2 次 → **6 次**（约 3 分钟容忍）
+      · **DB 正忙（VACUUM / 物化刷新等独占写锁的操作）时不计失败**，直接重新计数
+      · 自杀前 **flush** 一行说明（os._exit 不会刷缓冲，此前日志里根本看不到它自杀）
+    """
     import urllib.request as _ur
     fails = 0
     opener = _ur.build_opener(_ur.ProxyHandler({}))   # 绕过系统代理，直连本机
     while True:
         time.sleep(interval)
+        if wb_dw.DB_BUSY.is_set():
+            fails = 0                    # 数据库正忙（重活独占锁）→ 不算服务假死
+            continue
         try:
-            with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=3) as r:
+            with opener.open(f"http://127.0.0.1:{port}/api/health", timeout=10) as r:
                 ok = bool(json.loads(r.read().decode()).get("ok"))
             fails = 0 if ok else fails + 1
         except Exception:
             fails += 1
-        if fails >= 2:
-            print(f"[api] 看门狗：连续 {fails} 次自检失败，自杀退出（launchd 自动拉起）")
+        if fails >= 6:
+            print(f"[api] 看门狗：连续 {fails} 次自检失败，退出"
+                  f"（Windows 无 launchd，需下次开看板由桌宠自愈拉起）", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
             os._exit(1)
 
 

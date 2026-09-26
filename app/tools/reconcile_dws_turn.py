@@ -29,15 +29,19 @@ DB_FALLBACK = os.path.join(APP, "wb_usage", "data", "wb_usage_dw.db")
 # 需要覆盖的端点（全部会读轮次层的；args 为调用参数）
 CASES = [
     ("kpi", {}),
+    ("kpi", {"days": "today"}),
     ("daily", {"days": "all"}),
     ("daily", {"days": "today"}),
     ("daily", {"days": "7"}),
     ("projects", {}),
+    ("projects", {"agent": "workbuddy"}),
     ("clients", {}),
     ("sessions", {}),
     ("tops", {}),
     ("agents", {}),
     ("models", {}),
+    ("models", {"days": "7"}),
+    ("models", {"days": "30", "agent": "workbuddy"}),
 ]
 
 

@@ -20,6 +20,8 @@ VIEW 实时查询，ODS 增量入库后聚合自动反映最新数据，无需�
 import argparse
 import os
 import sqlite3
+import sys
+import threading
 import time
 
 from wb_common import day_of, ts_to_str
@@ -413,6 +415,16 @@ def session_latest_turns(conn, session_id, limit=10):
 #   读取方 **应先读 dws_turn**，读不到再退回 v_turn_total。
 _DWS_TURN_BUILT_KEY = "dws_turn_built_at"
 
+# ---------------------------------------------------------------------------
+# 数据库"正忙"标志（2026-09-26）
+# ---------------------------------------------------------------------------
+# 物化刷新、VACUUM、raw 归档这些操作会**独占写锁**，期间健康检查/普通查询可能被卡住。
+# 谁在干这类重活就把这个 Event 置上，服务健康自检（wb_api._watchdog）看到它就不计入失败，
+# 避免"重活把自检卡超时 → 误判服务假死 → 自杀"（Windows 上没有 launchd 兜底，
+# 自杀了就真的没人拉起，只有用户下次开看板才被桌宠自愈重启）。
+DB_BUSY = threading.Event()
+
+
 
 def turn_src(conn=None, db_path=None):
     """返回当前可用的**轮次数据源表名**：优先 'dws_turn'（物化快照，~0ms），
@@ -441,6 +453,59 @@ def turn_src(conn=None, db_path=None):
     return "v_turn_total"
 
 
+
+
+def ensure_fast_views(conn):
+    """把「以 v_turn_total 为源的视图」批量生成一份「以 dws_turn 为源」的孪生视图。
+
+    做法是**从 sqlite_master 读出原视图定义、只替换数据源** —— 因此不存在"抄错口径"
+    的风险，原视图改了这里自动跟着变（下次 ensure 时重建）。
+    读取方在物化表就绪时用 `*_ft`，否则退回原视图（见 wb_dw.turn_src）。
+
+    目前需要孪生的：v_agent（/api/agents 直接 SELECT * FROM v_agent）
+    """
+    made = []
+    for name, src in (("v_agent_ft", "v_agent"),):
+        try:
+            row = conn.execute("SELECT sql FROM sqlite_master WHERE type='view' AND name=?",
+                               (src,)).fetchone()
+            if not row or "FROM v_turn_total" not in row[0]:
+                continue
+            ddl = row[0].replace(f"VIEW {src} ", f"VIEW {name} ", 1).replace(
+                "FROM v_turn_total", "FROM dws_turn")
+            # ✅ 定义没变就**什么都不做**。
+            #   为什么这么重要：早期每次刷新都 DROP + CREATE。而 SQLite 的 DDL 需要独占锁，
+            #   刷新时其它连接可能正持有写事务 → CREATE 失败，但 DROP 已经成功了 →
+            #   v_agent_ft 凭空消失，端点静默退回慢路径（不报错，极难发现，实测踩到两次）。
+            #   所以：已是最新就直接跳过，绝不做无谓的 DROP。
+            cur = conn.execute("SELECT sql FROM sqlite_master WHERE type='view' AND name=?",
+                               (name,)).fetchone()
+            if cur and (cur[0] or "").strip() == ddl.strip():
+                made.append(name)
+                continue
+            last = None
+            for attempt in range(3):
+                try:
+                    conn.execute(f"DROP VIEW IF EXISTS {name}")
+                    conn.execute(ddl)
+                    conn.commit()
+                    made.append(name)
+                    last = None
+                    break
+                except Exception as e:
+                    last = e
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    time.sleep(0.5 * (attempt + 1))
+            if last is not None:
+                sys.stderr.write(f"[dw] 建立 {name} 失败（退回用原视图 {src}）：{last}\n")
+        except Exception as e:
+            sys.stderr.write(f"[dw] ensure_fast_views 异常（{src}）：{e}\n")
+    return made
+
+
 def ensure_dws_turn(conn):
     """保证物化表**结构**存在（空表；秒级、幂等）。不灌数据。"""
     row = conn.execute(
@@ -449,8 +514,44 @@ def ensure_dws_turn(conn):
         # CREATE TABLE AS ... WHERE 0：借视图拿列名与类型，但不产生行（快）
         conn.execute("CREATE TABLE dws_turn AS SELECT * FROM v_turn_total WHERE 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dws_turn_day ON dws_turn(day)")
+    # dws_model：模型分布用的**预聚合**表（日 × agent × 模型 粒度）。
+    # 为什么单独建：/api/models 原本每次跑 `v_call JOIN v_turn`（26 万行 × json_extract），
+    # 实测 2.5~10s；预聚合后端点只剩一次小表 GROUP BY（<10ms）。
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='dws_model'").fetchone()
+    if not row:
+        conn.execute("""CREATE TABLE dws_model (
+            day TEXT, agent TEXT, model TEXT,
+            api_calls INTEGER, credit REAL, total_tokens INTEGER)""")
+    # dws_agent：agent 汇总的物化表（列结构借 v_agent 定义，见 _agent_ft_select）。
+    # 为什么不用"孪生视图 v_agent_ft"：SQLite 的 CREATE VIEW 需要独占锁，而每次刷新
+    # 都要 DROP+CREATE，一旦 DROP 成功 CREATE 失败，视图就凭空消失（静默退回慢路径，
+    # 且若还有别的进程跑旧代码，会反复把它删掉——实测踩到两次）。改成表后由刷新统一灌，
+    # 读取方只读表，没有任何 DDL 抖动。
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='dws_agent'").fetchone():
+        conn.execute("""CREATE TABLE IF NOT EXISTS dws_agent (
+            agent TEXT, turns INTEGER, api_calls INTEGER, credit REAL,
+            total_tokens INTEGER, cached_tokens INTEGER, miss_tokens INTEGER,
+            completion_tokens INTEGER, thinking_tokens INTEGER, sessions INTEGER,
+            first_day TEXT, last_day TEXT, cache_hit_rate REAL)""")
+    # dws_session：v_session 的物化快照（窗口函数视图，实测约 500ms）。
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='dws_session'").fetchone():
+        try:
+            conn.execute("CREATE TABLE dws_session AS SELECT * FROM v_session WHERE 0")
+        except Exception:
+            pass
     conn.commit()
     return True
+    """（保留给需要"口径随 v_agent 自动同步"的场景）把 v_agent 定义改写成以 dws_turn
+    为源的 SELECT。
+
+    ⚠️ 生成 DDL 时不要直接拼 `WHERE 0`（原 SELECT 以 GROUP BY 结尾 → 语法错），
+    也不要在刷新里反复 DROP+CREATE 视图（需独占锁，失败会丢视图）。dws_agent 用的是
+    显式表结构 + 显式聚合，口径由 tools/reconcile_dws_turn.py 逐字段比对保证。
+    """
+    return None
 
 
 def dws_turn_age(conn):
@@ -483,16 +584,52 @@ def refresh_dws_turn(conn=None, db_path=None, min_interval_s=30.0, force=False,
             if age is not None and age < min_interval_s:
                 return False
         t0 = time.time()
+        DB_BUSY.set()                      # 刷新期间置忙：健康自检别把它算成"服务假死"
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute("DELETE FROM dws_turn")
             conn.execute("INSERT INTO dws_turn SELECT * FROM v_turn_total")
+            # dws_model：同事务重建，保证两张表口径一致
+            conn.execute("DELETE FROM dws_model")
+            conn.execute("""INSERT INTO dws_model(day, agent, model, api_calls, credit, total_tokens)
+                SELECT t.day, t.agent, c.model, COUNT(*), SUM(c.credit), SUM(c.total_tokens)
+                FROM v_call c JOIN v_turn t ON t.turn_id = c.turn_id
+                WHERE t.day != ''
+                GROUP BY t.day, t.agent, c.model""")
+            # dws_agent：与 v_agent 同口径的显式聚合（列已固定）。
+            # 等价性由 tools/reconcile_dws_turn.py 对 /api/agents 逐字段比对保证。
+            conn.execute("DELETE FROM dws_agent")
+            conn.execute("""INSERT INTO dws_agent(agent, turns, api_calls, credit,
+                    total_tokens, cached_tokens, miss_tokens, completion_tokens,
+                    thinking_tokens, sessions, first_day, last_day, cache_hit_rate)
+                SELECT agent,
+                       COUNT(*),
+                       SUM(api_calls), SUM(credit), SUM(total_tokens),
+                       SUM(cached_tokens), SUM(miss_tokens),
+                       SUM(completion_tokens), SUM(thinking_tokens),
+                       COUNT(DISTINCT session_id), MIN(day), MAX(day),
+                       CASE WHEN SUM(cached_tokens) + SUM(miss_tokens) > 0
+                            THEN 1.0 * SUM(cached_tokens) / (SUM(cached_tokens) + SUM(miss_tokens))
+                            ELSE NULL END
+                FROM dws_turn WHERE agent != '' GROUP BY agent""")
+            # dws_session：会话快照（v_session 带窗口函数，每次算约 500ms → 物化）
+            try:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                "AND name='dws_session'").fetchone():
+                    conn.execute("DELETE FROM dws_session")
+                    conn.execute("INSERT INTO dws_session SELECT * FROM v_session")
+            except Exception:
+                pass
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
                          (_DWS_TURN_BUILT_KEY, str(time.time())))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            DB_BUSY.clear()
+        # 注：早期这里会重建"孪生视图" v_agent_ft，但 DDL 需要独占锁、易丢（见
+        # ensure_dws_turn 内的说明）。现改为物化表 dws_agent，无需任何视图。
         if verbose:
             n = conn.execute("SELECT COUNT(*) FROM dws_turn").fetchone()[0]
             print(f"[dw] dws_turn 已物化 {n} 行，用时 {time.time()-t0:.1f}s")
