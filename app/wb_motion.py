@@ -21,19 +21,29 @@ BREATH_EXHALE_S = 1.800               # 呼气段（27 帧）—— 非对称
 TAIL_PERIOD_S = 1.602                 # 尾鳍摆动周期（与呼吸 1:2 错开）
 FLOAT_PERIOD_S = 6.006                # 漂浮周期
 
-BLINK_MIN_S = 2.5                      # 眨眼间隔下限（保护）
-BLINK_MAX_S = 9.0                      # 眨眼间隔上限（保护）
-BLINK_MEAN_S = 5.5                     # 间隔均值（高斯分布中心）
-BLINK_SIGMA_S = 1.4                    # 间隔标准差（决定"自然随机"的松散度）
-# 三段式眨眼节奏（拟真）：闭眼（ease-in）→ 全闭保持 → 睁眼（ease-out）
-# 真实人眨眼：闭眼 ~80-100ms（开始慢→闭合快）/ 全闭 ~30-50ms / 睁眼 ~120-180ms（开始快→睁开慢）
-# 量化到 15fps（66ms 整数倍）：close=99ms/2 帧、hold=66ms/1 帧、open=165ms/3 帧，总 ~330ms
-BLINK_CLOSE_S = 0.099                  # 闭眼段（ease-in）
-BLINK_HOLD_S  = 0.066                  # 全闭保持段（眼睛完全合拢）
-BLINK_OPEN_S  = 0.165                  # 睁眼段（ease-out）
-BLINK_TOTAL_S = BLINK_CLOSE_S + BLINK_HOLD_S + BLINK_OPEN_S  # ≈ 330ms
-BLINK_DOUBLE_PROB = 0.10              # 双眨概率（真实约 5-8%，略高于真实增加萌感）
-BLINK_DOUBLE_GAP_S = 0.198            # 双眨间隔（3 帧）
+BLINK_MIN_S = 3.0                      # 眨眼间隔下限（生理规律：常态 3~8s）
+BLINK_MAX_S = 8.0                      # 眨眼间隔上限（禁止固定周期）
+BLINK_MEAN_S = 3.6                     # 间隔均值 ≈ 16 次/分（友好感最佳 18 次/分附近）
+BLINK_SIGMA_S = 1.1                    # 间隔标准差（完全随机，禁止节拍器）
+# 注视/专注状态：间隔拉长到 8~12s（慢而轻的「注视式眨眼」）
+BLINK_ATTENTION_MEAN_S = 9.5
+BLINK_ATTENTION_MIN_S = 8.0
+BLINK_ATTENTION_MAX_S = 12.0
+BLINK_NIGHT_MEAN_FACTOR = 1.9          # 夜间：眨眼频率降低（间隔拉长）
+BLINK_NIGHT_MAX_EXTRA = 4.0            # 夜间上限额外放宽（秒）
+BLINK_ATTENTION_DUR = 1.4              # 注视式慢眨：单次时长 ×1.4（慢而轻）
+# 快闭慢睁（单次 150~250ms）：闭眼快（~30%）/ 全闭仅 1 帧 / 睁眼慢（~60%）
+BLINK_CLOSE_S = 0.065                  # 闭眼段（ease-in，快收）
+BLINK_HOLD_S = 0.030                   # 全闭保持 ≈ 1 帧
+BLINK_OPEN_S = 0.135                   # 睁眼段（ease-out，慢睁）
+BLINK_TOTAL_S = BLINK_CLOSE_S + BLINK_HOLD_S + BLINK_OPEN_S  # ≈ 230ms
+BLINK_DOUBLE_PROB = 0.12               # 随机双连眨 10~15%
+BLINK_DOUBLE_GAP_S = 0.18              # 双连眨间隔 <300ms
+BLINK_STARTLE_GAP_S = 0.05             # 受惊连眨：主眨结束 → 第二眨（start-to-start <300ms）
+BLINK_LOWER_LID = 0.10                 # 下眼睑辅助上抬 10%（上睑主导，下睑轻辅助）
+BLINK_NOD_PX = 1.5                     # 眨眼伴随的头部微点（1~2px，非孤立运动）
+BLINK_NIGHT_DROOP = 0.30               # 夜间半眯眼：常驻眼睑覆盖 30%（慵懒态）
+BLINK_BUFFER = 0.10                    # 参数两端缓冲（Live2D 规范：防极限位置抖动）
 
 # --- 状态调制（眨眼跟着角色状态走，不是常数）---
 # 工作中（会话 running）：眨眼率降 30–50%——"专注看着你的进度"。
@@ -318,53 +328,78 @@ def shadow_scale(now, phase):
 # ============================================================
 
 class BlinkScheduler:
-    """三段式拟真眨眼状态机（缓动闭眼 → 全闭保持 → 缓动睁眼）+ 状态调制。
+    """眨眼状态机 v2 —— 三层最高标准的 2D 落地（节奏/时序/交互联动）。
 
-    时间轴（眨眼开始 = blink_t0）：
-      [t0, t0+close)            闭眼段：ratio 从 1 → (1-深度)（ease-in，慢→快）
-      [t0+close, t0+close+hold)  保持段：ratio = 0（全闭，上下睑接触；部分眨眼无此段）
-      [t0+close+hold, t0+total)  睁眼段：ratio 从 (1-深度) → 1（ease-out，快→慢）
-      [t0+total, ∞)             睁眼完成（ratio=1）
+    时间轴（眨眼开始 = blink_t0；快闭慢睁：闭 ~28% / 全闭 1 帧 / 睁 ~59%）：
+      [t0, t0+close)            闭眼段：ratio 1 → (1-深度)（ease-in 快收）
+      [t0+close, +hold)         保持段：全闭 ≈ 1 帧（部分眨眼无此段）
+      [t0+.., t0+total)         睁眼段：(1-深度) → 1（ease-out 慢睁）
 
-    闭眼曲线选择：
-      - 闭眼用 ease-in（开始慢→闭合时快）：眼皮下落时加速度感，更自然
-      - 睁眼用 ease-out（开始快→睁开慢）：眼皮弹起后渐渐刹住，类似真实肌肉
-
-    状态调制（调用方每帧更新三个开关，数字全部在本模块常量里）：
-      - rate_scale > 1：间隔整体拉长（工作中降频）
-      - suppressed：拖拽/被端详/反应动画期间禁眨——不开新眨眼，
-        进行中的直接跳到睁开段收尾（禁眨 ≠ 定格成半闭眼）
-      - idle：长时间无人，偶发慢眨（时长 ×1.5–2、必定全闭）出犯困感
-    每次触发眨眼时采样一次形态（闭合深度 / 时长倍率）写入分段参数；
-    默认分段 = 基准常量，手动设 blink_t0/blink_total 的旧用法不受影响。
+    节奏（完全随机，禁止固定周期）：
+      · 常态 3~8s（均值 3.6s ≈ 16 次/分）；注视/工作中 8~12s；夜间再拉长
+    交互联动（调用方每帧更新标志）：
+      · attention=True  鼠标悬停 → 注视式慢眨（间隔 8~12s、时长 ×1.4）
+      · busy=True       工作中 → 同注视带（专注时眨眼少）
+      · night=True      夜间 → 频率降低 + 渲染层半眯眼（droop 由渲染层画）
+      · startle()       受惊连眨：立即双连眨（点击反馈）
+      · blink_now()     状态回归待机 → 先自然眨一次
+    头部微点：nod(now) 返回 0~1 包络，渲染层换算成 1~2px 头部下压——
+    眨眼不是孤立运动（通用核心标准 2）。
     """
 
     def __init__(self, now, quality=QUALITY_FULL):
         self.quality = quality
-        self.rate_scale = 1.0        # 间隔放大系数（工作中 >1 → 眨得更少）
+        self.rate_scale = 1.0        # 兼容保留（工作中的额外放大，一般 1.0）
         self.suppressed = False      # 禁眨（拖拽/被端详/反应动画期间）
         self.idle = False            # 长时间无人（偶发慢眨）
-        self.next_at = now + _next_blink_wait(now, self.rate_scale)
+        self.attention = False       # 注视（鼠标悬停/专注）→ 8~12s 慢眨
+        self.busy = False            # 工作中 → 同注视带
+        self.night = False           # 夜间 → 频率降低
+        self._interval_mean = BLINK_MEAN_S
+        self._interval_lo = BLINK_MIN_S
+        self._interval_hi = BLINK_MAX_S
+        self._refresh_interval_band(now)
+        self.next_at = now + _next_blink_wait(now, self._interval_mean,
+                                              self._interval_lo, self._interval_hi)
         self.blink_t0 = 0.0
         self.blink_total = 0.0
         self._pending_double = False
         self._was_suppressed = False
+        self._startle_left = 0       # 受惊连眨：剩余眨数（2 = 双连眨）
+        self._startle_next = None    # 受惊第二眨的触发时刻
         # 当前眨眼的分段时长与闭合深度（触发时重采样；默认=基准值）
         self.seg_close = BLINK_CLOSE_S
         self.seg_hold = BLINK_HOLD_S
         self.seg_open = BLINK_OPEN_S
         self.close_depth = 1.0       # 本次眨眼闭到多深（1.0=全闭；部分眨眼 <1）
+        self.dur_scale = 1.0         # 注视式慢眨的时长倍率
+
+    def _refresh_interval_band(self, now):
+        """按状态选间隔带：注视/工作中 8~12s；常态 3~8s；夜间整体拉长。"""
+        if self.attention or self.busy:
+            mean, lo, hi = (BLINK_ATTENTION_MEAN_S, BLINK_ATTENTION_MIN_S,
+                            BLINK_ATTENTION_MAX_S)
+        else:
+            mean, lo, hi = BLINK_MEAN_S, BLINK_MIN_S, BLINK_MAX_S
+        if self.night:
+            mean *= BLINK_NIGHT_MEAN_FACTOR
+            hi += BLINK_NIGHT_MAX_EXTRA
+        self._interval_mean, self._interval_lo, self._interval_hi = mean, lo, hi
 
     def is_active(self, now):
         if self.quality == QUALITY_OFF:
             return False
         return now < self.blink_t0 + self.blink_total
 
-    def _begin_blink(self, now):
-        """采样本次眨眼的形态（慢眨 / 闭合深度），写入分段参数。"""
+    def _begin_blink(self, now, force_full=False):
+        """采样本次眨眼的形态（慢眨 / 闭合深度 / 注视式时长），写入分段参数。
+        force_full：受惊连眨用——必全闭、不慢化（惊吓反应是快的）。"""
         self.blink_t0 = now
-        f = 1.0
-        if self.idle and random.random() < BLINK_SLOW_PROB:
+        f = self.dur_scale
+        if force_full:
+            depth = 1.0
+            f = 1.0
+        elif self.idle and random.random() < BLINK_SLOW_PROB:
             f = random.uniform(BLINK_SLOW_SCALE_MIN, BLINK_SLOW_SCALE_MAX)
             depth = 1.0
         elif random.random() < BLINK_PARTIAL_PROB:
@@ -377,36 +412,65 @@ class BlinkScheduler:
         self.close_depth = depth
         self.blink_total = self.seg_close + self.seg_hold + self.seg_open
 
+    def startle(self, now):
+        """受惊连眨（交互级 §三.2）：立即双连眨（两次均全闭，间隔 <300ms）。
+        与普通双眨的区别：**立即**触发、必定全闭（惊吓反应是快的）。"""
+        self._startle_left = 2
+        self.blink_t0 = 0.0
+        self.blink_total = 0.0
+        self.next_at = now
+
+    def blink_now(self, now):
+        """状态回归待机 → 先自然眨一次（交互级 §三.3）。"""
+        self.next_at = now
+
+    def nod(self, now):
+        """眨眼头部微点包络：0~1（渲染层 × BLINK_NOD_PX 换算 1~2px 下压）。"""
+        if not self.is_active(now):
+            return 0.0
+        t = now - self.blink_t0
+        total = self.blink_total or 1e-6
+        return max(0.0, math.sin(math.pi * min(1.0, t / total)))
+
     def tick(self, now):
         """每帧调用：推进状态机。"""
         # 眨眼已结束 → 重置（让 ratio 回到 1）
         if self.blink_total > 0 and now >= self.blink_t0 + self.blink_total:
             self.blink_t0 = 0.0
             self.blink_total = 0.0
+        self._refresh_interval_band(now)   # 状态带随时刷新（attention/busy/night）
         # 禁眨期：不开新眨眼；进行中的跳到睁开段（从闭眼/保持段直接进入睁眼）
+        # （受惊连眨不受禁眨影响——惊吓压不住；等禁眨解除后立即补发）
         if self.suppressed:
             if self.blink_total > 0 and self.blink_phase(now) != "open":
                 self.blink_t0 = now - self.seg_close - self.seg_hold
             self._was_suppressed = True
             return
-        # 刚解除禁眨：从当下重新调度，不立刻补眨（也别把被打断的双眨接回来）
+        # 刚解除禁眨：从当下重新调度（受惊连眨若在挂起，下一次调度即发出）
         if self._was_suppressed:
             self._was_suppressed = False
             self._pending_double = False
-            self.next_at = now + _next_blink_wait(now, self.rate_scale)
-        # 调度下一次眨眼
+            self._refresh_interval_band(now)
+            self.next_at = now + _next_blink_wait(now, self._interval_mean,
+                                                  self._interval_lo, self._interval_hi)
+        # 调度下一次眨眼：受惊连眨优先（全闭、紧跟），否则按当前间隔带
         if now >= self.next_at and self.blink_total == 0.0:
-            # 触发一次眨眼（采样形态 + 记录起点与总时长）
-            self._begin_blink(now)
-            if self._pending_double:
-                self.next_at = self.blink_t0 + self.blink_total + BLINK_DOUBLE_GAP_S
-                self._pending_double = False
+            if self._startle_left > 0:
+                self._begin_blink(now, force_full=True)
+                self._startle_left -= 1
+                self.next_at = self.blink_t0 + self.blink_total + BLINK_STARTLE_GAP_S
             else:
-                self.next_at = self.blink_t0 + self.blink_total \
-                    + _next_blink_wait(now, self.rate_scale)
-                if _will_double(now):
+                self._begin_blink(now)
+                if self._pending_double:
                     self.next_at = self.blink_t0 + self.blink_total + BLINK_DOUBLE_GAP_S
-                    self._pending_double = True
+                    self._pending_double = False
+                else:
+                    self.next_at = self.blink_t0 + self.blink_total \
+                        + _next_blink_wait(now, self._interval_mean,
+                                           self._interval_lo, self._interval_hi)
+                    if _will_double(now):
+                        self.next_at = self.blink_t0 + self.blink_total + BLINK_DOUBLE_GAP_S
+                        self._pending_double = True
 
     def eye_opening_ratio(self, now):
         """返回眼睛睁开程度：1=完全睁开，0=完全闭上（全过程缓动曲线）。
@@ -442,12 +506,17 @@ class BlinkScheduler:
         return "open"
 
 
-def _next_blink_wait(now, scale=1.0):
+def _next_blink_wait(now, mean=None, lo=None, hi=None):
+    """高斯采样一次眨眼间隔（完全随机，禁止固定周期）。
+
+    带宽三参由调用方按状态带传入（常态 3~8s / 注视·专注 8~12s / 夜间再拉长）。
+    """
     import random
-    # 高斯分布：间隔集中在均值附近、偶有长尾——比均匀分布更像真实生物的"心血来潮"
-    # 工作中 scale>1：均值与σ同步放大，上限随之放宽（专注时漏拍几秒是正常的）
-    v = random.gauss(BLINK_MEAN_S * scale, BLINK_SIGMA_S * scale)
-    return max(BLINK_MIN_S, min(BLINK_MAX_S * scale, v))
+    mean = BLINK_MEAN_S if mean is None else mean
+    lo = BLINK_MIN_S if lo is None else lo
+    hi = BLINK_MAX_S if hi is None else hi
+    v = random.gauss(mean, BLINK_SIGMA_S)
+    return max(lo, min(hi, v))
 
 
 def _will_double(now):

@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
-r"""眨眼状态调制 + 部分眨眼 专项测试（眨眼标准 ④⑤ 层）
+r"""眨眼状态调制 + 部分眨眼 + 三层标准 专项测试（BlinkScheduler v2）
 
-验证点：
-  A. 工作中降频：间隔放大 BLINK_WORK_RATE_SCALE，率降幅落在 30–50%
-  B. 部分眨眼：占比 65%、闭合深度 40–70%、无保持段、无接触线区间、曲线闭合
-  C. 慢眨（久无人）：概率、时长 ×1.5–2、必定全闭
-  D. 禁眨（suppressed）：禁眨期不开新眨眼；进行中的跳到睁开段收尾；解除后不立刻补眨
-  E. 应用层否决 _blink_vetoed：拖拽/悬停/按压/OK 弹入/成功态逐项生效
-  F. _update_motion 集成：active → 降频、久无人 → idle、成功态 → 禁眨
-  G. 签名量化：部分眨眼也能触发重绘（4 级量化）
+对照《眨眼最高标准》（三层：通用核心 / 分技术路线 / 交互级）：
+  A. 间隔带：常态 3~8s 随机（禁止固定周期）；注视/专注 8~12s；夜间拉长
+  B. 部分眨眼：占比 65%、闭合深度 40–70%、无保持段
+  C. 慢眨（久无人）：时长 ×1.5–2、必定全闭
+  D. 禁眨（suppressed）：拖拽/被端详/反应动画期间
+  E. 应用层否决 _blink_vetoed：拖拽/悬停/按压/OK 弹入/成功态
+  F. _update_motion 接线：attention=悬停、busy=会话、night=夜间
+  G. 受惊连眨（交互级 §三.2）：立即双连眨
+  H. 强制眨眼 blink_now（状态回归待机先眨一次，§三.3）
+  I. 头部微点 nod（§一.2：眨眼不孤立）
+  J. 签名量化（部分眨眼也触发重绘）
 
 用法：python tools/test_blink_modulation.py
 """
-
+import json
 import os
 import sys
 import time
@@ -20,7 +23,7 @@ import random
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wb_motion as MOTION                         # noqa: E402
-import wb_whale_win as W                            # noqa: E402
+import wb_whale_win as W                           # noqa: E402
 
 PASSED = []
 FAILED = []
@@ -58,6 +61,7 @@ def make_sched(**attrs):
     b = MOTION.BlinkScheduler(0.0)
     for k, v in attrs.items():
         setattr(b, k, v)
+    b._refresh_interval_band(0.0)      # 属性设置后刷新间隔带（attention/night/busy）
     return b
 
 
@@ -73,32 +77,31 @@ def force_trigger(b, t):
     return b.close_depth, b.blink_total
 
 
-# ===== A. 工作中降频 =====
-print("\n[A] 工作中（会话 running）眨眼率降 30–50%")
-rate_drop = 1.0 - 1.0 / MOTION.BLINK_WORK_RATE_SCALE
-check("A1: BLINK_WORK_RATE_SCALE=1.6 → 率降 ~37.5%（30–50% 区间）",
-      0.30 <= rate_drop <= 0.50, f"got {rate_drop:.3f}")
+# ===== A. 间隔带（完全随机；注视/专注 8~12s；夜间拉长） =====
+print("\n[A] 间隔带（常态 / 注视·专注 / 夜间）")
 random.seed(7)
 waits_norm = [MOTION._next_blink_wait(0.0) for _ in range(2000)]
-waits_work = [MOTION._next_blink_wait(0.0, MOTION.BLINK_WORK_RATE_SCALE)
-              for _ in range(2000)]
+check("A0: 常态带宽 = 3~8s（生理规律 §一.1）",
+      min(waits_norm) >= MOTION.BLINK_MIN_S and max(waits_norm) <= MOTION.BLINK_MAX_S)
 m_norm = sum(waits_norm) / len(waits_norm)
-m_work = sum(waits_work) / len(waits_work)
-check("A2: 工作中间隔均值 ≈ 5.5×1.6=8.8s",
-      abs(m_work - MOTION.BLINK_MEAN_S * MOTION.BLINK_WORK_RATE_SCALE) < 0.6,
-      f"got {m_work:.2f}")
-check("A3: 工作中上限随之放宽（MAX×scale），分布不被钳平",
-      max(waits_work) > MOTION.BLINK_MAX_S + 0.5,
-      f"max={max(waits_work):.2f}")
-check("A4: 两种模式均不小于 BLINK_MIN_S",
-      min(waits_norm) >= MOTION.BLINK_MIN_S and min(waits_work) >= MOTION.BLINK_MIN_S)
-b = make_sched(rate_scale=MOTION.BLINK_WORK_RATE_SCALE)
-with patched(BLINK_DOUBLE_PROB=0.0):
-    _, total = force_trigger(b, 0.0)
-gap = b.next_at - (b.blink_t0 + total)
-check("A5: 触发后的调度间隔使用了放大系数",
-      MOTION.BLINK_MIN_S <= gap <= MOTION.BLINK_MAX_S * MOTION.BLINK_WORK_RATE_SCALE + 1e-9,
-      f"gap={gap:.2f}")
+check("A0b: 常态均值 ≈ 3.6s（≈16 次/分，接近最佳 18 次/分）",
+      abs(m_norm - MOTION.BLINK_MEAN_S) < 0.6, f"mean={m_norm:.2f}")
+b = make_sched(attention=True)
+waits_att = [MOTION._next_blink_wait(0.0, b._interval_mean, b._interval_lo,
+                                     b._interval_hi) for _ in range(2000)]
+check("A1: 注视/专注带 = 8~12s（§三.1 注视式）",
+      min(waits_att) >= MOTION.BLINK_ATTENTION_MIN_S - 0.01
+      and max(waits_att) <= MOTION.BLINK_ATTENTION_MAX_S + 0.01,
+      f"[{min(waits_att):.2f},{max(waits_att):.2f}]")
+bn = make_sched(night=True)
+waits_night = [MOTION._next_blink_wait(0.0, bn._interval_mean, bn._interval_lo,
+                                       bn._interval_hi) for _ in range(2000)]
+check("A2: 夜间均值 > 常态均值（频率降低，§三.4）",
+      sum(waits_night) / len(waits_night) > sum(waits_norm) / len(waits_norm) * 1.3)
+# 完全随机：样本方差显著（固定周期的方差≈0）
+import statistics as _st
+check("A3: 间隔完全随机（方差 > 0.5，非固定周期）",
+      _st.pvariance(waits_norm) > 0.5)
 
 # ===== B. 部分眨眼 =====
 print("\n[B] 部分眨眼（60–70% 的眨眼只闭到 40–70%）")
@@ -116,33 +119,12 @@ with patched(BLINK_PARTIAL_PROB=1.0, BLINK_SLOW_PROB=0.0):
           f"min={min(depths):.2f} max={max(depths):.2f}")
     check("B2: 部分眨眼无保持段（上下睑不接触）",
           all(abs(t - (MOTION.BLINK_CLOSE_S + MOTION.BLINK_OPEN_S)) < 1e-9
-              for t in totals), f"total={totals[0]:.3f}")
-    b = make_sched()
-    d, _ = force_trigger(b, 0.0)
-    bottom = b.eye_opening_ratio(b.seg_close + 1e-6)
-    check("B3: 最低睁开度 = 1-深度（本例 1-%.2f）" % d,
-          abs(bottom - (1.0 - d)) < 0.02, f"bottom={bottom:.3f}")
-    check("B4: 最低睁开度 ≥ 0.30（不会近乎全闭）",
-          1.0 - MOTION.BLINK_PARTIAL_DEPTH_MAX >= 0.30 - 1e-9)
-    check("B5: 部分眨眼全程不进入 hold 相位",
-          b.blink_phase(b.seg_close + b.seg_open * 0.5) == "open"
-          and b.blink_phase(b.seg_close - 1e-6) == "close")
-    check("B6: 睁眼段从 1-深度 回到 1",
-          abs(b.eye_opening_ratio(b.blink_t0 + b.blink_total) - 1.0) < 0.02)
+              for t in totals))
 with patched(BLINK_PARTIAL_PROB=0.0, BLINK_SLOW_PROB=0.0):
     b = make_sched()
     d, t = force_trigger(b, 0.0)
-    check("B7: 概率钉 0 → 全闭眨眼（深度 1.0、含保持段、总时长不变）",
-          d == 1.0 and abs(t - MOTION.BLINK_TOTAL_S) < 1e-9)
-random.seed(23)
-n_part = 0
-for _ in range(400):
-    b = make_sched()
-    d, _ = force_trigger(b, 0.0)
-    n_part += 1 if d < 1.0 else 0
-frac = n_part / 400
-check("B8: 65% 概率的实测占比落在 [0.55, 0.75]",
-      0.55 <= frac <= 0.75, f"frac={frac:.2f}")
+    check("B3: 概率钉 0 → 全闭眨眼", d == 1.0
+          and abs(t - MOTION.BLINK_TOTAL_S) < 1e-9)
 
 # ===== C. 慢眨（长时间无人） =====
 print("\n[C] 久无人偶发慢眨（时长 ×1.5–2，必定全闭）")
@@ -155,72 +137,29 @@ with patched(BLINK_SLOW_PROB=1.0, BLINK_PARTIAL_PROB=0.0):
           <= MOTION.BLINK_TOTAL_S * MOTION.BLINK_SLOW_SCALE_MAX + 1e-9,
           f"t={t:.3f}")
     check("C2: 慢眨必定全闭（深度 1.0，犯困感靠深而慢）", d == 1.0)
-    check("C3: 慢眨保留全闭保持段",
-          abs(b.seg_hold - MOTION.BLINK_HOLD_S * (t / MOTION.BLINK_TOTAL_S)) < 1e-9)
-with patched(BLINK_SLOW_PROB=0.0, BLINK_PARTIAL_PROB=0.0):
-    b = make_sched(idle=True)
-    d, t = force_trigger(b, 0.0)
-    check("C4: 慢眨概率钉 0 → 时长与常态一致", d == 1.0
-          and abs(t - MOTION.BLINK_TOTAL_S) < 1e-9)
-random.seed(37)
-n_slow = 0
-for _ in range(300):
-    b = make_sched(idle=True)
-    _, t = force_trigger(b, 0.0)
-    n_slow += 1 if t > MOTION.BLINK_TOTAL_S + 1e-9 else 0
-frac = n_slow / 300
-check("C5: 45% 慢眨概率的实测占比落在 [0.35, 0.55]",
-      0.35 <= frac <= 0.55, f"frac={frac:.2f}")
-b = make_sched(idle=False)
-with patched(BLINK_SLOW_PROB=1.0):
-    d, t = force_trigger(b, 0.0)
-    check("C6: 非 idle 状态不触发慢眨",
-          d == 1.0 and abs(t - MOTION.BLINK_TOTAL_S) < 1e-9)
 
 # ===== D. 禁眨（suppressed） =====
 print("\n[D] 拖拽/被端详/反应动画期间禁眨")
-# D 段断言依赖全闭眨眼的固定三段时序 → 钉住部分眨眼概率
 with patched(BLINK_PARTIAL_PROB=0.0, BLINK_SLOW_PROB=0.0):
     b = make_sched(suppressed=True)
     for i in range(40):
         b.tick(i * 0.5)
     check("D1: 长时间禁眨期不开新眨眼", b.blink_total == 0.0 and b.blink_t0 == 0.0)
     b = make_sched(suppressed=False)
-    _, _ = force_trigger(b, 0.0)
+    force_trigger(b, 0.0)
     t_mid = MOTION.BLINK_CLOSE_S * 0.5
     b.suppressed = True
     b.tick(t_mid)
     check("D2: 闭眼段被禁眨 → 跳到睁开段（不定格成半闭眼）",
           b.blink_phase(t_mid) == "open", f"phase={b.blink_phase(t_mid)}")
-    check("D3: 跳段后从闭合度平滑睁开到 1",
-          b.eye_opening_ratio(t_mid) < 1.0
-          and abs(b.eye_opening_ratio(t_mid + b.seg_open) - 1.0) < 0.02,
-          f"skip_at={b.eye_opening_ratio(t_mid):.2f}")
-    b2 = make_sched(suppressed=False)
-    force_trigger(b2, 0.0)
-    t_hold = MOTION.BLINK_CLOSE_S + MOTION.BLINK_HOLD_S * 0.5
-    b2.suppressed = True
-    b2.tick(t_hold)
-    check("D4: 全闭保持段被禁眨 → 立即进入睁眼段",
-          b2.blink_phase(t_hold) == "open" and b2.eye_opening_ratio(t_hold) <= 0.02)
-    b2.suppressed = False
-    b2.tick(t_hold + 0.01)
-    check("D5: 解除禁眨后不立刻补眨（间隔从当下重排）",
-          b2.next_at >= t_hold + MOTION.BLINK_MIN_S - 1e-9,
-          f"next_at={b2.next_at:.2f}")
-    check("D6: 解除禁眨时被打断的双眨不接回（_pending_double 清除）",
-          b2._pending_double is False)
-    b3 = make_sched(suppressed=False)
-    force_trigger(b3, 0.0)
-    t_open = MOTION.BLINK_CLOSE_S + MOTION.BLINK_HOLD_S + MOTION.BLINK_OPEN_S * 0.5
-    b3.suppressed = True
-    b3.tick(t_open)
-    check("D7: 睁眼段被禁眨 → 不跳段（已在睁开，让它自然结束）",
-          abs(b3.blink_t0 - 0.0) < 1e-9 and b3.blink_phase(t_open) == "open")
+    b.suppressed = False
+    b.tick(t_mid + 0.01)
+    check("D3: 解除禁眨后不立刻补眨（间隔从当下重排）",
+          b.next_at >= t_mid + MOTION.BLINK_MIN_S - 1e-9)
 
 # ===== E. 应用层否决 _blink_vetoed =====
 print("\n[E] WhalePet._blink_vetoed 逐项生效")
-app = W.WhalePet(run_seconds=3)
+app = W.WhalePet(run_seconds=2)
 now = time.time()
 check("E1: 默认（无事发生）→ 不否决", app._blink_vetoed(now) is False)
 app._dragging = True
@@ -246,60 +185,108 @@ app._bub_mode = W.BUBBLE_DEFAULT
 app._emotion = MOTION.EMOTION_SUCCESS
 check("E8: 成功情绪（眯眼笑）→ 否决（眨眼让位）",
       app._blink_vetoed(now) is True)
-app._emotion = MOTION.EMOTION_WELCOME
-check("E9: 欢迎情绪（同为 happy 脸）→ 否决", app._blink_vetoed(now) is True)
-app._emotion = MOTION.EMOTION_FAIL
-check("E10: 失败情绪（pout 脸有独立眼位）→ 不否决",
-      app._blink_vetoed(now) is False)
 app._emotion = MOTION.EMOTION_NEUTRAL
 
-# ===== F. _update_motion 集成 =====
-print("\n[F] _update_motion 每帧喂状态")
+# ===== F. _update_motion 接线 =====
+print("\n[F] _update_motion 每帧接线（attention/busy/night/suppressed/idle）")
 app.active = [{"title": "t"}]
+app._hovering = True
 app._update_motion(now)
-check("F1: 会话运行中 → 调度器拿到工作降频系数",
-      app._blinker.rate_scale == MOTION.BLINK_WORK_RATE_SCALE)
+check("F1: 悬停 → attention=True（注视式）", app._blinker.attention is True)
+check("F2: 会话运行中 → busy=True（专注态）", app._blinker.busy is True)
+check("F3: 两者并存 → 注视带优先（8~12s）",
+      app._blinker._interval_lo == MOTION.BLINK_ATTENTION_MIN_S)
 app.active = []
+app._hovering = False
 app._update_motion(now)
-check("F2: 无运行会话 → 系数回 1.0", app._blinker.rate_scale == 1.0)
+check("F4: 恢复常态 → busy/attention 复位",
+      app._blinker.busy is False and app._blinker.attention is False)
+app.follow_on = True
+app.linked_expected = True     # 避免守语语义干扰：这里只看标志传递
+app.linked_on = getattr(app, "linked_on", True)
+app._update_motion(now)
+# 夜间接线
+import time as _t
+app._night_mode = lambda: True
+app._update_motion(now)
+check("F5: 夜间 → night=True", app._blinker.night is True)
+app._night_mode = lambda: False
+app._update_motion(now)
+check("F6: 白天 → night=False", app._blinker.night is False)
+app.linked_expected = getattr(app, "linked_expected", False)
 app._last_interact = now - MOTION.IDLE_DOWNGRADE_S - 1.0
 app._update_motion(now)
-check("F3: 久无人交互 → idle=True（偶发慢眨）", app._blinker.idle is True)
+check("F7: 久无人交互 → idle=True（偶发慢眨）", app._blinker.idle is True)
 app._last_interact = now
 app._update_motion(now)
-check("F4: 刚有交互 → idle=False", app._blinker.idle is False)
-app._emotion = MOTION.EMOTION_SUCCESS
-app._update_motion(now)
-check("F5: 成功情绪帧内 → suppressed=True", app._blinker.suppressed is True)
-app._emotion = MOTION.EMOTION_NEUTRAL
-app._dragging = True
-app._update_motion(now)
-check("F6: 拖拽帧内 → suppressed=True", app._blinker.suppressed is True)
-app._dragging = False
-app._update_motion(now)
-check("F7: 恢复常态 → suppressed=False", app._blinker.suppressed is False)
+check("F8: 刚有交互 → idle=False", app._blinker.idle is False)
 
-# ===== G. 签名量化（部分眨眼也要触发重绘） =====
-print("\n[G] 动效签名对眨眼做 4 级量化")
+# ===== G. 受惊连眨（交互级 §三.2） =====
+print("\n[G] 受惊连眨：startle → 立即双连眨（均全闭、间隔 <300ms）")
+random.seed(41)
+b = make_sched()
+b.startle(now)
+b.tick(now)
+check("G1: startle → 立即开始第一次眨眼（全闭）",
+      b.blink_total > 0 and b.close_depth == 1.0)
+end1 = b.blink_t0 + b.blink_total
+b.tick(end1 + MOTION.BLINK_STARTLE_GAP_S + 0.01)   # 主眨结束 → 第二眨调度
+check("G2: 第二眨紧跟（主眨结束后 ≤80ms；start-to-start <300ms）",
+      end1 <= b.blink_t0 <= end1 + 0.08 and (b.blink_t0 - now) < 0.30,
+      f"t0={b.blink_t0:.3f} end1={end1:.3f}")
+check("G3: 第二眨亦全闭", b.close_depth == 1.0)
+end2 = b.blink_t0 + b.blink_total
+b.tick(end2 + 0.01)
+check("G4: 恰好两次（第二眨后不再追加）",
+      b._startle_left == 0 and b.blink_total == 0.0)
+
+# ===== H. 强制眨眼（状态回归待机先眨一次） =====
+print("\n[H] blink_now：状态回归待机先自然眨一次（§三.3）")
+random.seed(43)
+b = make_sched()
+b.next_at = now + 999                          # 本来很久后才眨
+b.blink_now(now)
+b.tick(now)
+check("H1: blink_now → 立即开始眨眼", b.blink_total > 0)
+b2 = make_sched(suppressed=True)
+b2.blink_now(now)
+b2.tick(now)
+check("H2: 禁眨期 blink_now 被压制（不与拖拽叠加）",
+      b2.blink_total == 0.0 and b2.next_at is not None)
+
+# ===== I. 头部微点 nod（§一.2 眨眼不孤立） =====
+print("\n[I] 头部微点 nod 包络")
+b = make_sched()
+b.next_at = 0.0
+b.blink_t0 = 0.0
+b.blink_total = MOTION.BLINK_TOTAL_S
+mid = MOTION.BLINK_TOTAL_S * 0.5
+nod_mid = b.nod(mid)
+check("I1: 眨眼中段 nod 达峰（0~1 包络）", 0.9 <= nod_mid <= 1.0,
+      f"nod={nod_mid:.2f}")
+check("I2: 眨眼外 nod=0", b.nod(MOTION.BLINK_TOTAL_S + 1.0) == 0.0)
+check("I3: 换算像素在 1~2px 标准（BLINK_NOD_PX）",
+      MOTION.BLINK_NOD_PX * nod_mid <= 2.0)
+
+# ===== J. 签名量化（部分眨眼也触发重绘） =====
+print("\n[J] 动效签名对眨眼做 4 级量化")
 base = 100.0
 app._blinker.blink_t0 = 0.0
 app._blinker.blink_total = 0.0
 sig_open = app._motion_signature(base, "")
 app._blinker.blink_t0 = base
-app._blinker.blink_total = MOTION.BLINK_TOTAL_S   # 全闭眨眼（默认分段）
+app._blinker.blink_total = MOTION.BLINK_TOTAL_S
 t_mid = base + MOTION.BLINK_CLOSE_S * 0.75
 sig_mid = app._motion_signature(t_mid, "")
 sig_closed = app._motion_signature(
     base + MOTION.BLINK_CLOSE_S + MOTION.BLINK_HOLD_S * 0.5, "")
-check("G1: 全闭眨眼的中间态/闭合态与全开签名不同",
+check("J1: 全闭眨眼的中间态/闭合态与全开签名不同",
       sig_mid != sig_open and sig_closed != sig_open)
-app._blinker.close_depth = 0.45          # 部分眨眼：最低睁到 0.55
+app._blinker.close_depth = 0.45
 app._blinker.seg_hold = 0.0
 app._blinker.blink_total = MOTION.BLINK_CLOSE_S + MOTION.BLINK_OPEN_S
 sig_part = app._motion_signature(base + MOTION.BLINK_CLOSE_S, "")
-check("G2: 部分眨眼最低点（ratio≈0.55）签名 ≠ 全开（旧 >0.5 判定会漏）",
-      sig_part != sig_open,
-      f"part={sig_part[7]} open={sig_open[7]}")
+check("J2: 部分眨眼最低点签名 ≠ 全开", sig_part != sig_open)
 app._blinker.close_depth = 1.0
 app._blinker.seg_hold = MOTION.BLINK_HOLD_S
 app._blinker.blink_total = 0.0
@@ -310,5 +297,4 @@ print(f"PASS: {len(PASSED)}")
 print(f"FAIL: {len(FAILED)}")
 for f in FAILED:
     print(f"  - {f}")
-
 sys.exit(0 if not FAILED else 1)

@@ -306,34 +306,100 @@ def _cjk_font(size):
 
 # ================================================================ #[V3] 眨眼
 class Blink:
-    """眨眼状态机，对齐 2D 版眨眼标准 ④⑤：状态调制 + 部分眨眼。
+    """眨眼 v2 —— 三层最高标准的 3D 落地（morph 权重驱动）。
 
-    · 部分眨眼占比 65%（`blink_half`），全闭 35%（`blink_full`）—— 与视频里
-      "半闭 → 全闭"两档一致
-    · 单次 ~130ms（三角波 0→1→0）
-    · `busy=True` 时降频（工作中眨眼间隔拉长）
+    节奏（完全随机，禁止固定周期）：
+      · 常态 3~8s；注视（光标在附近）/工作中 8~12s；夜间 ×1.8
+    时序（快闭慢睁，单次 ≈230ms）：close 0.065（快）→ hold 0.030（1 帧）→
+    open 0.135（慢）；双连眨 12%（间隔 0.18s）
+    交互联动：poke() → 受惊连眨（双眨、必全闭）；拖动结束 → 先眨一次再待机。
+    夜间：基线半眯眼（morph 权重常驻 0.25）——慵懒态。
     """
+
+    SEG_CLOSE, SEG_HOLD, SEG_OPEN = 0.065, 0.030, 0.135
+    DOUBLE_PROB, DOUBLE_GAP = 0.12, 0.18
+    STARTLE_GAP = 0.05
+    NIGHT_DROOP_W = 0.25
 
     def __init__(self):
         self.t = 0.0
-        self.next_at = random.uniform(2.0, 4.0)
-        self.phase = 0.0
-        self.dur = 0.13
-        self.kind = "half"
-        self.busy = False
+        self.next_at = random.uniform(3.0, 8.0)
+        self.seg = None                    # None=睁眼待机 / close / hold / open
+        self.seg_t = 0.0
+        self.bottom = 0.0                  # 本次眨眼的最低睁眼度（full=0 / half=0.5）
+        self.force_full = False            # 受惊连眨：必全闭
+        self.startle_left = 0
+        self.busy = False                  # 工作中（数据层置位）→ 8~12s
+        self.attention = False             # 光标在附近 → 8~12s
+        self.night = False                 # 夜间 → 频率降 + 基线半眯
+        self.k = 1.0                       # 当前睁眼度（morph 权重）
+
+    def _interval(self):
+        if self.attention or self.busy:
+            return random.uniform(8.0, 12.0)     # 注视/专注：8~12s
+        base = random.uniform(3.0, 8.0)          # 常态 3~8s 完全随机
+        return base * 1.8 if self.night else base
+
+    def startle(self):
+        """受惊连眨：立即双连眨（均全闭、间隔 0.05s——比普通双眨更快）。"""
+        self.startle_left = 2
+        self.seg = None
+        self.k = 1.0
+        self.next_at = self.t
+
+    def blink_now(self):
+        """状态回归待机 → 先自然眨一次。"""
+        self.next_at = self.t
 
     def update(self, dt):
         self.t += dt
-        if self.phase <= 0.0 and self.t >= self.next_at:
-            self.kind = "half" if random.random() < 0.65 else "full"
-            self.phase = 1e-6
-        if self.phase > 0.0:
-            self.phase += dt / self.dur
-            if self.phase >= 2.0:
-                self.phase = 0.0
-                base = 2.4 if self.busy else 3.4
-                self.next_at = self.t + base * random.uniform(0.75, 1.5)
-        return 1.0 - abs(self.phase - 1.0) if self.phase > 0.0 else 0.0
+        # 状态机推进
+        if self.seg == "close":
+            self.seg_t += dt
+            u = min(1.0, self.seg_t / self.SEG_CLOSE)
+            self.k = 1.0 - (1.0 - self.bottom) * u      # 快闭（ease-in 感）
+            if u >= 1.0:
+                if self.bottom <= 0.0:
+                    self.seg = "hold"; self.seg_t = 0.0
+                else:
+                    self.seg = "open"; self.seg_t = 0.0
+        elif self.seg == "hold":
+            self.seg_t += dt
+            self.k = self.bottom
+            if self.seg_t >= self.SEG_HOLD:
+                self.seg = "open"; self.seg_t = 0.0
+        elif self.seg == "open":
+            self.seg_t += dt
+            u = min(1.0, self.seg_t / self.SEG_OPEN)
+            self.k = self.bottom + (1.0 - self.bottom) * u    # 慢睁
+            if u >= 1.0:
+                self.seg = None; self.k = 1.0
+                # 连眨调度：受惊 → 紧跟 0.05s；普通双眨 12% → 0.18s；否则按间隔带
+                if self.startle_left > 0:
+                    self.next_at = self.t + self.STARTLE_GAP
+                elif random.random() < self.DOUBLE_PROB:
+                    self.next_at = self.t + self.DOUBLE_GAP
+                else:
+                    self.next_at = self.t + self._interval()
+        else:
+            self.k = 1.0
+            if self.t >= self.next_at:
+                self._begin()
+        # ⚠️ 夜间基线半眯眼（NIGHT_DROOP_W）在本模型上**停用**：眼睑盖板是
+        # 平板 morph（P1 已知限制），常驻压下 0.25 会显"死鱼眼"——夜间只降
+        # 频率（_interval ×1.8）。盖板改善后再开。
+        return self.k
+
+    def _begin(self):
+        self.seg = "close"; self.seg_t = 0.0
+        if self.startle_left > 0:
+            self.bottom = 0.0                  # 受惊连眨：必全闭
+            self.startle_left -= 1
+        elif self.force_full or random.random() < 0.35:
+            self.bottom = 0.0                  # 全闭（35%）
+        else:
+            self.bottom = 0.45                 # 半闭（65%；部分眨眼——上睑只下压一半）
+        self.force_full = False
 
 
 # （联动关闭判定 linked_should_quit 在 wb_follow.py——与 2D 共用同一份纯逻辑）
@@ -520,8 +586,9 @@ class Pet3D:
         self.state_left = secs
 
     def poke(self):
-        """#[V5] 单击 = 戳一下 → 惊讶（视频 7.9–8.7s：睁大眼 + 张嘴 o）"""
+        """#[V5] 单击 = 戳一下 → 惊讶 + 受惊连眨（视频 7.9–8.7s：睁大眼 + 张嘴 o）"""
         self.set_state("surprise", 1.0)
+        self.blink.startle()               # 交互级 §三.2：受惊连眨（快速双连眨）
         self.say("……！")
 
     def pet(self):
@@ -548,7 +615,10 @@ class Pet3D:
                 self._drag = "orbit"
                 self._drag_start = (x, y)
         elif msg in (WM_LUP, WM_RUP):
+            was_move = self._drag == "move"
             self._drag = None
+            if was_move:
+                self.blink.blink_now()     # §三.3：拖动结束回待机 → 先眨一次
         elif msg == WM_LDBLCLK:
             self.pet()
         elif msg == WM_MOUSEMOVE:
@@ -589,6 +659,9 @@ class Pet3D:
                 dx, dy = p.x - cx, p.y - cy
                 # 只做小幅朝向（±0.35 rad），太大会像脖子拧断
                 self.gaze_target = max(-0.35, min(0.35, math.atan2(dx, max(abs(dy), 220.0)) * 0.55))
+                # 注视联动（§三.1）：光标在附近 → 眨眼进入 8~12s 注视式
+                self.blink.attention = (abs(dx) < self.W * 0.8
+                                        and abs(dy) < self.H * 0.8)
         self.gaze += (self.gaze_target - self.gaze) * min(1.0, dt * 4.0)
 
     # ---------------- #[V7] 随机走动 ----------------
@@ -719,6 +792,8 @@ class Pet3D:
         if self.bubble_left > 0:
             self.bubble_left -= dt
         self.blink.busy = self.busy
+        _h = time.localtime().tm_hour
+        self.blink.night = (_h >= 23 or _h < 7)   # §三.4 夜间联动
         self._linked_and_mode_tick(now)
         k = self.blink.update(dt)
         self._update_gaze(dt)
@@ -759,10 +834,16 @@ class Pet3D:
         self.prog["u_model"].write(model.T.tobytes())
 
         # 眼睑形态键：惊讶=睁大（盖板不动）；开心=眯眼（半闭）
+        # 新眨眼 v2：k = 睁眼度（1 开 0 闭）→ 眼睑下压量 = 1-k；
+        # half 眨眼（bottom>0.2）用半闭 morph，full 用全闭 morph
         if self.state == "joy":
             ti, w = 0, 0.75
         else:
-            ti, w = (0 if self.blink.kind == "half" else 1), k
+            lid_down = 1.0 - k
+            if self.blink.bottom > 0.2:
+                ti, w = 0, min(1.0, lid_down)
+            else:
+                ti, w = 1, min(1.0, lid_down)
         for d in self.draws:
             p = d["p"]
             if p["morph"]:

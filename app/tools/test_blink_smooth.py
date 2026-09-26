@@ -40,14 +40,18 @@ def check(name, cond, detail=""):
 # ===== A. 时间段划分 =====
 print("\n[A] BlinkScheduler 三段时间划分")
 b = MOTION.BlinkScheduler(0.0)
-check("A1: 闭眼段时长 BLINK_CLOSE_S",
-      abs(MOTION.BLINK_CLOSE_S - 0.099) < 0.01)
-check("A2: 保持段时长 BLINK_HOLD_S",
-      abs(MOTION.BLINK_HOLD_S - 0.066) < 0.01)
-check("A3: 睁眼段时长 BLINK_OPEN_S",
-      abs(MOTION.BLINK_OPEN_S - 0.165) < 0.01)
-check("A4: 总时长 ~330ms（真人眨眼 250-400ms 范围）",
-      0.25 < MOTION.BLINK_TOTAL_S < 0.40)
+check("A1: 闭眼段时长 BLINK_CLOSE_S（快闭 ~30% 占比）",
+      abs(MOTION.BLINK_CLOSE_S - 0.065) < 0.005)
+check("A2: 保持段时长 BLINK_HOLD_S（≈1 帧）",
+      abs(MOTION.BLINK_HOLD_S - 0.030) < 0.005)
+check("A3: 睁眼段时长 BLINK_OPEN_S（慢睁 ~60% 占比）",
+      abs(MOTION.BLINK_OPEN_S - 0.135) < 0.005)
+check("A4: 总时长 150~250ms（三层标准 §一.1）",
+      0.15 <= MOTION.BLINK_TOTAL_S <= 0.25)
+check("A4b: 快闭慢睁（闭 < 睁，占比 30/60）",
+      MOTION.BLINK_CLOSE_S < MOTION.BLINK_OPEN_S
+      and abs(MOTION.BLINK_CLOSE_S / MOTION.BLINK_TOTAL_S - 0.28) < 0.05
+      and abs(MOTION.BLINK_OPEN_S / MOTION.BLINK_TOTAL_S - 0.59) < 0.05)
 
 
 # ===== B. 闭眼段缓动曲线 =====
@@ -104,13 +108,13 @@ check("C6: t=BLINK_TOTAL_S ratio=1.0（全睁开结束）",
 
 # ===== D. 节奏自然性 =====
 print("\n[D] 节奏自然（真人眨眼参照）")
-# 真人眨眼：闭眼 ~80-120ms、保持 ~30-60ms、睁眼 ~120-180ms
-check("D1: 闭眼段 80-120ms 范围",
-      0.080 <= MOTION.BLINK_CLOSE_S <= 0.120)
-check("D2: 保持段 30-70ms 范围",
-      0.030 <= MOTION.BLINK_HOLD_S <= 0.070)
-check("D3: 睁眼段 120-180ms 范围（睁眼慢于闭眼）",
-      0.120 <= MOTION.BLINK_OPEN_S <= 0.180)
+# 三层标准 §一.1：闭快（≤80ms）/ 全闭 1 帧 / 睁慢（≥闭×1.8）
+check("D1: 闭眼段 ≤80ms（快闭）",
+      0.040 <= MOTION.BLINK_CLOSE_S <= 0.080)
+check("D2: 保持段 ≈1 帧（≤40ms）",
+      0.015 <= MOTION.BLINK_HOLD_S <= 0.040)
+check("D3: 睁眼段 ≥ 闭眼×1.8（慢睁）",
+      MOTION.BLINK_OPEN_S >= MOTION.BLINK_CLOSE_S * 1.8)
 check("D4: 睁眼时长 > 闭眼时长（拟真）",
       MOTION.BLINK_OPEN_S > MOTION.BLINK_CLOSE_S)
 

@@ -1201,6 +1201,12 @@ class WhalePet:
         self._drawn_sig = None
 
     # ---- P0-② 实时切换：读共享设置的 pet_mode，与本形态不同 → 优雅退出 ----
+    def _night_mode(self):
+        """夜间联动（跟随 P4 同族的"环境联动"）：23:00–07:00 → 眨眼频率降低
+        + 渲染层半眯眼慵懒态。屏幕亮度读取不可移植，用本地时段替代。"""
+        h = time.localtime().tm_hour
+        return h >= 23 or h < 7
+
     def _check_pet_mode(self, settings=None):
         """读共享设置；pet_mode 与本形态不同 → True（调用方优雅退出，
         守望 5s 内拉起新形态）。settings 传 dict 供测试注入。"""
@@ -2263,6 +2269,9 @@ class WhalePet:
         形态保持 MORPH_HOLD_S 秒后自动消失，期间 _draw_pet 优先用此形态。
         """
         now = time.time()
+        if region in ("head", "face"):
+            # 交互级 §三.2：点击头部/脸部 → 受惊连眨（快速双连眨）
+            self._blinker.startle(time.time())
         if region == "head":
             pool, face, snd, state = QUOTES_HEAD, "blush", "chirp", "blush"
             hearts = 3; spray = 0; wamp = 0.0; wdur = 0.0; rdur = 0.0
@@ -2377,14 +2386,19 @@ class WhalePet:
             self._float_dy = 0.0
             self._shadow_scale = 1.0
 
-        # ④ 眨眼状态机（精简/完整档才有）+ 状态调制（所有数字在 wb_motion.py）：
-        #    工作中（会话 running）降频；拖拽/被端详/反应动画禁眨；久无人偶发慢眨
+        # ④ 眨眼状态机 v2（精简/完整档才有）——三层标准：
+        #    注视（悬停）/工作中 → 8~12s 注视式慢眨；夜间 → 频率降 + 半眯眼；
+        #    常态 3~8s 完全随机；拖拽/被端详/反应动画禁眨；久无人偶发慢眨
         if q != MOTION.QUALITY_OFF:
             bl = self._blinker
-            bl.rate_scale = MOTION.BLINK_WORK_RATE_SCALE if self.active else 1.0
+            bl.attention = self._hovering          # 鼠标注视联动（§三.1）
+            bl.busy = bool(self.active)            # 工作中（会话 running）→ 专注态
+            bl.night = self._night_mode()          # 夜间联动（§三.4）
             bl.suppressed = self._blink_vetoed(now)
             bl.idle = idle_long
             bl.tick(now)
+            # §一.2 眨眼不是孤立运动：伴随 1~2px 头部微点（nod 包络随眨眼起伏）
+            self._breath += self._blinker.nod(now) * MOTION.BLINK_NOD_PX
         else:
             self._blinker.closed_until = self._blinker.open_until = 0.0
 
@@ -2979,9 +2993,16 @@ class WhalePet:
         if not fc:
             return
         ratio = self._blinker.eye_opening_ratio(now)
+        droop = False
         if ratio >= 1.0:
-            return
-        phase = self._blinker.blink_phase(now)
+            # 夜间慵懒态（§三.4）：非眨眼时段的常驻半眯眼（眼睑覆盖 30%）；
+            # 拖拽中不画（避免和拖拽反馈叠加）。白天不画——诚实 > 氛围。
+            if self._night_mode() and not self._dragging:
+                ratio = 1.0 - MOTION.BLINK_NIGHT_DROOP
+                droop = True
+            else:
+                return
+        phase = self._blinker.blink_phase(now) if not droop else "droop"
         skin = _lerp_argb(_argb(fc.get("lid_skin") or fc.get("skin_color")
                                 or "#FFF2EA"), _argb(fc.get("eyelid_color", "#2A2438")),
                           MOTION.BLINK_LID_SHADE)
@@ -3020,7 +3041,7 @@ class WhalePet:
                           cover_h + pad * 0.6)
 
             # === 下睑微抬：真实眨眼下睑轻抬 ~22%（上睑主导 80%）===
-            low_h = (bot - top) * 0.22 * close_p
+            low_h = (bot - top) * MOTION.BLINK_LOWER_LID * close_p
             if low_h > 0.5:
                 s.ellipse(skin,
                           cx - ew * 0.52 * width_factor,
@@ -3422,6 +3443,7 @@ class WhalePet:
                 save_pos(POS_FILE, nx, ny)
                 self._last_interact = time.time()
                 self._report_event("drag_snap", ok=True, detail=f"{nx},{ny}")
+                self._blinker.blink_now(time.time())   # §三.3：回待机先眨一次
                 return 0
             if was_press:                          # 单击：按区域即时分发（不等双击窗口）
                 self._last_interact = time.time()
