@@ -414,6 +414,33 @@ def session_latest_turns(conn, session_id, limit=10):
 _DWS_TURN_BUILT_KEY = "dws_turn_built_at"
 
 
+def turn_src(conn=None, db_path=None):
+    """返回当前可用的**轮次数据源表名**：优先 'dws_turn'（物化快照，~0ms），
+    否则退回 'v_turn_total'（视图，1.6~3.7s 但总是有数据）。
+
+    读取方统一用它的返回值拼 SQL，就能"有物化表就走快路、没有就退回"，
+    且**不会读到假空**（表存在但仍为空 = 还没物化过 → 退回视图）。
+    """
+    own = conn is None
+    c = conn
+    try:
+        if own:
+            c = sqlite3.connect(db_path or DEFAULT_DB, timeout=5)
+        row = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='dws_turn'").fetchone()
+        if row and c.execute("SELECT 1 FROM dws_turn LIMIT 1").fetchone():
+            return "dws_turn"
+    except Exception:
+        pass
+    finally:
+        if own and c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+    return "v_turn_total"
+
+
 def ensure_dws_turn(conn):
     """保证物化表**结构**存在（空表；秒级、幂等）。不灌数据。"""
     row = conn.execute(

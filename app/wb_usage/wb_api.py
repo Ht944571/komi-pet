@@ -53,6 +53,10 @@ DEFAULT_DB = os.path.join(BASE, "data", "wb_usage_dw.db")
 DEFAULT_HTML = os.path.join(BASE, "dashboard.html")
 
 
+# 对数用开关：强制指定轮次数据源（None=自动：有 dws_turn 就用它）
+_FORCE_SRC = None
+
+
 def get_conn(db_path):
     # 普通连接（非 mode=ro）：同进程已有 WAL 写连接（采集线程），
     # 只读 URI 模式 + WAL + 同进程写连接会 "unable to open database file"（实测）
@@ -121,6 +125,12 @@ class Api:
         cs = [p for p in parts if p]
         return (f"WHERE {' AND '.join(cs)}" if cs else ""), " AND ".join(cs)
 
+    def _src(self, conn=None):
+        """轮次数据源：优先物化表 dws_turn，其次视图 v_turn_total（见 wb_dw.turn_src）。"""
+        if _FORCE_SRC:
+            return _FORCE_SRC
+        return wb_dw.turn_src(conn, self.db_path)
+
     def kpi(self, days="30", agent="all"):
         return self._cached(f"kpi:{days}:{agent}", lambda: self._kpi(days, agent))
 
@@ -140,6 +150,7 @@ class Api:
         cw = ("source='official' AND " + rest) if rest else "source='official'"
         today = "day = date('now','localtime')"
         with closing(get_conn(self.db_path)) as c:
+            src = self._src(c)
             row = c.execute(f"""SELECT
                 COUNT(*) FILTER (WHERE {jw}),
                 COUNT(DISTINCT session_id) FILTER (WHERE {jw}),
@@ -153,7 +164,7 @@ class Api:
                 COALESCE(SUM(credit) FILTER (WHERE {cw}),0),
                 COALESCE(SUM(api_calls) FILTER (WHERE source='official' AND {today}),0),
                 COALESCE(SUM(credit) FILTER (WHERE source='official' AND {today}),0)
-              FROM v_turn_total {where}""").fetchone()
+              FROM {src} {where}""").fetchone()
         (turns, n_sess, calls, credit, tokens, cached, miss, comp,
          t_calls, t_credit, t_tokens, cb_calls, cb_credit,
          cb_t_calls, cb_t_credit) = row
@@ -188,19 +199,20 @@ class Api:
                           CASE WHEN SUM(cached_tokens)+SUM(miss_tokens) > 0
                                THEN 1.0*SUM(cached_tokens)/(SUM(cached_tokens)+SUM(miss_tokens))
                                ELSE NULL END AS cache_hit_rate
-                   FROM v_turn_total {where} GROUP BY day ORDER BY day""")
+                   FROM {src} {where} GROUP BY day ORDER BY day""")
         cb_where, _ = self._conds("source='official'", self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
             if days in ("today", "all", ""):
-                rows = c.execute(sql.format(where=where)).fetchall()
+                rows = c.execute(sql.format(where=where, src=self._src())).fetchall()
             else:
                 n = max(int(days), 1)
-                rows = c.execute(sql.format(where=where) + " DESC LIMIT ?", (n,)).fetchall()
+                rows = c.execute(sql.format(where=where, src=self._src()) + " DESC LIMIT ?", (n,)).fetchall()
                 rows = list(reversed(rows))
             # CodeBuddy 按天（前端可查 credit_cb）
+            src = self._src(c)
             cbmap = {r["day"]: (r["requests_cb"], r["credit_cb"]) for r in c.execute(
                 f"SELECT day, SUM(api_calls) AS requests_cb, SUM(credit) AS credit_cb"
-                f" FROM v_turn_total {cb_where} GROUP BY day"
+                f" FROM {src} {cb_where} GROUP BY day"
             )}
         data = []
         for r in rows:
@@ -275,10 +287,11 @@ class Api:
         """项目分布：v_turn_total 按 project 聚合（jsonl 项目 + CodeBuddy client 同口径）。"""
         where, _ = self._conds("project != ''", self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
+            src = self._src(c)
             rows = c.execute(
                 f"""SELECT project, COUNT(*) AS turns, SUM(api_calls) AS api_calls,
                           SUM(credit) AS credit, SUM(total_tokens) AS total_tokens
-                   FROM v_turn_total {where}
+                   FROM {src} {where}
                    GROUP BY project ORDER BY credit DESC"""
             ).fetchall()
         all_rows = [dict(r) for r in rows]
@@ -291,8 +304,9 @@ class Api:
         """客户端分布：jsonl 一律视为 WorkBuddy 本地客户端，official 按 client 字段聚合。"""
         where, _ = self._conds("source='jsonl'", self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
+            src = self._src(c)
             wb = c.execute(
-                f"SELECT SUM(credit) AS credit FROM v_turn_total {where}"
+                f"SELECT SUM(credit) AS credit FROM {src} {where}"
             ).fetchone()
             # 官方账单没有 agent 列：只在「全部」或明确筛 codebuddy 时纳入
             off = []
@@ -324,6 +338,7 @@ class Api:
         """全部会话聚合：v_turn_total 按 session 聚合（两条来源统一）。"""
         where, _ = self._conds(self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
+            src = self._src(c)
             rows = c.execute(
                 f"""SELECT session_id, project, title, COUNT(*) AS turns,
                           SUM(api_calls) AS api_calls, SUM(credit) AS credit,
@@ -331,7 +346,7 @@ class Api:
                           SUM(cached_tokens) AS cached_tokens, SUM(miss_tokens) AS miss_tokens,
                           SUM(completion_tokens) AS completion_tokens,
                           MAX(agent) AS agent
-                   FROM v_turn_total {where} GROUP BY session_id"""
+                   FROM {src} {where} GROUP BY session_id"""
             ).fetchall()
         return {"ok": True, "data": [dict(r) for r in rows]}
 
