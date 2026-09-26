@@ -225,7 +225,13 @@ COLOR_SHADOW = 0x5539406B             # 软阴影（制服蓝淡）
 COLOR_HAPPY = 0xFFE89AAE              # 成功态强调·樱花粉（古见主题）
 COLOR_FAIL = 0xFF8FA3BF               # 失败态（降饱和，不是红）
 COLOR_HIGHLIGHT = 0x1FFFFFFF          # 身体高光（白色 12% 透明）
-COLOR_HEART = 0xFFE89AAE              # 爱心·樱花粉
+COLOR_HEART = 0xFFE89AAE
+
+# 「跟随模式」的身份色徽章：画在立绘右边缘、高度 42% 处的小圆点（+ 接续樱花角标）。
+# 2026-09-26 关掉：用户反馈"桌宠右边有个小粉球"——正是它（颜色取自当前聚焦 agent 的
+# accent，他的 agent 标识色是樱花粉，所以看起来是个粉球）。跟随功能本身不受影响。
+# 想恢复就把这里改成 True。
+FOLLOW_BADGE_ON = False              # 爱心·樱花粉
 COLOR_DROP = 0xCCE89AAE               # 石化爆发粒子·樱花粉淡
 COLOR_BUBBLE = 0x307A86C9             # 自主吐泡·淡制服蓝
 COLOR_OK = 0xFFED6D2E                 # OK 完成态代表橙（取自参考字形 #ED6D2E）

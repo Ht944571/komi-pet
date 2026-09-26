@@ -2761,8 +2761,8 @@ class WhalePet:
     def _draw_follow_badge(self, s, x, pw, ph_draw, y_bottom, now):
         """领结位的身份色徽章（§3.1：跟随只换"身份"，轻量元素）。
         未知态：灰 + 半透明（§7#9 诚实 > 好看）。"""
-        if not self.follow_on:
-            return
+        if not self.follow_on or not getattr(MOTION, "FOLLOW_BADGE_ON", True):
+            return          # 徽章默认关闭（用户不想在角色旁边看到那个小圆点）
         f = self._follow_focus
         if f and f.get("key"):
             rgb = 0x7A86C9
