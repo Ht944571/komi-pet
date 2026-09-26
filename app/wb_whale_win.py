@@ -1089,6 +1089,7 @@ class WhalePet:
         self._arm_timers()                # 统一挂载定时器（hwnd 变化后需重新挂载）
         # 启动时后台预热时间线：首次右键/首批气泡就不用等（查库 3.6s 全在后台线程）
         self._kick_timeline_refresh()
+        self._start_api_guard()           # 看板 API 守护（后台 daemon 线程，不做网络阻塞）
         # P3 全局热键（Ctrl+Alt+F9 手动聚焦轮换）：绑定桌宠 hwnd，
         # WM_HOTKEY 走既有消息泵；组合被占用 → 静默降级（右键菜单仍是兜底）
         self._install_follow_hotkey()
@@ -3973,6 +3974,41 @@ class WhalePet:
         finally:
             self._spawning_dash = False
 
+    def _start_api_guard(self):
+        """看板 API 的常驻守护：**这不放在消息循环里**（见下）。
+
+        为什么需要：
+          看板 API（`wb_api.py`）在 Windows 上**没有守护进程**。它只有登录自启那一次，
+          中途如果退出（例如它内置看门狗自杀、或被任务管理器/更新打断），就没人拉起，
+          表现为「看板偶尔打不开」——只有用户点开看板时桌宠才会自愈重启一次。
+          而**桌宠本身有登录自启的守望 `wb_whale_watcher` 保活**，天然可靠，
+          所以把"盯一下 API 端口"这件事交给桌宠最合适。
+
+        ⚠️ 硬约束：**绝不能在 Win32 消息循环里做带超时的网络请求**。
+          本项目踩过：urlopen(timeout=0.5) 放进每秒的 timer tick，遇到"端口只 accept
+          不响应"的服务端会每 tick 干等满超时 → 消息循环卡顿、拖动/点击全延迟。
+          所以这里用**后台 daemon 线程**（sleep 间隔也放得宽），主循环完全不受影响。
+
+        行为：每 API_GUARD_INTERVAL_S 秒探一次；不通才拉起，并带冷却避免疯狂重试。
+        """
+        def loop():
+            while True:
+                try:
+                    time.sleep(API_GUARD_INTERVAL_S)
+                    if api_healthy(self.dashboard):
+                        continue                 # 正常 → 什么都不做（后台线程，不影响 UI）
+                    now = time.time()
+                    if now - getattr(self, "_api_guard_last_spawn", 0.0) < API_GUARD_COOLDOWN_S:
+                        continue
+                    self._api_guard_last_spawn = now
+                    self._report_event("api_guard_spawn",
+                                       detail=f"端口不通，拉起 {self.dashboard}")
+                    self._ensure_dashboard_server()
+                except Exception:
+                    pass      # 守护线程不能因为任何异常退出
+
+        threading.Thread(target=loop, daemon=True, name="api-guard").start()
+
     def open_dashboard(self):
         self._report_event("open_dashboard", detail="请求打开 " + self.dashboard)
         threading.Thread(target=self._open_dashboard_worker, daemon=True).start()
@@ -4100,6 +4136,10 @@ class WhalePet:
 # ---------------------------------------------------------------------------
 MUTEX_NAME = "Local\\KomiPetWhaleSingleInstance"
 ERROR_ALREADY_EXISTS = 183
+
+# 看板 API 守护（_start_api_guard）：探测间隔 / 两次拉起之间的冷却（秒）
+API_GUARD_INTERVAL_S = 60.0
+API_GUARD_COOLDOWN_S = 60.0
 
 
 def _acquire_single_instance():
