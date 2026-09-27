@@ -2519,14 +2519,36 @@ class WhalePet:
         self._report_event("long_press")
         self._drawn_sig = None
 
+    def _gaze_box_center(self, wx, wy, lay):
+        """判定矩形中心（屏幕坐标）。
+
+        中心取**立绘实际矩形**中心：窗口上部是气泡区，用窗口中心会让判定范围整体偏上。
+        立绘矩形还没记录（首帧前）就退回窗口中心。
+        """
+        spr = getattr(self, "_spr_rect", None)
+        if spr and spr[2] > 0 and spr[3] > 0:
+            return wx + spr[0] + spr[2] / 2.0, wy + spr[1] + spr[3] / 2.0
+        return wx + lay["W"] / 2.0, wy + lay["H"] / 2.0
+
+    def _cursor_in_gaze_box(self, pt, wx, wy, lay):
+        """光标是否落在判定矩形内（固定 MOTION.GAZE_RECT_W×H 屏幕像素，**不随 scale 缩放**）。
+
+        「朝向鼠标」（左右翻转）与「视线微移」**共用这一个范围** —— 用户要求的语义就是
+        「鼠标在范围内才跟随」。
+        """
+        cx, cy = self._gaze_box_center(wx, wy, lay)
+        half_w = MOTION.GAZE_RECT_W / 2.0
+        half_h = MOTION.GAZE_RECT_H / 2.0
+        return (cx - half_w) <= pt.x <= (cx + half_w) \
+            and (cy - half_h) <= pt.y <= (cy + half_h)
+
     def _update_pointer_state(self):
-        """光标位置 → 悬停态 + 头部朝向（提案 §3）。
+        """光标位置 → 悬停态 + 视线微移（提案 §3）。
 
         放在动画帧里统一算（而不是 WM_MOUSEMOVE），分层窗口不依赖鼠标离开消息也能正确复位。
 
         视线判定范围：**固定 MOTION.GAZE_RECT_W×H（443×465）屏幕像素**的矩形，
-        中心取**立绘实际矩形**中心（拿不到才退回窗口中心）；光标进入该范围即触发
-        跟随，不再要求光标压在桌宠自身窗口内。
+        见 `_cursor_in_gaze_box`；光标进入才触发微移，不再要求光标压在桌宠自身窗口内。
         ⚠️ 不乘 scale —— 用户要的就是这个绝对尺寸。
         悬停态（hover 放大/眨眼关注）仍保持只在桌宠窗口内触发，避免光标一过附近就放大。
         """
@@ -2540,19 +2562,11 @@ class WhalePet:
             # 悬停：只在桌宠自身窗口内
             if x <= pt.x <= x + lay["W"] and y <= pt.y <= y + lay["H"]:
                 hover = True
-            # 视线：固定 443×465，中心对准立绘矩形（气泡占窗口上部，用窗口中心会偏上）
-            spr = getattr(self, "_spr_rect", None)
-            if spr and spr[2] > 0 and spr[3] > 0:
-                cx = x + spr[0] + spr[2] / 2.0
-                cy = y + spr[1] + spr[3] / 2.0
-            else:
-                cx = x + lay["W"] / 2.0
-                cy = y + lay["H"] / 2.0
-            half_w = MOTION.GAZE_RECT_W / 2.0
-            half_h = MOTION.GAZE_RECT_H / 2.0
-            if (cx - half_w) <= pt.x <= (cx + half_w) and (cy - half_h) <= pt.y <= (cy + half_h):
+            # 视线：固定 443×465 判定矩形（与朝向翻转共用）
+            if self._cursor_in_gaze_box(pt, x, y, lay):
                 gaze_inside = True
-                dx_ratio = (pt.x - cx) / half_w
+                cx, _ = self._gaze_box_center(x, y, lay)
+                dx_ratio = (pt.x - cx) / (MOTION.GAZE_RECT_W / 2.0)
         except Exception:
             pass
         self._hovering = hover
@@ -3029,7 +3043,11 @@ class WhalePet:
                        "t0": time.time(), "dur": dur, "ret": ret}
 
     def _current_facing(self, now):
-        """朝向决策：自主翻身覆盖 > 鼠标跟随(0.4s 防抖) > 保持。"""
+        """朝向决策：自主翻身覆盖 > 鼠标跟随（**须在判定范围内**，0.4s 防抖）> 保持。
+
+        ⚠️ 2026-09-27 用户要求：只在光标落入 `_cursor_in_gaze_box`（固定 443×465）时
+        才朝向鼠标；出范围保持当前朝向 —— 以前是「屏幕任何位置都翻转」。
+        """
         if now < self._flip_until:
             return self._flip_dir
         if self._dragging:
@@ -3037,16 +3055,17 @@ class WhalePet:
         lay = self._layout()
         pt = POINT()
         _user32.GetCursorPos(ctypes.byref(pt))
-        wx, _ = self._window_xy(self.hwnd)
-        off = pt.x - (wx + lay["W"] / 2)
-        if abs(off) > 60:                        # 鼠标明显偏向一侧 → 面朝鼠标
-            d = "_f" if off > 0 else ""
-            if d != self._facing:
-                if self._follow_dir != d:
-                    self._follow_dir = d
-                    self._follow_since = now
-                elif now - self._follow_since > 0.4:
-                    self._facing = d
+        wx, wy = self._window_xy(self.hwnd)
+        if self._cursor_in_gaze_box(pt, wx, wy, lay):
+            off = pt.x - (wx + lay["W"] / 2)
+            if abs(off) > 60:                    # 鼠标明显偏向一侧 → 面朝鼠标
+                d = "_f" if off > 0 else ""
+                if d != self._facing:
+                    if self._follow_dir != d:
+                        self._follow_dir = d
+                        self._follow_since = now
+                    elif now - self._follow_since > 0.4:
+                        self._facing = d
         else:
             self._follow_dir = None
             self._follow_since = 0.0
