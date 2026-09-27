@@ -132,8 +132,12 @@ def main():
 
         # 切换后：双击"想法泡泡"仍应开看板；双击身体不应开看板（走连击互动）
         lay = app._layout()
+        # ⚠️ 2026-09-27：气泡改为「锚定立绘实际头顶」（见 WhalePet._bubble_box），
+        #    不再固定贴窗口顶部 —— 点击点必须取气泡椭圆的**真实中心**，
+        #    沿用旧的 lay["bubble_h"]/2 会落到气泡上方的空白里（用例会挂）。
+        _bx, _by, _bw, _bh = app._bubble_box(lay)
         _u.PostMessageW(app.hwnd, 0x0203, MK_LBUTTON,
-                        _makelparam(int(lay["W"] / 2), int(lay["bubble_h"] / 2)))
+                        _makelparam(int(lay["W"] / 2), int(_by + _bh / 2)))
         time.sleep(0.4)
         n_after_bubble = dash["n"]
         _u.PostMessageW(app.hwnd, 0x0203, MK_LBUTTON,

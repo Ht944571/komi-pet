@@ -67,6 +67,13 @@ class Stub:
         return {"W": 300, "H": 372, "bub_h": 128, "bubble_h": 162,
                 "pet_h": 210, "sc": 1.0}
 
+    def _bubble_box(self, lay):
+        """新契约（2026-09-27）：线上气泡改为「锚定立绘实际头顶」，_set_bubble_mode
+        的 OK 迸发粒子会调用它。Stub 没有立绘 → 退化成旧的「贴窗口顶部」几何即可，
+        本用例只关心状态机迁移，不校验气泡像素位置。"""
+        sc = lay["sc"]
+        return 6 * sc, 4 * sc, lay["W"] - 12 * sc, lay["bub_h"]
+
     def _play(self, key):
         self.played.append(key)
 
@@ -444,7 +451,12 @@ def shot(app, label, mode, anim_t=None, clicks=0, pulse_t=None):
     app.draw()
     img = surf_to_image(app.surf)
     lay = app._layout()
-    return img.crop((0, 0, lay["W"], int(lay["bubble_h"] + 8))), label
+    # ⚠️ 2026-09-27：气泡改为「锚定立绘实际头顶」（WhalePet._bubble_box），
+    #    不再固定贴窗口顶部 —— 快照必须按气泡椭圆的实际位置裁，
+    #    否则 idle/stone 等态下气泡下移，图会被从中间切掉。
+    _bb = app._bubble_box(lay)
+    top = max(0, int(_bb[1] - 8))
+    return img.crop((0, top, lay["W"], top + int(_bb[3] + 16))), label
 
 
 def render_sheet(out_path):
@@ -481,7 +493,8 @@ def render_sheet(out_path):
 
         cols, scale = 2, 1.6
         cw = int(app._layout()["W"] * scale)
-        chh = int((app._layout()["bubble_h"] + 8) * scale)
+        # 与 shot() 的裁剪高度一致：气泡高 + 上下各 8px 余量
+        chh = int((app._layout()["bub_h"] + 16) * scale)
         rows = (len(frames) + cols - 1) // cols
         fnt = _label_font(17)
         sheet = Image.new("RGB", (cols * cw + (cols + 1) * 10,

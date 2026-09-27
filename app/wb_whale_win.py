@@ -73,6 +73,12 @@ except Exception as _e:                                       # pragma: no cover
 BASE_W = 300                   # 窗口宽
 BASE_BUB_H = 128               # 气泡椭圆高
 BASE_BUBBLE_H = 162            # 气泡区总高（含想法小圆）
+# 主气泡椭圆底 → 立绘实际头顶 的连线跨度（基准 scale=1.0）。
+# ⚠️ 气泡**不再钉死在窗口顶部**，而是锚在「头顶上方 BUBBLE_CHAIN_PX」处 ——
+# 因为各态头顶在立绘区里上下浮动可达 150px（见 _sprite_content_top），
+# 钉死在顶部会让 idle/stone 时气泡离脑袋空出 100+px。
+# 调大 = 气泡离脑袋更远，调小 = 更近。
+BUBBLE_CHAIN_PX = 40
 # 立绘区高。v3 立绘是**统一画布 1191×1627**（内容只占约 60% 高，见 tools/build_pet_v3.py），
 # 若仍用旧的 210，角色会比旧版小约 40%。按内容反算：
 #   旧 823×981 画到 210px → 角色实高 ≈ 207px；新 idle 内容 999/1627 → 210×1627/999 ≈ 342
@@ -158,17 +164,21 @@ OK_STYLES = {
 OK_STYLE = "D"                 # 线上默认方案
 
 
-def ok_spec(lay, style=None):
+def ok_spec(lay, style=None, bub_y=None):
     """OK 态几何规格：比例 → 像素的唯一换算点。
 
     绘制（_draw_bubble_ok）、测试断言（A12）、预览出图三处共用同一组数字，
     避免"改了一处、另一处还是老数"的漂移。返回 dict：
       椭圆盒 bub_x/bub_y/bub_w/bub_h、图形盒 g_cx/g_cy/g_w/g_h、
       文案 cap_y/cap_font（可能为 None）、进度点 dots_cy/dot_r/dot_gap（可能为 None）
+
+    `bub_y`：主气泡椭圆上沿。**不传**则沿用旧口径（贴在窗口顶部，`bh * OK_BUB_TOP_R`）——
+    测试与预览出图保持向后兼容；**线上绘制会传入锚定头顶的实际位置**
+    （见 `WhalePet._bubble_box`），保证 OK 态与数据态的气泡停在同一个地方。
     """
     st = OK_STYLES.get(style or OK_STYLE) or OK_STYLES[OK_STYLE]
     sc, W, bh = lay["sc"], lay["W"], lay["bub_h"]
-    by = bh * OK_BUB_TOP_R
+    by = bh * OK_BUB_TOP_R if bub_y is None else bub_y
     bub_w = bh * st["bub_w_r"] if "bub_w_r" in st else W - 12 * sc
     gh = bh * st["glyph_h"]
     gw = gh * OK_GLYPH_SRC_AR
@@ -1862,7 +1872,8 @@ class WhalePet:
             if sound:
                 self._play("chirp")
             lay = self._layout()
-            self._spawn_particles("spark", 6, lay["W"] / 2, lay["bub_h"] * 0.45)
+            _bb = self._bubble_box(lay)          # 气泡锚定头顶，迸发点跟着走
+            self._spawn_particles("spark", 6, lay["W"] / 2, _bb[1] + _bb[3] / 2)
         else:
             self._ok_anim_dur = MOTION.OK_POP_OUT_S
             self._ok_anim_from = 1.0
@@ -3099,6 +3110,32 @@ class WhalePet:
                 return min(max(top, lay["bubble_h"] + 6 * sc), lay["H"] - 24 * sc)
         return lay["bubble_h"]
 
+    def _bubble_box(self, lay):
+        """主气泡椭圆的盒 (x, y, w, h)。
+
+        y 锚在「立绘实际内容顶上方 BUBBLE_CHAIN_PX」—— **不再钉死在窗口顶部**。
+        窗口顶部预留的气泡区高度是固定的，而各态头顶在立绘区里上下浮动（最大差 150px），
+        钉死会让 idle / pout / shy / blush / stone 这些"头顶偏低"的态离脑袋空出 100+px
+        （用户反馈「泡泡离脑袋太远」）。锚定后「气泡底 → 头顶」在各态下观感一致。
+
+        顶出窗口上沿时钳到 2px（happy 态头顶最高，本来几乎就贴着顶）。
+        """
+        sc = lay["sc"]
+        bh = lay["bub_h"]
+        by = self._sprite_content_top(lay) - BUBBLE_CHAIN_PX * sc - bh
+        return 6 * sc, max(2 * sc, by), lay["W"] - 12 * sc, bh
+
+    def _in_bubble(self, lay, py):
+        """纵向坐标是否落在**主气泡椭圆**上（双击开看板 / 单击切台词的分区判定）。
+
+        不能再用旧的 `0 <= py <= lay["bubble_h"]`：气泡改为锚定头顶后，
+        它的下沿会落进"立绘区"上半段，旧判据会漏判（点气泡下半截变成戳身体）。
+        """
+        if not self.bubble_on:
+            return False
+        _, by, _, bh = self._bubble_box(lay)
+        return by <= py <= by + bh
+
     def _draw_thought_circles(self, s, lay, line_argb):
         """想法小圆：沿「主气泡底部 → 立绘头顶」由大到小排列。
 
@@ -3111,7 +3148,7 @@ class WhalePet:
         """
         sc = lay["sc"]
         W = lay["W"]
-        bx, by, bw, bh = 6 * sc, 4 * sc, W - 12 * sc, lay["bub_h"]
+        bx, by, bw, bh = self._bubble_box(lay)      # 气泡锚定在头顶上方（见 _bubble_box）
         p0x = W / 2 - 22 * sc                       # 起点：主气泡底偏左
         p0y = by + bh + 4 * sc                      # 距主气泡下沿 4px
         p1x = W / 2 - 4 * sc                        # 终点：头顶偏中
@@ -3140,7 +3177,7 @@ class WhalePet:
             return
         sc = lay["sc"]
         W = lay["W"]
-        bx, by, bw, bh = 6 * sc, 4 * sc, W - 12 * sc, lay["bub_h"]
+        bx, by, bw, bh = self._bubble_box(lay)      # 气泡锚定在头顶上方（见 _bubble_box）
         # 主椭圆（白底 + 藏蓝描边）
         s.ellipse(C_BUBBLE, bx, by, bw, bh, line_argb=C_BUBBLE_LINE, line_w=3.5 * sc)
         self._draw_thought_circles(s, lay, C_BUBBLE_LINE)
@@ -3173,7 +3210,8 @@ class WhalePet:
           ② 图形弹入（0.55→1.0 过冲）/ 退场收小
           ③ 每次点击图形脉冲放大，配进度点点亮
         """
-        sp = ok_spec(lay)
+        # 气泡位置与数据态同源（锚定头顶），否则形态切换时气泡会上下跳一下
+        sp = ok_spec(lay, bub_y=self._bubble_box(lay)[1])
         sc = lay["sc"]
         gs, k, _anim = self._ok_visual(now)
         # 保持段（已点满）用满橙，其余按退场动画的 k 插值
@@ -3785,7 +3823,7 @@ class WhalePet:
             _user32.SetCapture(hwnd)
             py = ctypes.c_short((lparam >> 16) & 0xFFFF).value
             self._last_interact = time.time()
-            if self.bubble_on and 0 <= py <= lay["bubble_h"]:
+            if self._in_bubble(lay, py):
                 self._report_event("double_click", detail="bubble")
                 self.open_dashboard()
             else:
@@ -3817,7 +3855,7 @@ class WhalePet:
                 self._last_interact = time.time()
                 py = ctypes.c_short((lparam >> 16) & 0xFFFF).value
                 px = ctypes.c_short(lparam & 0xFFFF).value
-                if self.bubble_on and 0 <= py <= lay["bubble_h"]:
+                if self._in_bubble(lay, py):
                     if self._bub_mode == BUBBLE_OK:
                         # OK 态：单击计入连击（点满 3 次才回到数据态），不切台词
                         self._bubble_ok_click()
