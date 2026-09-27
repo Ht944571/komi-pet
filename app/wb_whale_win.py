@@ -2249,9 +2249,6 @@ class WhalePet:
             if kind == "heart":
                 vx, vy = random.uniform(-45, 45), random.uniform(-120, -60)
                 size, life = random.uniform(4, 7) * self.scale, random.uniform(0.8, 1.2)
-            elif kind == "bubble":
-                vx, vy = random.uniform(-12, 12), random.uniform(-75, -45)
-                size, life = random.uniform(4, 8) * self.scale, random.uniform(1.6, 2.4)
             elif kind == "spark":
                 # OK 态弹入的迸发小点：上抛更冲、寿命更短，像"啪"地一下
                 vx, vy = random.uniform(-115, 115), random.uniform(-195, -95)
@@ -2282,8 +2279,6 @@ class WhalePet:
                 continue
             if p["kind"] == "heart":
                 p["vy"] += 60 * dt               # 爱心轻飘
-            elif p["kind"] == "bubble":
-                p["vx"] += math.sin(now * 5 + p["phase"]) * 14 * dt   # 左右摇曳上浮
             else:
                 p["vy"] += 520 * dt              # 水滴重力
             p["x"] += p["vx"] * dt
@@ -2986,22 +2981,16 @@ class WhalePet:
         self._drawn_sig = None
 
     def _behavior(self):
-        """空闲自主玩耍：随机吐泡泡 / 游动 / 翻身 / 换表情 / 扭扭。"""
+        """空闲自主玩耍：随机游动 / 翻身 / 换表情 / 扭扭。
+
+        ⚠️ 2026-09-27：原「吐蓝色水泡泡」分支已按用户要求**整体删除**
+        （含 `_spawn_particles("bubble", ...)` 与配套台词）。若要恢复，见 git 历史。
+        """
         now = time.time()
         self._next_behavior = now + random.uniform(BEHAVIOR_MIN, BEHAVIOR_MAX)
-        lay = self._layout()
-        choice = random.choice(["bubble", "swim", "flip", "emote", "wiggle"])
+        choice = random.choice(["swim", "flip", "emote", "wiggle"])
         self._report_event("behavior", detail=choice)
-        if choice == "bubble":                   # 吐泡泡（嘴边升起空心泡）
-            mouth_x = lay["W"] / 2 + (22 if self._current_facing(now) else -22) * self.scale
-            mouth_y = lay["bubble_h"] + lay["pet_h"] * 0.45
-            self._spawn_particles("bubble", random.randint(2, 4), mouth_x, mouth_y)
-            if self.bubble_on and random.random() < 0.3:
-                self._quote = random.choice(["咕噜咕噜……", "噗噜噗噜~", "吐个泡泡玩玩"])
-                self._quote_dur = "玩耍中"
-                self._talk_until = now + 2.5
-                self._arm_watch()
-        elif choice == "swim":                   # 随机游动（窗口小幅漂移，稍后漂回）
+        if choice == "swim":                     # 随机游动（窗口小幅漂移，稍后漂回）
             dx = random.choice([-1, 1]) * random.uniform(20, 50)
             dy = random.uniform(-24, 24)
             self._start_drift(dx, dy, dur=random.uniform(1.4, 2.0))
@@ -3668,18 +3657,13 @@ class WhalePet:
                       line_argb=C_BUBBLE_LINE, line_w=2)
             s.ctext("古见同学缺席中", W / 2, y_bottom - ph_draw / 2 - 8 * sc, 11 * sc,
                     C_BUBBLE, bold=True)
-        # 粒子（爱心 / 石化爆发樱花 / 吐泡泡，随生命值淡出）——古见主题配色
+        # 粒子（爱心 / 石化爆发樱花 / OK 迸发小点，随生命值淡出）——古见主题配色
+        # ⚠️ 2026-09-27：「吐蓝色水泡泡」的 bubble 粒子已按要求删除
         for p in self._particles:
             a = max(0.0, min(1.0, p["life"] / p["max"]))
             if p["kind"] == "heart":
                 s.heart(p["x"], p["y"], p["size"],
                         (int(0xEF * a) << 24) | 0xE89AAE)
-            elif p["kind"] == "bubble":
-                r2 = p["size"] * (1.0 + (1 - a) * 0.4)     # 上浮略膨胀
-                s.ellipse((int(0x30 * a) << 24) | 0x7A86C9,
-                          p["x"] - r2, p["y"] - r2, r2 * 2, r2 * 2,
-                          line_argb=(int(0xC0 * a) << 24) | 0x39406B,
-                          line_w=1.6 * sc)
             elif p["kind"] == "spark":
                 # OK 弹入迸发：浅橙小点，随生命淡出
                 s.ellipse((int(0xE6 * a) << 24) | (MOTION.COLOR_OK_SPARK & 0xFFFFFF),

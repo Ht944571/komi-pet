@@ -240,7 +240,7 @@ COLOR_HEART = 0xFFE89AAE
 # 想恢复就把这里改成 True。
 FOLLOW_BADGE_ON = False              # 爱心·樱花粉
 COLOR_DROP = 0xCCE89AAE               # 石化爆发粒子·樱花粉淡
-COLOR_BUBBLE = 0x307A86C9             # 自主吐泡·淡制服蓝
+# （原 COLOR_BUBBLE「自主吐泡·淡制服蓝」已随该功能于 2026-09-27 删除）
 COLOR_OK = 0xFFED6D2E                 # OK 完成态代表橙（取自参考字形 #ED6D2E）
 COLOR_OK_SOFT = 0x2EED6D2E            # OK 完成态气泡淡填充（透明度 0.18）
 COLOR_OK_SPARK = 0xFFF5A65B           # OK 弹入迸发粒子·浅橙
