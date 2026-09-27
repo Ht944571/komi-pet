@@ -24,8 +24,54 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import wb_runtime as RT                                        # noqa: E402
+
+
+def _frozen_dispatch(argv):
+    """**打包成 exe 后**的入口分发：一个 exe + 子命令。
+
+    命令由 `wb_runtime.self_cmd()` / `hidden_launcher()` 生成：
+      --pet（默认） 桌宠本体     · --watcher 守望     · --api [--port N] 看板服务
+      --install / --uninstall / --status / --check   安装维护（见 wb_setup）
+    源码运行时不会走到这里（保持原有平台分发不变）。
+    """
+    def has(f):
+        return f in argv
+
+    if has("--install") or has("--uninstall") or has("--status") or has("--check"):
+        import wb_setup
+        act = ("uninstall" if has("--uninstall") else
+               "status" if has("--status") else
+               "check" if has("--check") else "install")
+        port = 8801
+        if "--port" in argv:
+            try:
+                port = int(argv[argv.index("--port") + 1])
+            except Exception:
+                pass
+        return wb_setup.main([act, "--port", str(port)])
+
+    if has("--watcher"):
+        RT.free_console()
+        import wb_whale_watcher
+        return wb_whale_watcher.main([])
+
+    if has("--api"):
+        # API 的 argparse 很严格 → 必须把 --api 摘掉再把余下参数原样传下去
+        # （控制台不摘：从 cmd 手动起时日志要看得见；被桌宠守护拉起时本来就没有控制台）
+        sys.path.insert(0, os.path.join(RT.bundle_dir(), "wb_usage"))
+        sys.argv = [sys.argv[0]] + [a for a in argv if a != "--api"]
+        import wb_api
+        return wb_api.main()
+
+    RT.free_console()          # 桌宠：双击 exe 不留黑窗
+    import wb_whale_win
+    return wb_whale_win.main()
+
 
 def main():
+    if RT.FROZEN:
+        return _frozen_dispatch(sys.argv[1:])
     if sys.platform == "darwin":
         import b_hover            # noqa: E402  需要 pyobjc（install.py 会自动准备）
         b_hover.main()

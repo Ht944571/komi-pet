@@ -48,6 +48,9 @@ from wb_hover_core import (                                   # noqa: E402
     fmt_tokens, fmt_duration, fmt_duration_live, fmt_ago,
 )
 
+# ---------- 运行时环境适配（源码运行 / 打包 exe：可写目录与自身唤起命令）----------
+import wb_runtime as RT                                       # noqa: E402
+
 # ---------- 动效设计系统（节奏 / 幅度 / 缓动 / 情绪 / 降级，全部集中管理）----------
 import wb_motion as MOTION                                    # noqa: E402
 
@@ -91,9 +94,12 @@ EVENT_LOG = os.path.join(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "
                          "komi-wb-hover.events.log")   # komi- 前缀：与旧技能遗留进程隔离（P1）
 DASH_READY_WAIT = 8.0
 _HERE = os.path.dirname(os.path.abspath(__file__))
-POS_FILE = os.path.join(_HERE, ".whale_pos.json")
-SETTINGS_FILE = os.path.join(_HERE, ".whale_settings.json")
-ASSETS_DIR = os.path.join(_HERE, "assets")
+# ⚠️ **可写**文件（窗口位置 / 设置）走 RT.data_dir()：
+#    打包后 = %LOCALAPPDATA%\KomiPet；源码运行 = app/ —— 与打包前完全一致。
+#    只读资源（立绘等）继续从**包内**读（bundle_dir()），装到只读目录也不怕。
+POS_FILE = os.path.join(RT.data_dir(), ".whale_pos.json")
+SETTINGS_FILE = os.path.join(RT.data_dir(), ".whale_settings.json")
+ASSETS_DIR = os.path.join(RT.bundle_dir(), "assets")
 # v3 立绘目录（8 态、统一画布、按脸宽归一）——由 tools/build_pet_v3.py 生成。
 # 高冷版（alt_*）已停用：审美线统一到 v3 的 Q 版，见 docs/眨眼重构交接-2026-09-26.md。
 SPRITE_DIR = os.path.join(ASSETS_DIR, "pet_v3")
@@ -4048,9 +4054,10 @@ class WhalePet:
                 return
             self._spawning_dash = True
         try:
-            api_py = os.path.join(_HERE, "wb_usage", "wb_api.py")
-            if not os.path.isfile(api_py):
-                log_exception(f"[dashboard] 找不到看板服务脚本 {api_py}")
+            # 打包后没有 .py 可跑 → 「自身 exe + --api」；源码运行与改造前**逐字符一致**
+            cmd = RT.self_cmd("api", port=self._dashboard_port())
+            if not RT.FROZEN and not os.path.isfile(cmd[1]):
+                log_exception(f"[dashboard] 找不到看板服务脚本 {cmd[1]}")
                 return
             port = self._dashboard_port()
             self._report_event("ensure_server", ok=True,
@@ -4059,8 +4066,8 @@ class WhalePet:
             with open(os.path.join(tmp, "wb-usage.log"), "ab") as fout, \
                  open(os.path.join(tmp, "wb-usage.err.log"), "ab") as ferr:
                 subprocess.Popen(
-                    [sys.executable, api_py, "--port", str(port)],
-                    cwd=os.path.dirname(api_py),
+                    cmd,
+                    cwd=RT.EXE_DIR if RT.FROZEN else os.path.dirname(cmd[1]),
                     stdin=subprocess.DEVNULL, stdout=fout, stderr=ferr,
                     creationflags=subprocess.DETACHED_PROCESS
                     | getattr(subprocess, "CREATE_NO_WINDOW", 0))

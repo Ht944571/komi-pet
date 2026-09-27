@@ -34,3 +34,9 @@ live2d/model/
 
 # 备份文件（*.bak / *.pre_*）不进仓库
 *.bak
+
+# ---- Windows 打包产物（可随时重建，60MB+，绝不进仓库）----
+# 提交的是 packaging/build_win.py + verify_win.py + app.ico；
+# 产物由 `python packaging/build_win.py` 重新生成。
+dist/
+build/

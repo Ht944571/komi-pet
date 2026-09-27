@@ -23,6 +23,8 @@ import tempfile
 import time
 import urllib.request
 
+import wb_runtime as RT          # 运行时环境适配（可写数据目录 / 包内只读资源）
+
 # ---------- 常量 ----------
 POLL_SEC = 1              # 最短刷新间隔（秒）
 ACTIVE_WINDOW_SEC = 3     # 降级时用：近 N 秒有活动 = 活跃对话
@@ -48,24 +50,26 @@ def load_paths():
            > 家目录默认值。
     """
     cfg = {}
-    cfg_path = os.path.join(SCRIPT_DIR, "wb_paths.json")
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
+    # 打包后 wb_paths.json 落在**数据目录**；源码运行两者是同一个 app/（行为不变）
+    for cfg_path in (RT.paths_config_path(), os.path.join(SCRIPT_DIR, "wb_paths.json")):
+        if cfg_path and os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                break
+            except Exception:
+                cfg = {}
     home = os.path.expanduser("~")
 
     db = cfg.get("db_path")
     if not db or not os.path.exists(db):
-        db = os.path.join(SCRIPT_DIR, "wb_usage", "data", "wb_usage_dw.db")
+        db = RT.db_path()          # 源码 = app/wb_usage/data/…；打包 = 数据目录
 
     wb = cfg.get("workbuddy_db")
     if not wb or not os.path.exists(wb):
         wb = os.path.join(home, ".workbuddy", "workbuddy.db")
 
-    pos = cfg.get("pos_file") or os.path.join(SCRIPT_DIR, ".hover_pos.json")
+    pos = cfg.get("pos_file") or os.path.join(RT.data_dir(), ".hover_pos.json")
     dash = (cfg.get("dashboard_url")
             or os.environ.get("WB_DASHBOARD_URL")
             or "http://127.0.0.1:8801")

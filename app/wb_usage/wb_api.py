@@ -49,8 +49,19 @@ import wb_dw
 import agents as agent_registry
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DB = os.path.join(BASE, "data", "wb_usage_dw.db")
-DEFAULT_HTML = os.path.join(BASE, "dashboard.html")
+# 运行时环境适配（wb_runtime 在上级 app/；打包后同在 PYZ 里，import 直接成功）
+try:
+    import wb_runtime as RT
+except ImportError:                                     # 源码直接跑本文件时补 sys.path
+    sys.path.insert(0, os.path.dirname(BASE))
+    import wb_runtime as RT
+
+# **可写**：数仓走数据目录 —— 源码 = app/wb_usage/data/…（与改造前逐字节一致）；
+#          打包 = %LOCALAPPDATA%\KomiPet\wb_usage_dw.db（包目录只读，写不进去）
+DEFAULT_DB = RT.db_path()
+# **只读**：静态资源从包内的 wb_usage/ 读（源码下它 == BASE）
+WEB_DIR = os.path.join(RT.bundle_dir(), "wb_usage")
+DEFAULT_HTML = os.path.join(WEB_DIR, "dashboard.html")
 
 
 # 对数用开关：强制指定轮次数据源（None=自动：有 dws_turn 就用它）
@@ -616,9 +627,10 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path in ("/", "/index.html"):
-            self._file(os.path.join(BASE, "dashboard.html"), "text/html; charset=utf-8")
+            self._file(os.path.join(WEB_DIR, "dashboard.html"), "text/html; charset=utf-8")
         elif path == "/chart.umd.min.js":
-            self._file(os.path.join(BASE, "data", "chart.umd.min.js"), "application/javascript")
+            self._file(os.path.join(WEB_DIR, "data", "chart.umd.min.js"),
+                       "application/javascript")
         elif path == "/api/agents":
             self._json(self.api.agents())
         elif path == "/api/kpi":

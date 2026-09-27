@@ -25,12 +25,15 @@ import subprocess
 import sys
 import time
 
+import wb_runtime as RT          # 运行时环境适配（打包后：自身 exe + 子命令）
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 HOVER_ENTRY = os.path.join(SCRIPTS_DIR, "hover.py")
+"""源码运行时的桌宠入口。打包后不用它 —— 走 `RT.self_cmd("pet")`（自身 exe --pet）。"""
 
 WORKBUDDY_EXE = "WorkBuddy.exe"
 WHALE_CLASS = "WBWhalePetClass"      # 桌宠主窗口类名（wb_whale_win.py 注册，历史名保留）
@@ -103,15 +106,14 @@ def spawn_whale():
     注入 WB_PET_LINKED=1：告诉桌宠"你是为 WorkBuddy 拉起的"，
     于是即使它启动瞬间没探测到 WorkBuddy，也会在宽限期后自行退出（不留孤儿）。
     """
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    if not os.path.isfile(pythonw):
-        pythonw = sys.executable  # 兜底
+    # 打包后没有 pythonw、也没有 .py → 「自身 exe + --pet」；源码运行与改造前一致
+    cmd = RT.self_cmd("pet")
     flags = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
     env = dict(os.environ)
     env["WB_PET_LINKED"] = "1"
     subprocess.Popen(
-        [pythonw, HOVER_ENTRY],
-        cwd=SCRIPTS_DIR, close_fds=True,
+        cmd,
+        cwd=RT.EXE_DIR if RT.FROZEN else SCRIPTS_DIR, close_fds=True,
         creationflags=flags, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -328,10 +330,12 @@ def _run_key_set():
     独立出来时，旧的自启项还指回 skill，不清掉会各自拉起一只桌宠。
     """
     import winreg
-    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    if not os.path.isfile(pythonw):
-        pythonw = sys.executable
-    value = f'"{pythonw}" "{os.path.abspath(__file__)}"'
+    value = RT.hidden_launcher("watcher")
+    if value is None:                   # 源码运行：保持原样（pythonw + 本文件）
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.isfile(pythonw):
+            pythonw = sys.executable
+        value = f'"{pythonw}" "{os.path.abspath(__file__)}"'
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                             r"Software\Microsoft\Windows\CurrentVersion\Run",

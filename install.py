@@ -28,6 +28,9 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app"))
+import wb_runtime as RT          # noqa: E402  运行时环境适配（打包后走自身 exe + 子命令）
+
 # ---------- 目录约定（全部相对本项目，与 WorkBuddy skill 目录无关）----------
 ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(ROOT, "app")
@@ -199,9 +202,13 @@ def register_autostart(port, start_now=True):
         warn("macOS 请自行写 launchd plist（参考 app/b_hover.py 的注释）。")
         return False
     pyw = _pythonw()
+    # 打包后 hidden_launcher 会给出「wscript 隐藏启动自身 exe」；源码运行返回 None，
+    # 继续用 pythonw + 脚本 —— 两种形态下行为都不变。
     entries = [
-        (RUN_API, f'"{pyw}" "{API_PY}" --port {port}'),
-        (RUN_WATCHER, f'"{pyw}" "{WATCHER_PY}"'),
+        (RUN_API, RT.hidden_launcher("api", extra=["--port", port])
+         or f'"{pyw}" "{API_PY}" --port {port}'),
+        (RUN_WATCHER, RT.hidden_launcher("watcher")
+         or f'"{pyw}" "{WATCHER_PY}"'),
     ]
     if not _run_key_write(entries):
         return False

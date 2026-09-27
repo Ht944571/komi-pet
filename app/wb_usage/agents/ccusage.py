@@ -34,13 +34,24 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 
 from .base import AgentSource, canonical_usage, usage_json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(HERE, "data", "ccusage")
+# ⚠️ 这是**可写**缓存（npx ccusage 拉回来的 json）→ 必须落在可写目录：
+#    源码运行 = wb_usage/agents/data/ccusage（与改造前一致）；
+#    打包后 = %LOCALAPPDATA%\KomiPet\agents\ccusage（包目录只读，写不进去）
+try:
+    import wb_runtime as RT
+except ImportError:                                     # 源码直接跑时补 sys.path（app/）
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    import wb_runtime as RT
+CACHE_DIR = (os.path.join(HERE, "data", "ccusage") if not RT.FROZEN
+             else os.path.join(RT.data_dir(), "agents", "ccusage"))
 
 REFRESH_MIN_S = 300          # 同一源两次刷新的最小间隔（任务文档：≥5 分钟）
 REFRESH_GAP_S = 60           # 相邻两源刷新的间隔（轮转节流）
