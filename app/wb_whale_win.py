@@ -2523,20 +2523,34 @@ class WhalePet:
         """光标位置 → 悬停态 + 头部朝向（提案 §3）。
 
         放在动画帧里统一算（而不是 WM_MOUSEMOVE），分层窗口不依赖鼠标离开消息也能正确复位。
+
+        视线判定范围：以窗口中心为原点、尺寸取 MOTION.GAZE_RECT_W×H（截图 443×465）
+        的矩形；光标进入该范围即触发跟随，不再要求光标压在桌宠自身窗口内。
+        悬停态（hover 放大/眨眼关注）仍保持只在桌宠窗口内触发，避免光标一过附近就放大。
         """
-        inside, dx_ratio = False, 0.0
+        hover = False
+        gaze_inside, dx_ratio = False, 0.0
         try:
             pt = POINT()
             _user32.GetCursorPos(ctypes.byref(pt))
             x, y = self._window_xy(self.hwnd)
             lay = self._layout()
+            # 悬停：只在桌宠自身窗口内
             if x <= pt.x <= x + lay["W"] and y <= pt.y <= y + lay["H"]:
-                inside = True
-                dx_ratio = (pt.x - (x + lay["W"] / 2)) / max(1.0, lay["W"] / 2)
+                hover = True
+            # 视线：扩展到截图尺寸的矩形
+            sc = self.scale
+            cx = x + lay["W"] / 2.0
+            cy = y + lay["H"] / 2.0
+            half_w = (MOTION.GAZE_RECT_W * sc) / 2.0
+            half_h = (MOTION.GAZE_RECT_H * sc) / 2.0
+            if (cx - half_w) <= pt.x <= (cx + half_w) and (cy - half_h) <= pt.y <= (cy + half_h):
+                gaze_inside = True
+                dx_ratio = (pt.x - cx) / max(1.0, half_w)
         except Exception:
-            inside = False
-        self._hovering = inside
-        if inside:
+            pass
+        self._hovering = hover
+        if gaze_inside:
             self._gaze_target = max(-MOTION.GAZE_MAX_PX, min(
                 MOTION.GAZE_MAX_PX, dx_ratio * MOTION.GAZE_MAX_PX)) * self.scale
         else:
