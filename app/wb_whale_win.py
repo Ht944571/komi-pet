@@ -1015,6 +1015,13 @@ class WhalePet:
         # 自更新：后台检查结果缓存 + 是否在处理（网络全在后台线程，绝不进消息循环）
         self._update_info = None
         self._update_busy = False
+        # 形态尺寸归一 + 切换时的尺寸缓入（见 _state_size / _size_factor）
+        self._size_cache = {}
+        self._canvas_ar = 0.0
+        self._size_key = None
+        self._size_from = 1.0
+        self._size_now = 1.0
+        self._size_t0 = 0.0
         self.scale = float(self._settings.get("scale", 1.0))
         self.bubble_on = bool(self._settings.get("bubble", True))
         self.sound_on = bool(self._settings.get("sound", True))
@@ -1690,7 +1697,10 @@ class WhalePet:
         lay = self._layout()
         ph = lay["pet_h"] - 8 * lay["sc"]
         for key, (img, iw, ih) in self._sprites.items():
-            pw, phh = int(ph * iw / ih), int(ph)
+            # 每个形态按**自己的尺寸系数**预缩放（形态尺寸归一，见 _state_size）
+            st = key.split(".", 1)[1].replace("_f", "")
+            phh = int(ph * self._state_size(st))
+            pw = int(phh * iw / ih)
             if pw <= 0 or phh <= 0:
                 continue
             tmp = Surface(pw, phh)
@@ -3289,7 +3299,9 @@ class WhalePet:
         head_dx = self._gaze_dx + self._drag_tilt
         if cached is None:
             if img is not None:
-                s.image(img, x, y, w, h)
+                # 没命中预缩放缓存（尺寸过渡/极端缩放）：直接重采样，
+                # 但**同样要应用视线/拖拽位移**，否则那几帧立绘会横向跳一下
+                s.image(img, x + head_dx, y, w, h)
             return
         if abs(head_dx) < 0.2:
             s.blit(cached, x, y, w, h)         # 完全静止 → 1:1 整块，最快
@@ -3644,6 +3656,61 @@ class WhalePet:
             except Exception:
                 log_exception("[acc] 绘制")
 
+    # ---- 形态尺寸归一（点击换姿势时的"忽大忽小"）----
+
+    def _state_size(self, state):
+        """形态之间的**尺寸归一系数**（乘在立绘绘制高度上）。
+
+        为什么需要：v3 八态共用一张画布，构建期只归一到「脸宽一致」，
+        **姿势本身的高低没管** —— 实测屏幕上内容高 169px(stone) ~ 318px(happy)，差 1.88 倍。
+        点一下就换姿势，看着就是"忽大忽小"。
+
+        做法：把「视觉大小」（内容框的几何均值 √(w·h)）往全体平均值拉
+        `MOTION.SIZE_NORM_ALPHA` 倍：
+            0   = 不动（脸一致，姿势高度差 1.88×）
+            0.5 = 折中 —— 实测缩放只有 0.96~1.10（**脸最多变 10%**），高度差降到 1.56×
+            1   = 完全按视觉大小（高度差 1.30×，但**脸会变 1.45×**，一眼看得出头在缩放）
+
+        ⚠️ 刻意不取 1：对 chibi 角色，"头的大小"比"整体高度"更影响观感，
+        脸跟着抖会显得廉价。要更彻底就调 MOTION.SIZE_NORM_ALPHA。
+        """
+        if not self._size_cache:
+            a = getattr(MOTION, "SIZE_NORM_ALPHA", 0.5)
+            boxes = getattr(self, "_spr_cbox", {}) or {}
+            ar = self._canvas_ar
+            if not ar and self._sprites:
+                spr = next(iter(self._sprites.values()))
+                ar = spr[1] / max(1, spr[2])          # 画布宽高比
+                self._canvas_ar = ar
+            ar = ar or 1.0
+            # 内容框是**归一化**坐标：宽要乘画布宽高比，才和高度在同一物理尺度上
+            gm = {st: (((b[2] - b[0]) * ar) * (b[3] - b[1])) ** 0.5
+                  for st, b in boxes.items() if len(b) >= 4}
+            if a <= 0 or len(gm) < 2:
+                self._size_cache = {st: 1.0 for st in gm}
+            else:
+                mean = sum(gm.values()) / len(gm)
+                self._size_cache = {st: (mean / g) ** a for st, g in gm.items()}
+        return self._size_cache.get(state, 1.0)
+
+    def _size_factor(self, state, now):
+        """带**尺寸过渡**的形态系数：换形态时从旧尺寸缓入新尺寸（SIZE_MORPH_S 内）。
+
+        为什么还要过渡：8 个姿势差异太大，`_draw_state_fade` 的**溶解闸门**会判定"硬切"
+        （避免两张脸叠成双重曝光）。硬切 + 尺寸差 = 突跳，所以这里单独把"尺寸"这一维做成缓入
+        —— 新姿势**长/缩到它该有的大小**，观感是"她站起来了"，而不是"啪地换了一张图"。
+        """
+        target = self._state_size(state)
+        if self._size_key != state:
+            self._size_from = self._size_now
+            self._size_key = state
+            self._size_t0 = now
+        dur = getattr(MOTION, "SIZE_MORPH_S", 0.2)
+        u = 1.0 if dur <= 0 else min(1.0, max(0.0, (now - self._size_t0) / dur))
+        self._size_now = (self._size_from
+                          + (target - self._size_from) * MOTION.ease_out_cubic(u))
+        return self._size_now
+
     def _draw_pet(self, s, lay):
         """立绘：状态选图（开心/文静/嘟嘴）+ 镜像 + 按压 Q 弹 + 摇摆 + 脸红 + 粒子。"""
         sc = lay["sc"]
@@ -3653,7 +3720,6 @@ class WhalePet:
         hover_s = 1.0 + (MOTION.HOVER_SCALE - 1.0) * MOTION.ease_out_cubic(self._hover_t)
         hover_s = min(hover_s, MOTION.SCALE_MAX)          # 提案 §5 克制上限
         sq = self._squash
-        ph_draw = ph * hover_s * sq
         # 压扁时横向补偿（squash & stretch，体积感）
         pw_ratio = min(1.0 + (1.0 - sq) * 0.7, MOTION.SCALE_MAX)
         if self._pressed:
@@ -3673,6 +3739,10 @@ class WhalePet:
             state = "pout"                  # 失败 = 委屈（不是怒容）
         else:
             state = "happy" if (self.active or self._in_talk()) else "idle"
+        # ---- 形态尺寸归一 × 尺寸过渡 ----
+        # 各姿势内容高差 1.88×（stone 169px vs happy 318px），点一下就换姿势；
+        # 不处理就是"忽大忽小"，硬切时还会突跳（见 _state_size / _size_factor）
+        ph_draw = ph * hover_s * sq * self._size_factor(state, now)
         facing = self._current_facing(now)  # 翻身覆盖 > 鼠标跟随 > 保持
         # 双版本 sprite key：'q.idle' / 'alt.idle' / 带 _f 后缀等
         style_prefix = getattr(self, "style", "q")
@@ -3706,7 +3776,7 @@ class WhalePet:
             cache_key = f"{style_prefix}.{state}{facing}"
             cached = (self._sprite_cache.get(cache_key)
                       or self._sprite_cache.get(f"{style_prefix}.{state}"))
-            if cached and abs(cached[2] - ph_draw) < 2:
+            if cached and abs(cached[2] - ph_draw) <= max(2.0, ph_draw * 0.16):
                 self._blit_pet(s, cached[0], img, x, y_bottom - ph_draw, pw, ph_draw)
             else:
                 self._blit_pet(s, None, img, x, y_bottom - ph_draw, pw, ph_draw)
