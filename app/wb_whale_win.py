@@ -3076,11 +3076,38 @@ class WhalePet:
         self._draw_accessories(s, lay, now)
         s.present(self.hwnd)
 
+    def _sprite_content_top(self, lay):
+        """当前立绘**实际内容顶**的屏幕 y（拿不到就退回「气泡区下沿」）。
+
+        为什么必须动态取：v3 各态共用同一张画布（1167×1570），但**上方留白差别极大** ——
+        内容顶归一化位置 happy 0.041 / joy 0.120 / idle 0.355 / stone 0.489。
+        早期把想法小圆的终点写死在 `lay["bubble_h"]`（等于假设"头发顶正好在气泡区下沿"），
+        于是头顶偏低的态（pout/shy/idle/blush/stone）小圆与头顶之间会空出一大截
+        —— 正是用户反馈的「想法泡泡与桌宠连接空隙太大」（实测相差 18~167px）。
+
+        直接用 `_spr_rect`/`_spr_key` 即可：`_draw_bubble` 比 `_draw_pet` 先跑，
+        这里读到的是**上一帧**记录的立绘矩形（1 帧 = 66ms，肉眼无感）。
+        """
+        rect = getattr(self, "_spr_rect", None)
+        key = getattr(self, "_spr_key", None)
+        if rect and key:
+            cbox = getattr(self, "_spr_cbox", {}).get(key[0])
+            if cbox:
+                top = rect[1] + cbox[1] * rect[3]
+                sc = lay["sc"]
+                # 兜底钳制：首帧 / 极端缩放时别让连线缩进气泡里或跑出窗口
+                return min(max(top, lay["bubble_h"] + 6 * sc), lay["H"] - 24 * sc)
+        return lay["bubble_h"]
+
     def _draw_thought_circles(self, s, lay, line_argb):
-        """想法小圆：沿「主气泡底部 → 立绘头顶」对角线由大到小排列。
+        """想法小圆：沿「主气泡底部 → 立绘头顶」由大到小排列。
 
         漫画思考泡惯例：圆从大到小指向源头，给眼睛一条"从头顶冒出"的引导线。
         数据态与 OK 态共用同一套几何，只换描边色 —— 形态切换时小圆不跳位。
+
+        终点锚在**当前态立绘的实际内容顶**（见 `_sprite_content_top`，各态可差 150px），
+        并让颗数随跨度自适应：**首颗贴住气泡下沿、末颗贴住头顶**，
+        跨度大就按 ~30px 步距多排几颗 —— 不再出现"小圆飘在半空、离头一大截"。
         """
         sc = lay["sc"]
         W = lay["W"]
@@ -3088,16 +3115,23 @@ class WhalePet:
         p0x = W / 2 - 22 * sc                       # 起点：主气泡底偏左
         p0y = by + bh + 4 * sc                      # 距主气泡下沿 4px
         p1x = W / 2 - 4 * sc                        # 终点：头顶偏中
-        p1y = lay["bubble_h"] + 5 * sc              # 立绘头发最上沿上方 5px
-        c1r, c2r = 7.5 * sc, 4.5 * sc               # 大→小，靠近主气泡的更大
-        c1x = p0x + (p1x - p0x) * 0.30              # 30% 处（近主气泡端）
-        c1y = p0y + (p1y - p0y) * 0.30
-        c2x = p0x + (p1x - p0x) * 0.78              # 78% 处（近头顶端，最小）
-        c2y = p0y + (p1y - p0y) * 0.78
-        s.ellipse(C_BUBBLE, c1x - c1r, c1y - c1r, c1r * 2, c1r * 2,
-                  line_argb=line_argb, line_w=3.0 * sc)
-        s.ellipse(C_BUBBLE, c2x - c2r, c2y - c2r, c2r * 2, c2r * 2,
-                  line_argb=line_argb, line_w=2.4 * sc)
+        p1y = self._sprite_content_top(lay) - 4 * sc    # 立绘实际内容顶上方 4px
+
+        r_big, r_sml = 8.0 * sc, 3.8 * sc           # 大→小：近气泡的大、近头顶的小
+        y0 = p0y + r_big                            # 首颗圆心：贴着气泡下沿
+        y1 = p1y - r_sml                            # 末颗圆心：贴着头发顶
+        if y1 - y0 < 8 * sc:                        # 极端贴近时留一点间距，防两颗重合
+            y1 = y0 + 8 * sc
+        usable = y1 - y0
+        n = 2 if usable < 34 * sc else min(6, int(round(usable / (30.0 * sc))) + 1)
+        span = max(1.0, p1y - p0y)
+        for i in range(n):
+            t = i / (n - 1)
+            y = y0 + usable * t
+            x = p0x + (p1x - p0x) * ((y - p0y) / span)
+            r = r_big + (r_sml - r_big) * t
+            s.ellipse(C_BUBBLE, x - r, y - r, r * 2, r * 2,
+                      line_argb=line_argb, line_w=(3.0 - 0.6 * t) * sc)
 
     def _draw_bubble(self, s, lay, now):
         """气泡分形态绘制：OK 态走 _draw_bubble_ok，其余走数据态三行文案。"""
