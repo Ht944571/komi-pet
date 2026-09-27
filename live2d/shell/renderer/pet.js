@@ -31,16 +31,34 @@ function hitAt(cx, cy) {
     if (cx >= b.x && cx <= b.x + b.w && cy >= b.y && cy <= b.y + b.h) return b.name;
   return null;
 }
-function gaze(cx, cy) {
+// 视线判定范围：与 Python 2D 版统一的**固定 443×465 物理像素**（中心=窗口中心）。
+// 窗口默认整窗穿透、鼠标基本不在窗口里 → 判定必须基于**全局光标**（主进程按 ~15fps
+// 轮询 screen.getCursorScreenPoint 后推送），不能只靠窗口自己的 mousemove。
+// ⚠️ 主进程的 screen/bounds 都是 DIP，所以下面要按 devicePixelRatio 把物理像素折回 DIP，
+//    否则高 DPI 屏上判定框会随缩放倍数变小（150% 屏只有 2/3 大）。
+const GAZE_BOX_W = 443, GAZE_BOX_H = 465;
+
+function applyGaze(dx, dy) {
   const now = performance.now();
   if (now - lastGaze < 66) return;                 // 15fps 节流，与桌宠气质一致
   lastGaze = now;
-  const dx = Math.max(-1, Math.min(1, (cx - 0.5) * 2));
-  const dy = Math.max(-1, Math.min(1, (cy - 0.42) * 2));
   l2d.setParams({
     ParamAngleX: dx * 30, ParamAngleY: -dy * 20,
     ParamEyeBallX: dx, ParamEyeBallY: -dy,
   });
+}
+function gazeFromCursor(d) {
+  if (!ready || dragOn || !d || !d.win || !d.cur) return;
+  const dpr = window.devicePixelRatio || 1;            // 物理像素 → DIP
+  const cx = d.win.x + d.win.width / 2;
+  const cy = d.win.y + d.win.height / 2;
+  const hw = GAZE_BOX_W / 2 / dpr, hh = GAZE_BOX_H / 2 / dpr;
+  const ox = d.cur.x - cx, oy = d.cur.y - cy;
+  if (Math.abs(ox) > hw || Math.abs(oy) > hh) {    // 出判定范围 → 视线回正
+    applyGaze(0, 0);
+    return;
+  }
+  applyGaze(Math.max(-1, Math.min(1, ox / hw)), Math.max(-1, Math.min(1, oy / hh)));
 }
 const LINES = {
   head: ['……唔。被摸头的话，稍微、有点开心。', '在、在听。不要突然伸手。'],
@@ -85,7 +103,8 @@ function boot() {
     const hit = !!area || dragOn;
     if (hit !== over) { over = hit; window.pet.setClickThrough(!hit); }  // 状态变化才调
     if (dragOn) { window.pet.dragMove({ screenX: e.screenX, screenY: e.screenY }); return; }
-    if (ready && !dragOn) gaze(cx, cy);
+    // 注：视线不再挂在这里 —— 鼠标不在窗口内时收不到 mousemove，
+    //     改由主进程全局轮询推送（见 gazeFromCursor）。
   });
   addEventListener('mousedown', e => {
     if (!ready) return;
@@ -98,6 +117,7 @@ function boot() {
   addEventListener('mouseup', () => { if (dragOn) { dragOn = false; window.pet.dragEnd(); } });
   addEventListener('contextmenu', e => e.preventDefault());   // 右键归托盘
   window.pet.onScaleChanged(() => fit());
+  window.pet.onCursor(d => gazeFromCursor(d));     // 全局光标 → 视线跟随
 }
 
 if (typeof L2D === 'undefined') {

@@ -21,7 +21,7 @@ if (process.env.KOMI_SHELL_SAFE === '1') {
   app.commandLine.appendSwitch('enable-unsafe-swiftshader');
 }
 
-let win = null, tray = null, server = null, drag = null, quitting = false;
+let win = null, tray = null, server = null, drag = null, quitting = false, gazeTimer = null;
 const state = { clickThrough: false, scale: 1, visible: true };
 
 function loadPos() { try { return JSON.parse(fs.readFileSync(POS_FILE, 'utf8')); } catch { return null; } }
@@ -76,6 +76,20 @@ function createWindow() {
     console.log('[renderer]', msg));
   win.once('ready-to-show', () => { if (state.visible) win.show(); });
   win.on('closed', () => { win = null; });
+
+  // ---- 视线跟随：全局光标轮询 ----
+  // 只靠渲染进程的 mousemove 的话，鼠标一离开窗口就收不到事件，视线立刻停住
+  // （窗口又是默认整窗穿透的，鼠标基本不在窗口里）。所以由主进程按 ~15fps 轮询
+  // screen.getCursorScreenPoint()，连同窗口 bounds 一起推给渲染进程，由它做判定。
+  if (!gazeTimer) {
+    gazeTimer = setInterval(() => {
+      if (!win) return;
+      try {
+        const c = screen.getCursorScreenPoint();
+        win.webContents.send('cursor-pos', { cur: { x: c.x, y: c.y }, win: win.getBounds() });
+      } catch (_) { }
+    }, 66);                                   // 66ms ≈ 15fps，与渲染层的节流一致
+  }
 }
 
 function createTray() {

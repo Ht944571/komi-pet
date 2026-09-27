@@ -2524,8 +2524,10 @@ class WhalePet:
 
         放在动画帧里统一算（而不是 WM_MOUSEMOVE），分层窗口不依赖鼠标离开消息也能正确复位。
 
-        视线判定范围：以窗口中心为原点、尺寸取 MOTION.GAZE_RECT_W×H（截图 443×465）
-        的矩形；光标进入该范围即触发跟随，不再要求光标压在桌宠自身窗口内。
+        视线判定范围：**固定 MOTION.GAZE_RECT_W×H（443×465）屏幕像素**的矩形，
+        中心取**立绘实际矩形**中心（拿不到才退回窗口中心）；光标进入该范围即触发
+        跟随，不再要求光标压在桌宠自身窗口内。
+        ⚠️ 不乘 scale —— 用户要的就是这个绝对尺寸。
         悬停态（hover 放大/眨眼关注）仍保持只在桌宠窗口内触发，避免光标一过附近就放大。
         """
         hover = False
@@ -2538,15 +2540,19 @@ class WhalePet:
             # 悬停：只在桌宠自身窗口内
             if x <= pt.x <= x + lay["W"] and y <= pt.y <= y + lay["H"]:
                 hover = True
-            # 视线：扩展到截图尺寸的矩形
-            sc = self.scale
-            cx = x + lay["W"] / 2.0
-            cy = y + lay["H"] / 2.0
-            half_w = (MOTION.GAZE_RECT_W * sc) / 2.0
-            half_h = (MOTION.GAZE_RECT_H * sc) / 2.0
+            # 视线：固定 443×465，中心对准立绘矩形（气泡占窗口上部，用窗口中心会偏上）
+            spr = getattr(self, "_spr_rect", None)
+            if spr and spr[2] > 0 and spr[3] > 0:
+                cx = x + spr[0] + spr[2] / 2.0
+                cy = y + spr[1] + spr[3] / 2.0
+            else:
+                cx = x + lay["W"] / 2.0
+                cy = y + lay["H"] / 2.0
+            half_w = MOTION.GAZE_RECT_W / 2.0
+            half_h = MOTION.GAZE_RECT_H / 2.0
             if (cx - half_w) <= pt.x <= (cx + half_w) and (cy - half_h) <= pt.y <= (cy + half_h):
                 gaze_inside = True
-                dx_ratio = (pt.x - cx) / max(1.0, half_w)
+                dx_ratio = (pt.x - cx) / half_w
         except Exception:
             pass
         self._hovering = hover
