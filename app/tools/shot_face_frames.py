@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 r"""面部叠加层真机出图：眨眼各相位 / 部分眨眼 / 腮红 / 高冷版，1× 全身 + 4× 面部裁切。
 
-与 shot_accessories.py 同一管线（真 GDI 绘制 → DIB 读回），专拍"程序化叠加层"
+与 shot_face_frames 同一套管线（真 GDI 绘制 → DIB 读回），专拍"程序化叠加层"
 （眨眼眼睑盖板 / 腮红）——这些元素每几秒出现一次，1× 下的画质只有真机能说明。
 
 用法：python tools/shot_face_frames.py [--out 目录] [--scale 1.0]
