@@ -181,6 +181,13 @@ SIZE_NORM_ALPHA = 0.5
 # 观感从"啪地换了张图"变成"她站起来了 / 坐下了"。
 SIZE_MORPH_S = 0.20
 
+# ---- 写字本子（任务进行中写字 / 完成后展示，见 wb_notebook.py）----
+NOTE_APPEAR_S = 0.32       # 拿出本子翻开
+NOTE_PRESENT_S = 0.42      # 完成后"翻页 + 举起来"的时长
+NOTE_HOLD_S = 6.0          # 展示保持多久（之后自动收起）
+NOTE_DISMISS_S = 0.30      # 收起
+NOTE_WRITE_SPEED = 1.0     # 写字速度倍率：1.0 = 每行约 0.62s；调大更快
+
 DRAG_TILT_MAX_PX = 6.0                # 拖拽倾斜上限（提案 ≤8° 对应像素）
 DRAG_TILT_HEAD_RATIO = 0.55           # 头部剪切在身体上方的占比
 

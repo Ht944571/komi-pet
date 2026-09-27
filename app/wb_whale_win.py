@@ -54,6 +54,9 @@ import wb_runtime as RT                                       # noqa: E402
 # ---------- 动效设计系统（节奏 / 幅度 / 缓动 / 情绪 / 降级，全部集中管理）----------
 import wb_motion as MOTION                                    # noqa: E402
 
+# ---------- 写字本子（任务进行中写字 / 完成后展示；纯逻辑可单测）----------
+import wb_notebook as NOTEBOOK                                # noqa: E402
+
 # ---------- 跟随模式（聚焦信号）：纯逻辑层（去抖状态机 / 前台→agent 推断）----------
 import wb_follow as FOLLOW                                    # noqa: E402
 
@@ -573,6 +576,10 @@ if _gdiplus is not None:
     _GetImageW = _gp("GdipGetImageWidth", [P, P])
     _GetImageH = _gp("GdipGetImageHeight", [P, P])
     _DrawImageRectI = _gp("GdipDrawImageRectI", [P, P, INT_C, INT_C, INT_C, INT_C])
+    # 旋转贴图（平行四边形目标）：3 个目标点 = 左上 / 右上 / 左下。
+    # 源矩形必须给**图片实际尺寸**，否则只取左上角一块（第一次踩的就是这个）。
+    _DrawImagePoints = _gp("GdipDrawImagePointsRect",
+                           [P, P, ctypes.POINTER(F), INT_C, F, F, F, F, INT_C, P, P, P])
     _CreateBmpFromHBITMAP = _gp("GdipCreateBitmapFromHBITMAP", [wt.HBITMAP, wt.HPALETTE, P])
 
 _FONT_FAMILY = None
@@ -670,6 +677,28 @@ class Surface:
     def image(self, img, x, y, w, h):
         """绘制 PNG 立绘（含 alpha）。坐标自上而下。"""
         _DrawImageRectI(self.g, img, int(x), int(self._fy(y, h)), int(w), int(h))
+
+    def image_rot(self, img, iw, ih, x, y, w, h, deg):
+        """把位图画进 (x,y,w,h) 并绕**中心**旋转 deg 度（写字本子的倾斜）。
+
+        走 GDI+ 的平行四边形映射：给 3 个目标点即可，缩放与旋转一次完成，
+        比"自己重采样 + 逐帧旋转"省得多。
+        """
+        g = self.g
+        cx, cy = x + w / 2.0, y + h / 2.0
+        a = math.radians(deg)
+        ca, sa = math.cos(a), math.sin(a)
+
+        def _r(px, py):
+            dx, dy = px - cx, py - cy
+            return (cx + dx * ca - dy * sa, cy + dx * sa + dy * ca)
+
+        x0, y0 = _r(x, y)
+        x1, y1 = _r(x + w, y)
+        x2, y2 = _r(x, y + h)
+        pts = (F * 6)(x0, y0, x1, y1, x2, y2)
+        _DrawImagePoints(g, img, pts, 3, 0.0, 0.0, float(iw), float(ih),
+                         UNIT_PIXEL, None, None, None)
 
     def blit(self, src, x, y, w, h, sw=None, sh=None):
         """从另一 Surface alpha 合成（预缩放立绘缓存用，免重采样）。
@@ -1015,6 +1044,9 @@ class WhalePet:
         self._size_from = 1.0
         self._size_now = 1.0
         self._size_t0 = 0.0
+        # 写字本子（任务进行中写字 / 完成后展示）：状态机 + 素材缓存
+        self._nb = NOTEBOOK.NotebookState()
+        self._nb_imgs = {}
         self.scale = float(self._settings.get("scale", 1.0))
         self.bubble_on = bool(self._settings.get("bubble", True))
         self.sound_on = bool(self._settings.get("sound", True))
@@ -1894,6 +1926,14 @@ class WhalePet:
         n = len(self.active)
         prev = self._prev_active_n
         self._prev_active_n = n
+        # ★ 本子与气泡**共用这一处判据**（见 wb_notebook 模块头）：
+        #   任务开始 / 进行中 / 完成三者不可能对不上 —— 否则会出现
+        #   "气泡说完成了、本子还在写"这种自相矛盾的画面。
+        moved = self._nb.feed(n, time.time(), self._nb_stats())
+        if moved:
+            self._report_event("notebook_" + moved,
+                               detail=f"n={n} page={self._nb.page} lines={self._nb.lines}")
+            self._drawn_sig = None
         if prev is None:
             return
         if prev > 0 and n == 0:
@@ -2338,6 +2378,8 @@ class WhalePet:
         self._update_pointer_state()
         # ⑤ 提案 §1 待机三件套 + §3 微交互 + §2 情绪：统一计算本帧的位移量
         self._update_motion(now)
+        # ⑥ 写字本子：阶段流转 + 逐行落墨（纯逻辑，不绘制）
+        self._nb.tick(now)
         # ⑥ 脏检测：把全部动效量化后拼成签名，只有签名变化才重绘（省电关键）
         facing = self._current_facing(now)
         sig = self._sig()
@@ -2346,6 +2388,7 @@ class WhalePet:
                  or now < self._wobble_until or now < self._react_until
                  or self._ok_animating(now)          # 气泡形态切换 / 点击脉冲 / 完成保持
                  or self._fade is not None           # ★ 状态切换过渡期间必须每帧重绘
+                 or self._nb.visible()            # 本子在写字/展示 → 逐帧重绘
                  or msig != self._motion_sig
                  or facing != getattr(self, "_facing_drawn", None)
                  or sig != self._drawn_sig)
@@ -3079,6 +3122,9 @@ class WhalePet:
         if self.bubble_on:
             self._draw_bubble(s, lay, now)
         self._draw_pet(s, lay)
+        # 写字本子画在立绘**之上**（她抱在身前，必须挡住身体）；
+        # 但它不占气泡区，想法小圆与气泡的位置完全不受影响。
+        self._draw_notebook(s, lay, now)
         s.present(self.hwnd)
 
     def _sprite_content_top(self, lay):
@@ -3490,6 +3536,190 @@ class WhalePet:
                 s.ellipse(color, cx - e["w"] * w * 0.26, cy - e["h"] * h * 0.18,
                           e["w"] * w * 0.52, e["h"] * h * 0.36)
 
+    # ================= 写字本子（任务进行中写字 / 完成后展示）=================
+    # 参考视频 `Q版古见同学写字.mp4` 三段：写字 → 翻页 → 展示。
+    # 视频是 AI 生成且带水印，只当**动作参考**；本子素材是自己画的（tools/make_notebook.py）。
+    # 触发条件与气泡 OK 态**共用同一判据**（见 _sync_bubble_mode），不可能对不上。
+
+    def _nb_image(self, name):
+        """加载并缓存本子素材（GDI+ 位图，进程内只加载一次）。"""
+        if name not in self._nb_imgs:
+            path = os.path.join(ASSETS_DIR, "notebook", name)
+            img = P()
+            if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
+                log_exception(f"[notebook] 素材缺失 {path}（跑 tools/make_notebook.py 生成）")
+                self._nb_imgs[name] = None
+            else:
+                w, h = U32(0), U32(0)
+                _GetImageW(img, ctypes.byref(w))
+                _GetImageH(img, ctypes.byref(h))
+                self._nb_imgs[name] = (img, w.value, h.value)
+        return self._nb_imgs[name]
+
+    def _nb_stats(self):
+        """本子展示页要写的数据 —— **真实值**，不是装饰（页面其余是手写波浪线）。"""
+        a = self.active or []
+        lt = self.latest_turn or {}
+        credit = sum(float(x.get("credit") or 0) for x in a)
+        tokens = sum(int(x.get("total_tokens") or 0) for x in a)
+        title = ""
+        for x in a:
+            title = (x.get("_wb_title") or x.get("title") or x.get("project") or "")
+            if title:
+                break
+        if not title:
+            title = (lt.get("_wb_title") or lt.get("title") or lt.get("project") or "")
+        # 用时口径与气泡一致：running 用 first_ts → now（每秒刷新）
+        first = min([x.get("first_ts") or 0 for x in a if x.get("first_ts")] or [0])
+        dur = ""
+        if first:
+            secs = max(0, int(time.time() - first / 1000.0))
+            dur = f"{secs // 60}:{secs % 60:02d}" if secs >= 60 else f"{secs}秒"
+        return {"title": title, "dur": dur,
+                "tokens": (fmt_tokens(tokens) if tokens else ""),
+                "credit": (f"{credit:.1f}" if credit else "")}
+
+    def _nb_deck(self, now=None):
+        """当前该把本子画在哪（拿不到立绘几何就返回 None）。"""
+        if not self._spr_rect:
+            return None
+        st, _facing = self._spr_key
+        cbox = self._spr_cbox.get(st)
+        if not cbox:
+            return None
+        fm = self._face_metrics(st, cbox)
+        eye_y = fm[0] if fm else None       # 该态眼位（内容高里的相对位置）
+        return self._nb.deck(self._spr_rect, cbox, self.scale,
+                             now or time.time(), eye_y=eye_y)
+
+    def _draw_notebook(self, s, lay, now):
+        """本子三层读感（对齐参考视频）：
+          ① 写字 —— 按立绘内容框定位在膝头、微微倾斜，随手腕起伏；
+             墨迹**逐行从左长出来**，正写的那行末端点一个笔尖墨点。
+          ② 翻页 —— 写满一页时本子横向压扁再弹回（2D 里读作"纸翻过去"）。
+          ③ 展示 —— 转正、放大、升到胸前，封面换成摊开的内页，
+             页脚给出**可读的结果**（用时 / tokens / 积分）+ 一颗小爱心；点它开看板。
+
+        说明：本子不做全局 alpha 淡入淡出（GDI+ 位图走的是 DrawImage 系列，
+        没有现成的全局 alpha），改用**缩放 + 位移 + 压扁**表达进出场 —— 观感够用，
+        也省掉三处 ImageAttributes 绑定。
+        """
+        if not self._nb.visible():
+            return
+        d = self._nb_deck(now)
+        if not d or d["alpha"] <= 0.01:
+            return
+        img = self._nb_image(d["asset"])
+        if not img:
+            return
+        _st, facing = self._spr_key
+        tilt = -d["tilt"] if facing == "_f" else d["tilt"]
+        x, y, w, h = d["x"], d["y"], d["w"], d["h"]
+        if abs(tilt) < 0.15:
+            s.image(img[0], x, y, w, h)
+        else:
+            s.image_rot(img[0], img[1], img[2], x, y, w, h, tilt)
+        self._nb_draw_ink(s, d, now)
+
+    def _nb_page_lines(self, showing, now):
+        """页面上要画的墨迹行。展示态 = 写满整页；写字态 = 已写的行（末行还在长）。"""
+        if not showing:
+            return self._nb.ink_lines(now)
+        out = []
+        for i in range(NOTEBOOK.LINES_PER_PAGE):
+            out.append({"i": i,
+                        "span": NOTEBOOK.line_span(i + (self._nb.page - 1) * 100),
+                        "indent": NOTEBOOK.line_indent(i), "ink": 1.0})
+        return out
+
+    def _nb_draw_ink(self, s, d, now):
+        """页面上的墨迹：写字态逐行长出来，展示态是写满的一整页。
+
+        两处讲究：
+          · **跳过中缝**（跨中缝写字物理上不对，凑近看很假）；
+          · 正写的那一行末端点一个略大的笔尖墨点 —— "她在写"的读感主要靠它。
+        """
+        pg = d["page"]
+        px, py, pw, ph = pg["x"], pg["y"], pg["w"], pg["h"]
+        if pw < 8 or ph < 8:
+            return
+        showing = d["showing"]
+        lines = self._nb_page_lines(showing, now)
+        if not lines:
+            return
+        rows = NOTEBOOK.LINES_PER_PAGE if showing else max(1, len(lines))
+        lh = ph / (rows + 1.6)
+        dot = max(1.7, lh * 0.27)          # 下限 1.7px：小缩放时墨迹也读得出来
+        g0, g1 = pg["gut0"], pg["gut1"]
+
+        def in_gutter(x):
+            return g0 - dot <= x <= g1 + dot
+
+        for k, ln in enumerate(lines):
+            ly = py + lh * (k + 0.75)
+            if ly > py + ph - lh * 0.5:
+                break
+            x0 = px + pw * ln["indent"]
+            span = pw * ln["span"] * (1.0 if showing else ln["ink"])
+            if span <= 0:
+                continue
+            steps = max(3, int(span / max(1.3, dot * 1.35)))
+            for j in range(steps):
+                t = j / max(1, steps - 1)
+                dx = x0 + span * t
+                if in_gutter(dx):
+                    continue
+                s.ellipse(NOTEBOOK.INK, dx,
+                          ly + math.sin(t * 6.4 + k * 1.31) * dot * 0.85, dot, dot)
+            if not showing and ln["ink"] < 0.999:
+                ex = x0 + span - dot * 0.4
+                if not in_gutter(ex):
+                    s.ellipse(NOTEBOOK.PEN_DOT, ex,
+                              ly + math.sin(6.4 + k * 1.31) * dot * 0.85,
+                              dot * 1.6, dot * 1.6)
+        if showing:
+            self._nb_draw_footer(s, d)
+
+    def _nb_draw_footer(self, s, d):
+        """展示页页脚：**可读的真实结果** + 一颗小爱心（呼应参考视频末帧）。
+
+        页宽太小（缩放很低）时只画爱心、不画字 —— 字号会小到糊成一团，不如不画。
+        """
+        pg = d["page"]
+        px, py, pw, ph = pg["x"], pg["y"], pg["w"], pg["h"]
+        hs = max(3, int(min(pw, ph) * 0.075))
+        hx, hy = px + pw - hs * 2.2, py + ph - hs * 2.4
+        s.ellipse(NOTEBOOK.HEART, hx, hy, hs, hs)
+        s.ellipse(NOTEBOOK.HEART, hx + hs * 0.95, hy, hs, hs)
+        s.poly(NOTEBOOK.HEART, [(hx - 0.1, hy + hs * 0.62),
+                                (hx + hs * 1.95, hy + hs * 0.62),
+                                (hx + hs * 0.92, hy + hs * 1.95)])
+        txt = self._nb.present_text()
+        if not txt or pw < 54:
+            return
+        size = max(7, int(min(pw * 0.082, ph * 0.17)))
+        s.ctext(txt, px + pw / 2.0 - hs * 1.1, py + ph - size * 1.7, size,
+                NOTEBOOK.INK, maxw=pw - hs * 2.4)
+
+    def _nb_hit(self, mx, my):
+        """点在**展示态**的本子上 → 视为"我要细看"。写字态不抢点击（那属于身体互动）。"""
+        if self._nb.phase != NOTEBOOK.PHASE_PRESENT:
+            return False
+        d = self._nb_deck()
+        if not d:
+            return False
+        pad = 4
+        return (d["x"] - pad <= mx <= d["x"] + d["w"] + pad
+                and d["y"] - pad <= my <= d["y"] + d["h"] + pad)
+
+    def _on_nb_click(self):
+        """点本子：收起本子并打开看板（写在本子上的东西，看板里有明细）。"""
+        self._report_event("notebook_click", detail=self._nb.present_text())
+        self._play("pop")
+        self._nb.dismiss_now(time.time())
+        self._drawn_sig = None
+        self.open_dashboard()
+
     # ---- 形态尺寸归一（点击换姿势时的"忽大忽小"）----
 
     def _state_size(self, state):
@@ -3781,8 +4011,11 @@ class WhalePet:
                     self._long_press_release(lay)   # 提案 §3：长按憋气后"噗"地喷水
                 else:
                     # 身体点击 → 按区域切形态（提案 §3：点击头/脸/身/裙摆触发不同形态）
-                    region = self._body_region(px, py, lay)
-                    self._morph_by_region(region)
+                    if self._nb_hit(px, py):
+                        self._on_nb_click()          # 展示态点本子 → 看明细
+                    else:
+                        region = self._body_region(px, py, lay)
+                        self._morph_by_region(region)
             return 0
         if msg == WM_HOTKEY and wparam == ID_HOTKEY_FOLLOW:
             self._hotkey_cycle_focus()      # P3 全局热键：手动聚焦轮换

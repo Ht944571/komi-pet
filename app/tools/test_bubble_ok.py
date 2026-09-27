@@ -41,6 +41,10 @@ class Stub:
     def __init__(self):
         self._bub_mode = W.BUBBLE_DEFAULT
         self._prev_active_n = None
+        # 写字本子：_sync_bubble_mode 现在**同一个判据**顺带驱动它（见 wb_notebook 模块头），
+        # 所以 Stub 也要有。给它真状态机，本子的迁移逻辑才能被一起回归到。
+        self._nb = W.NOTEBOOK.NotebookState()
+        self._nb_phase_seen = []
         self._ok_clicks = 0
         self._ok_last_click = 0.0
         self._ok_anim_t0 = 0.0
@@ -84,6 +88,10 @@ class Stub:
         self.events.append((a, k))
 
     # 状态机方法内部会 self.xxx() 调用彼此 → 必须把真实现绑到 stub 上
+    def _nb_stats(self):
+        """Stub 没有真实会话数据 → 空统计（本子只做迁移，不显示内容）。"""
+        return {}
+
     def _set_bubble_mode(self, mode, now=None, sound=True):
         return W.WhalePet._set_bubble_mode(self, mode, now, sound)
 
