@@ -55,6 +55,12 @@ def legacy_recreate(app):
 
 def main():
     app = W.WhalePet(run_seconds=26)
+
+    # 写字本子 / 帧序列动画只在「有对话任务在跑」时接管画面（见 wb_notebook / wb_anim），
+    # 而本机此刻可能真有会话在跑 —— 本测试要验的是 **v3 立绘路径**，强制回 hidden 保证确定性。
+    app._anim_clip = None
+    app._nb.phase = "hidden"
+    app._drawn_sig = None
     hwnd0 = app.hwnd
 
     counters = {"anim": 0, "draw": 0, "tick": 0}

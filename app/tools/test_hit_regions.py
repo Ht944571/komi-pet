@@ -46,10 +46,17 @@ def main():
     import wb_whale_win as W
 
     app = W.WhalePet(run_seconds=None)
+
+    # 写字本子 / 帧序列动画只在「有对话任务在跑」时接管画面（见 wb_notebook / wb_anim），
+    # 而本机此刻可能真有会话在跑 —— 本测试要验的是 **v3 立绘路径**，强制回 hidden 保证确定性。
+    app._anim_clip = None
+    app._nb.phase = "hidden"
+    app._drawn_sig = None
     lay = app._layout()
     print(f"窗口 {lay['W']}x{lay['H']}  bubble_h={lay['bubble_h']} pet_h={lay['pet_h']}")
+    # __anim__ 是帧序列动画的伪态（合法新增），这里只要求八个 v3 态齐全
     check("G0: 立绘内容框已加载（点击分区依赖它）",
-          len(getattr(app, "_spr_cbox", {})) == len(STATES),
+          all(st in getattr(app, "_spr_cbox", {}) for st in STATES),
           f"got {sorted(getattr(app, '_spr_cbox', {}).keys())}")
 
     for st in STATES:

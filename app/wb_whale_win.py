@@ -56,6 +56,7 @@ import wb_motion as MOTION                                    # noqa: E402
 
 # ---------- 写字本子（任务进行中写字 / 完成后展示；纯逻辑可单测）----------
 import wb_notebook as NOTEBOOK                                # noqa: E402
+import wb_anim as ANIM                                         # noqa: E402
 
 # ---------- 跟随模式（聚焦信号）：纯逻辑层（去抖状态机 / 前台→agent 推断）----------
 import wb_follow as FOLLOW                                    # noqa: E402
@@ -1044,6 +1045,11 @@ class WhalePet:
         self._size_from = 1.0
         self._size_now = 1.0
         self._size_t0 = 0.0
+        # 帧序列动画（AI 视频 → 透明帧）：有对话任务在跑时用它替代立绘
+        self._anim_clip = ANIM.load("write")          # 没素材 = None → 回退 v3 立绘
+        self._anim_key = None
+        self._anim_t0 = 0.0
+        self._anim_cache = []
         # 写字本子（任务进行中写字 / 完成后展示）：状态机 + 素材缓存
         self._nb = NOTEBOOK.NotebookState()
         self._nb_imgs = {}
@@ -1125,6 +1131,9 @@ class WhalePet:
 
         self._sprites = self._load_sprites()
         self._spr_cbox = self._load_sprite_boxes()         # {state: 内容框(归一化)}
+        if self._anim_clip:
+            # 帧序列有自己的内容框：登记专用 key，气泡锚点/命中区都按它算
+            self._spr_cbox["__anim__"] = list(self._anim_clip.content_box)
         self._blink_patches = self._load_blink_patches()   # {state: (img, (x,y,w,h))}
         self._blink_cache = {}           # 按当前 scale 预缩放的贴片
         self._shown_key = None           # 上一帧实际画出的立绘 key（状态切换渐变用）
@@ -1721,6 +1730,20 @@ class WhalePet:
             self._cache_surfs.append(tmp)
         # OK 图形同样按「当前尺寸 + 当前方案」预缩放（分层窗口要 1:1 合成，省掉每帧重采样）
         self._ok_glyph_cache = None
+        # 帧序列动画同样预缩放（键 = 帧号）。49 帧 420x565 ≈ 46MB 内存，
+        # 与 8 张 v3 立绘（约 58MB）同一量级，可接受；显示尺寸变了会整体重建。
+        self._anim_cache = []
+        if getattr(self, "_anim_clip", None):
+            for k in range(self._anim_clip.count):
+                info = self._anim_image(k)
+                if not info:
+                    continue
+                aimg, aiw, aih = info
+                apw, aph = int(ph * aiw / aih), int(ph)
+                atmp = Surface(apw, aph)
+                atmp.clear()
+                atmp.image(aimg, 0, 0, apw, aph)
+                self._anim_cache.append((atmp, apw, aph))
         if getattr(self, "_ok_img", None):
             img, iw, ih = self._ok_img
             gh = max(1, int(round(ok_spec(lay)["g_h"])))
@@ -2389,6 +2412,7 @@ class WhalePet:
                  or self._ok_animating(now)          # 气泡形态切换 / 点击脉冲 / 完成保持
                  or self._fade is not None           # ★ 状态切换过渡期间必须每帧重绘
                  or self._nb.visible()            # 本子在写字/展示 → 逐帧重绘
+                 or self._anim_play_now()         # 帧序列在播 → 逐帧重绘
                  or msig != self._motion_sig
                  or facing != getattr(self, "_facing_drawn", None)
                  or sig != self._drawn_sig)
@@ -3536,6 +3560,69 @@ class WhalePet:
                 s.ellipse(color, cx - e["w"] * w * 0.26, cy - e["h"] * h * 0.18,
                           e["w"] * w * 0.52, e["h"] * h * 0.36)
 
+    # ================= 帧序列动画（AI 视频 → 透明帧）=================
+    # 触发条件与写字本子/气泡**同一套任务判据**（见 wb_notebook 模块头）：
+    # 有任务在跑 → 循环播「写字段」；任务完成 → 播一遍「翻页+举本子」段；其余回退 v3 立绘。
+    # 播放期间程序化本子**不画**（视频里她本来就抱着本子，叠两层 = 穿帮）。
+
+    def _anim_image(self, i):
+        """按帧号加载并缓存 GDI+ 位图。"""
+        clip = self._anim_clip
+        key = f"f{i}"
+        cache = getattr(self, "_anim_imgs", None)   # 惰性：__init__ 顺序不保证（同旧 _acc_image）
+        if cache is None:
+            cache = self._anim_imgs = {}
+        if key in cache:
+            return cache[key]
+        path = clip.frame_path(i)
+        img = P()
+        if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
+            log_exception(f"[anim] 缺帧 {path}")
+            cache[key] = None
+        else:
+            w, h = U32(0), U32(0)
+            _GetImageW(img, ctypes.byref(w))
+            _GetImageH(img, ctypes.byref(h))
+            cache[key] = (img, w.value, h.value)
+        return self._anim_imgs[key]
+
+    def _anim_play_now(self):
+        """现在该不该播帧序列（而不是 v3 立绘）。"""
+        return bool(self._anim_clip) and self._nb.phase in (
+            NOTEBOOK.PHASE_WRITING, NOTEBOOK.PHASE_PRESENT, NOTEBOOK.PHASE_APPEAR)
+
+    def _draw_anim_frame(self, s, lay, now):
+        """画当前帧，并把 _spr_rect/_spr_key 指到帧序列的内容框上
+        （气泡锚点 / 命中区 / 视线全部照常工作）。返回是否真的画了。"""
+        clip = self._anim_clip
+        if self._anim_key != self._nb.phase:
+            self._anim_key = self._nb.phase
+            self._anim_t0 = now
+        i = clip.index(self._nb.phase, self._anim_t0, now)
+        ent = self._anim_cache[i] if i < len(self._anim_cache) else None
+        if not ent:
+            return False
+        sc = lay["sc"]
+        W, H = lay["W"], lay["H"]
+        ph = lay["pet_h"] - 8 * sc
+        hover_s = 1.0 + (MOTION.HOVER_SCALE - 1.0) * MOTION.ease_out_cubic(self._hover_t)
+        ph_draw = ph * hover_s * self._squash
+        pw = ph_draw * clip.canvas[0] / float(clip.canvas[1])
+        x = (W - pw) / 2
+        y_bottom = H - 4 * sc + self._breath + self._float_dy
+        # 矩形/键指向帧序列：气泡锚点与命中区按它的内容框算（meta 里有归一化内容框）
+        self._spr_rect = (x, y_bottom - ph_draw, pw, ph_draw)
+        self._spr_key = ("__anim__", "")
+        sw = pw * 0.72 * self._shadow_scale
+        s.ellipse(C_SHADOW, W / 2 - sw / 2, y_bottom - 6 * sc, sw,
+                  8 * sc * self._shadow_scale)
+        if abs(ent[2] - ph_draw) <= max(2.0, ph_draw * 0.16):
+            self._blit_pet(s, ent[0], None, x, y_bottom - ph_draw, pw, ph_draw)
+        else:
+            # 尺寸差太多（罕见）：这帧跳过，别硬拉伸出鬼影
+            pass
+        return True
+
     # ================= 写字本子（任务进行中写字 / 完成后展示）=================
     # 参考视频 `Q版古见同学写字.mp4` 三段：写字 → 翻页 → 展示。
     # 视频是 AI 生成且带水印，只当**动作参考**；本子素材是自己画的（tools/make_notebook.py）。
@@ -3604,6 +3691,8 @@ class WhalePet:
         没有现成的全局 alpha），改用**缩放 + 位移 + 压扁**表达进出场 —— 观感够用，
         也省掉三处 ImageAttributes 绑定。
         """
+        if self._anim_play_now():
+            return                            # 帧序列动画里她抱着视频里的本子，别再叠一层
         if not self._nb.visible():
             return
         d = self._nb_deck(now)
@@ -3780,6 +3869,10 @@ class WhalePet:
         sc = lay["sc"]
         W, H = lay["W"], lay["H"]
         ph = lay["pet_h"] - 8 * sc
+        # 帧序列动画（AI 视频）优先：有任务在跑时整个角色换成视频帧，
+        # 程序化本子也不画（视频里她本来就抱着本子）。
+        if self._anim_play_now() and self._draw_anim_frame(s, lay, time.time()):
+            return
         # 提案 §3：悬停放大（ease-out-cubic 淡入）+ 点击压缩（squash 曲线）
         hover_s = 1.0 + (MOTION.HOVER_SCALE - 1.0) * MOTION.ease_out_cubic(self._hover_t)
         hover_s = min(hover_s, MOTION.SCALE_MAX)          # 提案 §5 克制上限
