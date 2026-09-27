@@ -6,7 +6,6 @@ r"""跟随模式 P2 连续锚点 + P3 pin 锁定 专项测试
   B. today_timeline 数据层（真库只读）：summary/recent 形状
   C. 气泡 row3：有数据 → 跨 agent 叙述；无数据 → 回退「活跃 X 分钟前」
   D. P3 pin：锁定 → 跟随不覆盖；解开 → 跟随即刻接管；手动聚焦生效；持久化
-  E. Codex 配件：登记册一行 JSON → accessories() 含 codex
 
 用法：python tools/test_timeline_pin.py
 """
@@ -128,12 +127,6 @@ try:
 finally:
     W.SETTINGS_FILE = saved_sf
 
-print("\n[E] Codex 配件（P2 一行 JSON）")
-acc = REG.accessories()
-check("E1: 登记册 codex.accessory = beret",
-      REG.load()["agents"]["codex"].get("accessory") == "beret")
-check("E2: accessories() 含 codex（并集语义，无需新美术）",
-      "codex" in acc and acc["codex"]["accessory"] == "beret")
 
 print(f"\n=== 总结 ===")
 print(f"PASS: {len(PASSED)}")

@@ -3,23 +3,22 @@
 wb_agent_registry.py — agent 登记册（唯一来源）
 ================================================================
 
-`assets/_agents.json` 是「**谁在跑 / 配什么配件 / 有哪些能力 / 配置在哪**」的
-**唯一声明处**。配件层（`wb_accessories`）与活跃探测层（`wb_agent_presence`）
+`assets/_agents.json` 是「**谁在跑 / 有哪些能力 / 配置在哪**」的
+**唯一声明处**。活跃探测层（`wb_agent_presence`）
 都从这里读，避免"同一份信息写两处"——本项目反复吃过的亏。
 
 为什么要有这一层：
-  原先"哪个 agent 配什么配件"写在 `_acc_persona.json`、"怎么探测"也写在同一个文件的
+  原先"怎么探测"写在 `_acc_persona.json`（该文件已随配件层删除）、
   `presence` 字段里，而"有哪些能力/开关"根本没有。要做「用户自主选择接入哪些 agent」，
   需要一个**带开关与能力声明**的统一登记处。于是合并成 `_agents.json`。
 
 向后兼容
 --------
-`_agents.json` 缺失时**回退**到旧的 `_acc_persona.json`（其 `agents[key].presence /
-accessory` 结构与新格式兼容），保证老环境的 assets 目录也能跑。
+`_agents.json` 缺失时返回空表（**不再回退**旧 persona 文件：它已随配件层删除）。
 
 缓存
 ----
-按 (mtime, size) 缓存：`accessories()` 会被每帧调用（配件层要判断显示哪些），
+按 (mtime, size) 缓存：`load()` 会被每帧调用（探测层要判断哪些 agent 启用了），
 不能每次都读盘；但用户在设置里改了开关要能立刻生效，所以不能永久缓存。
 """
 
@@ -29,7 +28,6 @@ import shutil
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 REGISTRY = os.path.join(ASSETS, "_agents.json")
-LEGACY = os.path.join(ASSETS, "_acc_persona.json")
 
 _cache = None          # (mtime_ns, size, data)
 
@@ -40,7 +38,7 @@ def load(force=False):
     spec 里保证有的键：label / enabled / caps / presence。
     """
     global _cache
-    for path in (REGISTRY, LEGACY):
+    for path in (REGISTRY,):
         try:
             st = os.stat(path)
         except OSError:
@@ -66,7 +64,6 @@ def load(force=False):
                 "enabled": bool(spec.get("enabled", True)),
                 "verified": bool(spec.get("verified", True)),
                 "order": spec.get("order", 100),
-                "accessory": spec.get("accessory"),
                 "accent": spec.get("accent"),
                 "caps": spec.get("caps") or {},
                 "presence": spec.get("presence") or {},
@@ -92,15 +89,6 @@ def enabled_keys():
     return [k for k, v in load()["agents"].items() if v["enabled"]]
 
 
-def accessories():
-    """供配件层：{key: {accessory, label, accent}} —— 只含启用的、且有配件声明的。"""
-    out = {}
-    for key, v in load()["agents"].items():
-        if v["enabled"] and v["accessory"]:
-            out[key] = {"accessory": v["accessory"],
-                        "label": v["label"],
-                        "accent": v["accent"]}
-    return out
 
 
 def probes():

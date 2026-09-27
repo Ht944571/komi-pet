@@ -899,7 +899,7 @@ body > .wrap{position:relative;z-index:10}
     <h3 data-page-node-id="komiRegH3">Agent 接入 <span class="rng" id="regSource" data-page-node-id="komiRegSrc">(—)</span></h3>
     <span class="card-note" aria-hidden="true">だれと はなす？</span>
     <p class="reg-hint" data-page-node-id="komiRegHint">
-      只有<b>打开开关</b>的 agent 会被识别 —— 桌宠会按它佩戴配件，看板显示它的用量。
+      只有<b>打开开关</b>的 agent 会被识别 —— 看板显示它的用量。
       标着 <span class="reg-bg warn">未验证</span> 的项，其位置与进程名来自对同类开源项目的调研，
       <b>开启前请先确认</b>，否则只会空转。开关写入 <code>app/assets/_agents.json</code>，桌宠下一轮即生效。
     </p>
@@ -1091,7 +1091,6 @@ async function loadRegistry(){
     else if(a.level===1) b.push('<span class="reg-bg ok">本轮活跃</span>');
     else if(a.level===3) b.push('<span class="reg-bg">在跑</span>');
     ['log','presence','hooks'].forEach(k=>{ if(caps[k]) b.push('<span class="reg-bg cap">'+CAP_LABEL[k]+'</span>'); });
-    if(a.accessory) b.push('<span class="reg-bg cap">配件 '+esc(a.accessory)+'</span>');
     if(!a.verified) b.push('<span class="reg-bg warn">未验证</span>');
     return '<div class="reg-row'+(a.enabled?'':' off')+'" data-k="'+esc(a.key)+'">'
       +'<input class="reg-sw" type="checkbox" data-reg="'+esc(a.key)+'"'+(a.enabled?' checked':'')+'>'

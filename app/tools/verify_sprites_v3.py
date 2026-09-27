@@ -49,7 +49,7 @@ def main():
 
     app = W.WhalePet(run_seconds=None)
     lay = app._layout()
-    top = lay["bubble_h"] + lay["hr"]              # 立绘区上沿（避开气泡！）
+    top = lay["bubble_h"]                         # 立绘区上沿（避开气泡！）
     print(f"窗口 {lay['W']}x{lay['H']}   立绘区上沿 y={top}   scale={lay['sc']}")
     print(f"{'state':10}{'渲染脸宽':>9}{'脸心x':>7}{'脸心y':>7}{'内容底边':>9}{'内容高':>8}")
 

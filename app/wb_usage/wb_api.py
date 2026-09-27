@@ -540,7 +540,7 @@ class Api:
                 "key": key, "label": spec["label"],
                 "enabled": spec["enabled"], "verified": spec["verified"],
                 "order": spec["order"],
-                "accessory": spec["accessory"], "accent": spec["accent"],
+                  "accent": spec["accent"],
                 "caps": spec["caps"], "presence": spec["presence"],
                 "config_paths": spec["config_paths"], "log_paths": spec["log_paths"],
                 "notes": spec["notes"], "has_data": key in with_data,

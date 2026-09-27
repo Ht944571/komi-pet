@@ -1,16 +1,15 @@
 {
   "version": 1,
-  "note": "★ Agent 登记册（唯一来源）。谁在跑、配什么配件、有哪些能力、配置/日志在哪。新增 agent 只改本文件，不改代码。",
+  "note": "★ Agent 登记册（唯一来源）。谁在跑、有哪些能力、配置/日志在哪。新增 agent 只改本文件，不改代码。",
   "schema": {
     "label": "显示名",
-    "enabled": "用户开关：false = 完全忽略该 agent（不探测、不配配件）",
+    "enabled": "用户开关：false = 完全忽略该 agent（不探测、不进看板）",
     "verified": "本机是否实测验证过（false 的项属于『已知但未验证』，需自行确认路径/进程名）",
     "order": "看板/菜单里的排序",
-    "accessory": "活跃时古见佩戴的配件 kind（见 wb_accessories.KINDS）；null = 只显示在数据里，不佩戴",
     "accent": "身份色（预留：徽章/领结用）",
     "caps": {
       "log": "★有解析器能读用量 → 看板有数据",
-      "presence": "★能探测『正在运行』 → 能驱动配件",
+      "presence": "★能探测『正在运行』 → 桌宠据此判断宿主是否还在（联动关闭）",
       "hooks": "是否有事件回调能力（我们暂未实现；Clawd 走的是这条路）"
     },
     "presence": "活跃探针：procs=进程名精确匹配；ports=本机监听端口（web 型 agent 用）",
@@ -24,7 +23,6 @@
       "enabled": true,
       "verified": true,
       "order": 10,
-      "accessory": "cat",
       "accent": "#F2A0AE",
       "caps": {
         "log": true,
@@ -55,7 +53,6 @@
       "enabled": true,
       "verified": true,
       "order": 15,
-      "accessory": "beret",
       "accent": "#39406B",
       "caps": {
         "log": true,
@@ -84,7 +81,6 @@
       "enabled": true,
       "verified": true,
       "order": 25,
-      "accessory": "whale_plush",
       "accent": "#5B7CFA",
       "caps": {
         "log": true,
@@ -110,7 +106,6 @@
       "enabled": true,
       "verified": true,
       "order": 30,
-      "accessory": "beret",
       "accent": "#10A37F",
       "caps": {
         "log": true,
@@ -131,14 +126,13 @@
       "log_paths": [
         "~/.codex/sessions/**/rollout-*.jsonl"
       ],
-      "notes": "用量数据可用（文件源）。**没有活跃探针** → 不会驱动配件。CLI 类 agent 寄生在 node.exe 上，靠进程名判断『在跑』不可靠，这也是 Clawd 用 hooks 的原因。"
+      "notes": "用量数据可用（文件源）。**没有活跃探针** → 不参与「联动关闭」判定。CLI 类 agent 寄生在 node.exe 上，靠进程名判断『在跑』不可靠，这也是 Clawd 用 hooks 的原因。"
     },
     "claude-code": {
       "label": "Claude Code",
       "enabled": false,
       "verified": false,
       "order": 40,
-      "accessory": null,
       "accent": "#D97757",
       "caps": {
         "log": false,
@@ -162,7 +156,6 @@
       "enabled": false,
       "verified": false,
       "order": 50,
-      "accessory": null,
       "accent": "#4285F4",
       "caps": {
         "log": false,
@@ -184,7 +177,6 @@
       "enabled": false,
       "verified": false,
       "order": 55,
-      "accessory": null,
       "accent": "#615CED",
       "caps": {
         "log": false,
@@ -206,7 +198,6 @@
       "enabled": false,
       "verified": false,
       "order": 60,
-      "accessory": null,
       "accent": "#0B0B0B",
       "caps": {
         "log": false,
@@ -228,7 +219,6 @@
       "enabled": false,
       "verified": false,
       "order": 65,
-      "accessory": null,
       "accent": "#6E56CF",
       "caps": {
         "log": false,
@@ -252,7 +242,6 @@
       "enabled": false,
       "verified": false,
       "order": 70,
-      "accessory": null,
       "accent": "#6B7280",
       "caps": {
         "log": false,
@@ -274,7 +263,6 @@
       "enabled": false,
       "verified": false,
       "order": 75,
-      "accessory": null,
       "accent": "#2E7DF6",
       "caps": {
         "log": false,

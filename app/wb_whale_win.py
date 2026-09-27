@@ -60,17 +60,14 @@ import wb_follow as FOLLOW                                    # noqa: E402
 # ---------- 登记册（跟随的 window_hints / accent 来源）----------
 import wb_agent_registry as REG                               # noqa: E402
 
-# ---------- 配件层（按"哪些 agent 在用"决定古见佩戴什么）----------
-# 失败必须整体降级：配件是锦上添花，绝不能因为它起不来就连桌宠本体一起挂掉
+# ---------- 活跃探测（哪些 agent 现在"在用" → 「联动关闭」的宿主判据）----------
+# ⚠️ 配件层（猫/贝雷帽/鲸鱼玩偶）已于 2026-09-27 整体删除；
+#    PRESENCE **保留** —— 它同时是 _host_alive 的判据，不是配件专属。
+#    这里仍整体 try 兜底：探测起不来也不能连累桌宠本体。
 try:
-    import wb_accessories as ACC                              # noqa: E402
     import wb_agent_presence as PRESENCE                      # noqa: E402
-    _ACC_OK = True
-except Exception as _e:                                       # pragma: no cover
-    ACC = None
+except Exception:                                             # pragma: no cover
     PRESENCE = None
-    _ACC_OK = False
-    _ACC_IMPORT_ERR = _e
 
 # ---------- 布局（基准 scale=1.0，实际尺寸 = 基准 × self.scale）----------
 BASE_W = 300                   # 窗口宽
@@ -116,9 +113,6 @@ META_FILE = os.path.join(SPRITE_DIR, "_build_meta.json")
 # 反应态集合：与立绘态同名，_draw_pet 直接取用（v3 新增 joy / surprise）
 REACT_FACES = ("blush", "pout", "stone", "joy", "surprise")
 
-# 配件总开关：2026-09-26 用户要求「帽子（贝雷帽）/小猫/鲸鱼玩偶都不进桌宠」→ 置 True。
-# 代码与素材都保留（不删），随时可恢复；菜单项与 persona 表也随之失效。
-ACCESSORIES_OFF = True
 
 # ---------- 配色（古见同学主题：制服蓝 / 领结红 / 深紫黑 / 灰紫，对齐古见同学展示页）----------
 C_BUBBLE = 0xFFFDFBF6          # 气泡米白底（展示页 --bg #F7F4EE 的亮阶）
@@ -303,7 +297,6 @@ INTERP_HIGHQUALITY = 7         # HighQualityBicubic（立绘缩放质量）
 UNIT_PIXEL = 2
 FONT_REGULAR, FONT_BOLD = 0, 1
 IDM_DASHBOARD, IDM_QUIT, IDM_BUBBLE, IDM_SOUND = 1001, 1002, 1003, 1004
-IDM_ACC = 1005                 # 配件层总开关（猫/贝雷帽/鲸鱼玩偶）
 IDM_OK_AUTO = 1006             # 完成态自动收起开关（P2：不再只能改 wb_motion 重启）
 IDM_LINKED = 1007              # 随 Agent 退出联动关闭开关（P2 同上）
 IDM_FOLLOW = 1008              # 跟随前台切换聚焦开关（跟随模式 P1）
@@ -1123,27 +1116,17 @@ class WhalePet:
         self._install_follow_hotkey()
         threading.Thread(target=self._health_loop, daemon=True).start()
 
-        # ---- 配件层：状态对象 + 后台活跃探测（探测绝不放消息循环）----
-        self.acc_on = bool(self._settings.get("accessories", True))
-        self._acc = None
+        # ---- 活跃探测（后台线程；探测绝不放消息循环）----
+        # ⚠️ 用途是**「联动关闭」的宿主判据**（见 _host_alive），**与配件无关**；
+        #    配件层（猫/贝雷帽/鲸鱼玩偶）已于 2026-09-27 整体删除，这段必须留着。
         self._presence = None
-        self._spr_rect = None            # 上一帧立绘矩形（配件定位用）
+        self._spr_rect = None            # 上一帧立绘矩形（命中区 / 气泡锚点用）
         self._spr_key = ("idle", "")
-        # 活跃探测器**独立于配件开关**：它同时是"联动关闭"的宿主判据
-        # （见 _host_alive）。若只在 acc_on 时创建，关掉配件就会让联动关闭退回
-        # "只认 WorkBuddy"的老逻辑——那正是本次要解耦的东西。
-        if _ACC_OK:
-            try:
-                self._presence = PRESENCE.PresenceDetector().start()
-            except Exception:
-                log_exception("[presence] 活跃探测启动失败")
-                self._presence = None
-        if _ACC_OK and self.acc_on:
-            try:
-                self._acc = ACC.AccessoryState(scale=self.scale)
-            except Exception:
-                log_exception("[acc] 配件层初始化失败")
-                self._acc = None
+        try:
+            self._presence = PRESENCE.PresenceDetector().start()
+        except Exception:
+            log_exception("[presence] 活跃探测启动失败")
+            self._presence = None
 
     # ---- 设置持久化 ----
     def _load_settings(self):
@@ -1168,7 +1151,6 @@ class WhalePet:
                          "bubble": self.bubble_on,
                          "quality": self._quality,
                          "style": self.style,
-                         "accessories": self.acc_on,
                          "ok_autodismiss": self.ok_autodismiss_on,
                          "linked_close": self.linked_close_on,
                          "follow": self.follow_on,
@@ -1471,7 +1453,7 @@ class WhalePet:
         命名约定：{state} / {state}_f
             state ∈ idle/happy/pout/shy/blush/stone/joy/surprise
         sprite key 形如 'q.idle' / 'q.idle_f'。
-        高冷版（alt_*）与配件已停用（2026-09-26 决策：审美线统一到 v3 Q 版）。
+        高冷版（alt_*）与配件层（猫/贝雷帽/玩偶）均已删除（2026-09-27）。
         """
         sprites = {}
         states = ("idle", "happy", "pout", "shy", "blush", "stone", "joy", "surprise")
@@ -1598,12 +1580,9 @@ class WhalePet:
         sc = self.scale
         bub_h = int(BASE_BUB_H * sc)
         bubble_h = int(BASE_BUBBLE_H * sc) if self.bubble_on else 0
-        # 配件净空：插在气泡区与立绘区之间，供贝雷帽占用头顶上方的空间（见 wb_motion）。
-        # 配件停用后这块就是纯空白（气泡与角色之间一条 58px 的缝），故归零。
-        hr = 0 if ACCESSORIES_OFF else int(MOTION.ACC_HEADROOM * sc)
         pet_h = int(BASE_PET_H * sc)
-        return {"W": int(BASE_W * sc), "H": bubble_h + hr + pet_h,
-                "bub_h": bub_h, "bubble_h": bubble_h, "hr": hr,
+        return {"W": int(BASE_W * sc), "H": bubble_h + pet_h,
+                "bub_h": bub_h, "bubble_h": bubble_h,
                 "pet_h": pet_h, "sc": sc}
 
     # ---- 窗口 ----
@@ -2126,7 +2105,7 @@ class WhalePet:
 
         v2（2026-09-25 解耦）：联动关闭的宿主从「WorkBuddy 进程」泛化为
         「任一活跃 agent」。判据直接取桌宠内已在跑的活跃探测器缓存
-        ——零额外开销，且与配件层用的是**同一份判定**，不会两边口径不一。
+        ——零额外开销，判定口径与 wb_agent_presence 完全一致，不会两边不一。
 
         未探满一轮时返回 None：否则启动瞬间的空集合会被误判成"全退出了"而误关。
         """
@@ -2302,7 +2281,6 @@ class WhalePet:
     def _anim_tick(self):
         now = time.time()
         dt = ANIM_MS / 1000.0
-        self._tick_accessories(now, dt)
         # ① 粒子物理
         alive = []
         for p in self._particles:
@@ -3101,11 +3079,6 @@ class WhalePet:
         if self.bubble_on:
             self._draw_bubble(s, lay, now)
         self._draw_pet(s, lay)
-        # 配件统一画在立绘**之上**：
-        #   · 贝雷帽/玩偶必须在身体前面（穿戴与抱持）
-        #   · 小黑猫贴地线走过——从她脚前经过是自然的；若画在身后，
-        #     chibi 立绘太宽（占窗口 65%）会把猫整个挡住，等于消失
-        self._draw_accessories(s, lay, now)
         s.present(self.hwnd)
 
     def _sprite_content_top(self, lay):
@@ -3517,145 +3490,6 @@ class WhalePet:
                 s.ellipse(color, cx - e["w"] * w * 0.26, cy - e["h"] * h * 0.18,
                           e["w"] * w * 0.52, e["h"] * h * 0.36)
 
-    # ================= 配件层（猫 / 贝雷帽 / 鲸鱼玩偶） =================
-
-    def _init_accessories(self):
-        """惰性建配件层（初始化失败自动降级，绝不影响桌宠本体）。"""
-        if not _ACC_OK:
-            return
-        try:
-            self._acc = ACC.AccessoryState(scale=self.scale)
-            if self._presence is None:                 # 正常情况下 __init__ 已建好
-                self._presence = PRESENCE.PresenceDetector().start()
-        except Exception:
-            self._acc = None
-            self._presence = None
-            log_exception("[acc] 初始化")
-
-    def _release_accessories(self):
-        """关闭配件显示。
-
-        **只销毁配件层，保留活跃探测器**——后者同时供"联动关闭"判定宿主用
-        （见 _host_alive）。若在此一并 stop，"关掉配件"就会连带让联动关闭失效。
-        探测器是 daemon 线程，随进程退出即结束，不需要显式清理。
-        """
-        self._acc = None
-
-    def _tick_accessories(self, now, dt):
-        """每帧推进配件层（挂在动画帧上，猫才走得顺）。
-
-        注意：本方法可能早于 `_acc` 建立就被调用（__init__ 里 _recreate_window
-        会先 draw 一次），所以一律用 getattr 防御式取值。
-        """
-        if not getattr(self, "_acc", None):
-            return
-        try:
-            if self._presence:
-                act = self._presence.active()          # 读缓存，零开销
-                # 必须比 **集合**：act 是 set，而 self._acc.active 是 list，
-                # `set != list` 在 Python 里恒为真 → 曾导致每帧重复上报同一状态
-                # （同一秒 6 条、事件日志被刷到 4 万行）。这是"比较忘了统一类型"的典型。
-                if set(act) != set(self._acc.active):
-                    self._acc.set_active_agents(act)
-                    self._report_event("acc_active",
-                                       detail=",".join(sorted(act)))
-            self._acc.update(dt, self._layout(), now,
-                             enter_s=MOTION.ACC_ENTER_S, exit_s=MOTION.ACC_EXIT_S)
-            if self._acc.active_kinds():
-                self._drawn_sig = None                 # 有配件在动 → 每帧重绘
-        except Exception:
-            self._acc = None                           # 异常即摘除，本体不受影响
-            log_exception("[acc] tick")
-
-    def _acc_image(self, fn):
-        """按文件名缓存配件图（GDI+ 位图，进程内只加载一次）。"""
-        cache = getattr(self, "_acc_imgs", None)
-        if cache is None:
-            cache = self._acc_imgs = {}
-        got = cache.get(fn)
-        if got is not None:
-            return got
-        path = os.path.join(ASSETS_DIR, fn)
-        if not os.path.isfile(path):
-            cache[fn] = None
-            return None
-        g = P()
-        if _LoadImage(path, ctypes.byref(g)) != 0 or not g:
-            cache[fn] = None
-            return None
-        w_, h_ = U32(0), U32(0)
-        _GetImageW(g, ctypes.byref(w_))
-        _GetImageH(g, ctypes.byref(h_))
-        if w_.value <= 0 or h_.value <= 0:
-            cache[fn] = None
-            return None
-        cache[fn] = (g, w_.value, h_.value)
-        return cache[fn]
-
-    def _draw_accessories(self, s, lay, now):
-        """画配件（统一在立绘之上，按槽位各自定位）。
-
-        说明：GDI 的 AlphaBlend 走的是 1:1 直拷，**没有全局 alpha**，
-        所以入退场不靠淡入淡出，而是靠位移 + 缩放（drop / hug / walk_in 三种曲线）
-        ——视觉上一样读得出"出现了"，且不必为透明度再引入一遍重采样。
-
-        ⚠️ 2026-09-26 起**整体停用**：用户明确要求帽子（贝雷帽）/小猫/鲸鱼玩偶都不进桌宠，
-        切到 v3 统一审美线。这里保留代码（不删）以便随时恢复，由 OFF 开关控制。
-        """
-        if ACCESSORIES_OFF:
-            return
-        acc = getattr(self, "_acc", None)
-        rect = getattr(self, "_spr_rect", None)
-        if not acc or not rect:                     # 早期 draw（__init__）直接跳过
-            return
-        acc.sprite_span = (rect[0], rect[0] + rect[2])   # 让小猫避开她身后
-        state, facing = getattr(self, "_spr_key", ("idle", ""))
-        style = "alt" if getattr(self, "style", "q") == "alt" else "q"
-        base_state = state[4:] if state.startswith("alt_") else state
-        face = ACC.anchor_for(acc.anchors, base_state, facing, style)
-        if not face:
-            return
-
-        for kind in acc.active_kinds():
-            spec = ACC.KINDS.get(kind)
-            if not spec:
-                continue
-            fn = None
-            if kind == "cat":
-                fn = acc.cat.sprite_file()
-            else:
-                files = spec.get("files") or ()
-                fn = files[1] if (facing == "_f" and len(files) > 1) else (
-                    files[0] if files else None)
-            if not fn:
-                continue
-            img = self._acc_image(fn)
-            if not img:
-                continue
-
-            ar = img[1] / float(img[2])
-            pl = ACC.compute_placement(
-                kind, face, rect, ar, lay,
-                cat_x=(acc.cat.x if kind == "cat" else None),
-                scale=lay.get("sc", 1.0), style=style)
-            if not pl:
-                continue
-            x, y, w, h = pl
-
-            tr = acc.transition(kind)
-            dx, dy, sca = (tr.transform(kind)[:3] if tr else (0.0, 0.0, 1.0))
-            w2, h2 = w * sca, h * sca
-            x2 = x + dx - (w2 - w) / 2.0
-            y2 = y + dy - (h2 - h)          # 以底边为缩放基准
-            x2 = max(-w2 * 0.3, min(x2, lay["W"] - w2 * 0.7))
-            # 用 image() 而不是 blit()：配件是 GDI+ 位图（P()），不是 Surface；
-            # blit 只接受另一个 Surface（内部取 src.hdc）。踩过一次——写错 API 又被
-            # `except: pass` 吞掉，表现为"几何全对但什么都没画出来"，极难查。
-            try:
-                s.image(img[0], x2, y2, w2, h2)
-            except Exception:
-                log_exception("[acc] 绘制")
-
     # ---- 形态尺寸归一（点击换姿势时的"忽大忽小"）----
 
     def _state_size(self, state):
@@ -3765,7 +3599,7 @@ class WhalePet:
             img, iw, ih = spr
             pw = (ph * iw / ih) * pw_ratio
             x = (W - pw) / 2 + wob
-            # 记录本帧立绘矩形与状态键：配件层据此定位（与 _draw_blush 同一套归一化锚点）
+            # 记录本帧立绘矩形与状态键：命中区 / 气泡锚点据此定位（与 _draw_blush 同一套归一化锚点）
             self._spr_rect = (x, y_bottom - ph_draw, pw, ph_draw)
             self._spr_key = (state, facing)
             # 提案 §4：软阴影随漂浮高度缩放（漂浮越高阴影越小越淡）
@@ -3969,9 +3803,6 @@ class WhalePet:
             menu, MF_STRING | (MF_CHECKED if self.bubble_on else 0),
             IDM_BUBBLE, "想法气泡")
         _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.acc_on else 0),
-            IDM_ACC, "配件（猫 / 贝雷帽 / 玩偶）")
-        _user32.AppendMenuW(
             menu, MF_STRING | (MF_CHECKED if self.sound_on else 0),
             IDM_SOUND, "互动音效")
         # P2：行为开关（此前只能改 wb_motion 的 *_ON 后重启）
@@ -4081,15 +3912,6 @@ class WhalePet:
             self._report_event("menu_bubble", detail=str(self.bubble_on))
             self._save_settings()
             self._recreate_window()
-        elif cmd == IDM_ACC:
-            self.acc_on = not self.acc_on
-            self._report_event("menu_acc", detail=str(self.acc_on))
-            self._save_settings()
-            if self.acc_on and self._acc is None:
-                self._init_accessories()
-            if not self.acc_on:
-                self._release_accessories()
-            self._drawn_sig = None
         elif cmd == IDM_SOUND:
             self.sound_on = not self.sound_on
             if self.sound_on and not self._sounds:

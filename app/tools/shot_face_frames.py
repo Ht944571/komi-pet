@@ -106,7 +106,6 @@ def main():
     if app._presence:
         app._presence.stop()
         app._presence = None
-    app._acc = None                              # 面部诊断不画配件
 
     # 稳定数据态：无会话在跑 → 立绘走 idle，气泡走固定文案
     app.active = []

@@ -180,20 +180,31 @@ def main():
 
     # ---------- D. --pet ----------
     print("\n[D] --pet（真实起一个桌宠窗口）")
-    n_killed = kill_pet()
-    print(f"      临时停掉正在跑的桌宠 {n_killed} 个（守望会在几十秒内把源码版拉回来）")
-    time.sleep(2)
+    # ⚠️ 这里天生有竞态：杀掉桌宠后，**守望会立刻把它拉回来**，打包版就抢不到
+    #    单实例锁（"已有桌宠实例在运行，本次启动退出"）—— 那是正确行为，不是 bug。
+    #    所以要**重试**：每轮先杀干净、再启动，直到窗口真的属于我们起的那个 pid。
     petlog = os.path.join(data_dir, "pet.log")
     pf = open(petlog, "wb")
-    pp = subprocess.Popen([EXE, "--pet"], env=env, cwd=DIST_DIR,
-                          stdout=pf, stderr=pf, stdin=subprocess.DEVNULL,
-                          creationflags=0x00000008 | 0x08000000)
-    win = []
-    for _ in range(20):
-        time.sleep(1)
-        win = [w for w in enum_pet_windows() if w[1] == pp.pid]
+    pp, win, n_killed = None, [], 0
+    for attempt in range(6):
+        n_killed += kill_pet()
+        time.sleep(1.5)
+        pp = subprocess.Popen([EXE, "--pet"], env=env, cwd=DIST_DIR,
+                              stdout=pf, stderr=pf, stdin=subprocess.DEVNULL,
+                              creationflags=0x00000008 | 0x08000000)
+        win = []
+        for _ in range(8):
+            time.sleep(1)
+            win = [w for w in enum_pet_windows() if w[1] == pp.pid]
+            if win:
+                break
         if win:
+            if attempt:
+                print(f"      （第 {attempt + 1} 轮才抢到实例锁 —— 守望抢跑属正常竞态）")
             break
+        pp.kill()
+        time.sleep(1)
+    print(f"      临时停掉正在跑的桌宠 {n_killed} 个（守望会在几十秒内把源码版拉回来）")
     check("D1 桌宠窗口已出现", bool(win), f"看到 {len(win)} 个")
     if win:
         print(f"      窗口={win[0][2]}  pid={win[0][1]}")

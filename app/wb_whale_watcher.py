@@ -173,7 +173,7 @@ def active_agents():
     """当前活跃的 agent 集合。**None = 无法判定**（调用方应保持不动，宁可留着）。
 
     v2（2026-09-25 解耦）：宿主从「WorkBuddy 进程」泛化为「任一已注册 agent」。
-    探针是**声明式**的（app/assets/_acc_persona.json 的 presence 字段），
+    探针是**声明式**的（app/assets/_agents.json 的 presence 字段），
     新增 agent 只改 JSON 就自动覆盖，不用动本文件。
 
     降级链（保证任何环境下都有确定行为）：

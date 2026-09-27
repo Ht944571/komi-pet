@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-wb_agent_presence.py — 哪些 agent 现在「在用」？（配件层的输入）
+wb_agent_presence.py — 哪些 agent 现在「在用」？（联动关闭的宿主判据）
 ====================================================================
 
 判定口径（重要，和「跟随前台窗口」是两个不同的信号）
 ----------------------------------------------------
-  · **活跃（本模块）** = 该 agent **在运行**。决定古见**佩戴什么配件**。
+  · **活跃（本模块）** = 该 agent **在运行**。桌宠据此判断"宿主还在不在"（联动关闭）。
     语义是"我的生活里有它"，应当是**稳定**的——开着一整天就一整天都在，
-    不能因为切个窗口就闪来闪去（配件忽隐忽现会非常廉价）。
+    不能因为切个窗口就闪来闪去（否则联动关闭会误触发）。
 
   · **聚焦（另说）** = 前台窗口属于谁。决定徽章/领结等**即时**标识，可以频繁变。
 
-这两件事分开，是为了让"配件"这种体积大、动静大的东西保持稳定；
+这两件事分开，是为了让"谁在跑"这个判据保持稳定；
 高频变化只交给轻量的元素去表达。详见 docs/桌宠跨Agent体验设计.md。
 
 实现约束
@@ -21,7 +21,7 @@ wb_agent_presence.py — 哪些 agent 现在「在用」？（配件层的输入
   放进 timer tick，消息循环每秒被卡死半秒）。
   本模块对外只暴露 `active()` 读缓存，**读取是零开销的**。
 
-声明式：探针写在 assets/_acc_persona.json 的 `presence` 字段，
+声明式：探针写在 assets/_agents.json 的 `presence` 字段，
 新增 agent 只改 json，不改这里的代码。
 """
 
@@ -40,9 +40,8 @@ except Exception:                                   # pragma: no cover
 import json
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-PERSONA = os.path.join(_HERE, "assets", "_acc_persona.json")
 
-DEFAULT_INTERVAL = 2.0          # 探测周期（秒）；配件是长期状态，2s 足够
+DEFAULT_INTERVAL = 2.0          # 探测周期（秒）；"在不在跑"是长期状态，2s 足够
 PORT_TIMEOUT = 0.15             # 端口 connect 超时（本机回环，取小值即可）
 
 # ---------------------------------------------------------------------------
@@ -191,7 +190,7 @@ def detect_detail(specs=None, now=None):
 def load_probes():
     """从 **agent 登记册**读 {agent_key: {"procs": [...], "ports": [...]}}。
 
-    登记册是唯一来源（`assets/_agents.json`，缺失时回退 `_acc_persona.json`），
+    登记册是唯一来源（`assets/_agents.json`），
     见 `wb_agent_registry`。**只返回 enabled=true 的项** —— 用户在设置里关掉的
     agent 不该再被探测（这是"用户自主选择接入哪些 agent"的落点）。
     """
@@ -366,7 +365,7 @@ class PresenceDetector:
         return self
 
     def _loop(self):
-        # 首轮立刻探，避免开桌宠后要等一个周期才出现配件
+        # 首轮立刻探，避免开桌宠后要等一个周期才知道宿主在不在
         while not self._stop.is_set():
             self.poll_now()
             with self._lock:
