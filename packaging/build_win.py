@@ -46,8 +46,12 @@ BUILD = os.path.join(ROOT, "build")
 STAGE = os.path.join(BUILD, "stage")
 ICON = os.path.join(ROOT, "packaging", "app.ico")
 
-NAME = "古见同学桌宠"
-VERSION = "1.0.0"
+# 版本号/应用名的**唯一出处**是 app/wb_version.py（运行时也要用，不能各写一份）
+sys.path.insert(0, os.path.join(ROOT, "app"))
+import wb_version as V          # noqa: E402
+
+NAME = V.APP_NAME
+VERSION = V.VERSION
 
 # 不进包的素材（开发期中间产物，可重新生成）
 ASSET_SKIP_DIRS = {"_gen3", "_whale_backup", "_gen", "__pycache__"}
@@ -132,6 +136,20 @@ README = '''\
 
   ★ 绿色便携模式：在 exe 同级目录放一个空文件 portable.txt，
     数据就改放  <本目录>\\data\\  —— 塞 U 盘里换台电脑也能带着走。
+
+【自定义更新（可选）】
+  本程序支持自更新：发布方给一个 update.json 清单，你指过去即可。
+
+    {name}.exe --set-update-source <地址>   设置更新源（目录或 update.json 的 URL/路径）
+    {name}.exe --check-update              看看有没有新版
+    {name}.exe --update                    立即更新（下载→校验→替换→自动重启）
+
+  · 地址可以是 http(s)、局域网共享、甚至本地文件夹
+  · **不设置就完全不联网**（默认不检查更新，放心）
+  · 设置后：桌宠启动会静默检查（每天一次），有新版会冒个气泡提示；
+    右键菜单会出现「更新到 vX」，点它才会真的更新
+  · 下载的包会按清单里的 sha256 校验，不通过绝不安装
+  · 更新只替换程序，**你的设置和用量数据原样保留**
 
 【命令行（可选）】
   {name}.exe --install [--port 8801]    安装自启（等同双击 安装.cmd）
@@ -234,9 +252,15 @@ def run_pyinstaller(no_icon=False):
 def write_runtime_files():
     """把 exe 旁边的配套文件补齐：隐藏启动脚本 / 安装卸载 / 说明书。"""
     d = os.path.join(DIST, NAME)
-    for fn, content in (("launch_hidden.vbs", VBS),
-                        ("安装.cmd", INSTALL_CMD),
-                        ("卸载.cmd", UNINSTALL_CMD),
+    # ⚠️ .vbs 必须用 **UTF-16(带 BOM)** 写：wscript 默认按 ANSI 读 .vbs，
+    #    用 UTF-8 存的话里面的中文路径（古见同学桌宠.exe）会整个乱掉 →
+    #    自启/更新后重启会**静默失败**（踩过一次：更新完桌宠没回来、残留没人清）。
+    # .cmd 反而要 UTF-8：脚本里先 `chcp 65001`，之后的行按 UTF-8 解析（含中文路径）✓
+    with open(os.path.join(d, "launch_hidden.vbs"), "w",
+              encoding="utf-16", newline="\r\n") as f:
+        f.write(VBS)
+    log("  launch_hidden.vbs（UTF-16）")
+    for fn, content in (("安装.cmd", INSTALL_CMD), ("卸载.cmd", UNINSTALL_CMD),
                         ("README.txt", README)):
         with open(os.path.join(d, fn), "w", encoding="utf-8", newline="\r\n") as f:
             f.write(content)

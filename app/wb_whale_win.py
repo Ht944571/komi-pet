@@ -311,6 +311,7 @@ IDM_PIN = 1009                 # 锁定聚焦（pin）开关（跟随模式 P3�
 IDM_TIMELINE0 = 1400           # 1400：今日时间线摘要项；1401+i ↔ 最近轮次[i]
 IDM_FOCUS0 = 1450              # 1450+i ↔ 手动聚焦候选[i]（登记册启用 agent）
 IDM_HANDOFF = 1010             # 生成接续摘要 → 剪贴板（跟随模式 P4；仅角标活跃时出现）
+IDM_UPDATE = 1011              # 检查更新 / 更新到 vX（仅配置了更新源时出现）
 ID_HOTKEY_FOLLOW = 1           # 全局热键 id（RegisterHotKey 的 id 命名空间独立于定时器）
 IDM_SCALE0 = 1100              # 1100+i ↔ SCALES[i]
 SCALES = (0.6, 0.8, 1.0, 1.5, 2.0, 2.5)
@@ -1011,6 +1012,9 @@ class WhalePet:
         self._spawn_lock = threading.Lock()
         # ---- 外观状态（设置持久化）----
         self._settings = self._load_settings()
+        # 自更新：后台检查结果缓存 + 是否在处理（网络全在后台线程，绝不进消息循环）
+        self._update_info = None
+        self._update_busy = False
         self.scale = float(self._settings.get("scale", 1.0))
         self.bubble_on = bool(self._settings.get("bubble", True))
         self.sound_on = bool(self._settings.get("sound", True))
@@ -1106,6 +1110,7 @@ class WhalePet:
         # 启动时后台预热时间线：首次右键/首批气泡就不用等（查库 3.6s 全在后台线程）
         self._kick_timeline_refresh()
         self._start_api_guard()           # 看板 API 守护（后台 daemon 线程，不做网络阻塞）
+        self._start_update_watch()        # 自更新检查（未配更新源 → 线程直接退出，零联网）
         # P3 全局热键（Ctrl+Alt+F9 手动聚焦轮换）：绑定桌宠 hwnd，
         # WM_HOTKEY 走既有消息泵；组合被占用 → 静默降级（右键菜单仍是兜底）
         self._install_follow_hotkey()
@@ -3962,6 +3967,18 @@ class WhalePet:
             chk = MF_CHECKED if self.style == st else 0
             _user32.AppendMenuW(subs, MF_STRING | chk, IDM_STYLE0 + i, label)
         _user32.AppendMenuW(menu, MF_POPUP, subs, "形态风格")
+        # 自更新：只有「配了更新源」或「已知有新版」才出现 —— 默认不联网就别摆个没用的项
+        try:
+            import wb_update as _UP
+            _up_src = _UP.source()
+        except Exception:
+            _up_src = ""
+        _up_m = (self._update_info or {}).get("manifest") or {}
+        if (self._update_info or {}).get("available") and _up_m.get("version"):
+            _user32.AppendMenuW(menu, MF_STRING, IDM_UPDATE,
+                                f"更新到 v{_up_m['version']}")
+        elif _up_src:
+            _user32.AppendMenuW(menu, MF_STRING, IDM_UPDATE, "检查更新")
         _user32.AppendMenuW(menu, MF_STRING, IDM_QUIT, "退出古见同学")
         _user32.SetForegroundWindow(hwnd)
         cmd = _user32.TrackPopupMenu(
@@ -4019,6 +4036,8 @@ class WhalePet:
             self._toggle_focus_pin()
         elif cmd == IDM_HANDOFF:
             self._gen_handoff()
+        elif cmd == IDM_UPDATE:
+            self._on_update_menu()
         elif cmd == IDM_QUIT:
             self._report_event("menu_quit")
             _user32.PostQuitMessage(0)
@@ -4075,6 +4094,105 @@ class WhalePet:
             log_exception("[dashboard] 拉起看板服务失败")
         finally:
             self._spawning_dash = False
+
+    # ---- 自更新（检查 / 下载 / 替换）----
+    # ⚠️ 铁律：**网络与文件操作一律放后台线程**，绝不进 Win32 消息循环
+    #    （本项目既有教训：把带超时的 urlopen 放进 timer tick 会卡死拖动与点击）。
+
+    def _say_once(self, text, dur="提示", secs=8.0):
+        """走既有的「说话」通道在气泡里提示一句（不打断动画、不加音效）。"""
+        try:
+            self._quote = text
+            self._quote_dur = dur
+            self._talk_until = time.time() + secs
+            self._drawn_sig = None          # 强制重绘
+            self._arm_watch()
+        except Exception:
+            pass
+
+    def _notify_update(self, info):
+        m = (info or {}).get("manifest") or {}
+        self._say_once(f"有新版本 v{m.get('version')}，右键可以更新", "发现更新", 10.0)
+
+    def _start_update_watch(self):
+        """后台自更新检查：启动查一次，之后每 24 小时一次。
+
+        **没配更新源就直接退出** —— 默认零联网（隐私安全）。
+        查到新版只**提示**，绝不自动替换：换版本必须用户点。
+        """
+        try:
+            import wb_update                       # 提前失败就别起线程
+        except Exception:
+            return
+
+        def job():
+            first = True
+            while True:
+                try:
+                    if not wb_update.source():
+                        return                     # 未配置 → 完全不联网
+                    info = wb_update.check()
+                    self._update_info = info
+                    if info.get("available"):
+                        self._notify_update(info)
+                except Exception:
+                    pass
+                time.sleep(600 if first else 24 * 3600)
+                first = False
+
+        threading.Thread(target=job, daemon=True, name="komi-update-watch").start()
+
+    def _start_update_check(self, notify=False):
+        """右键「检查更新」：后台查一次，结果写回 self._update_info。"""
+        if self._update_busy:
+            return
+        self._update_busy = True
+
+        def job():
+            try:
+                import wb_update
+                info = wb_update.check()
+                self._update_info = info
+                if notify:
+                    if info.get("available"):
+                        self._notify_update(info)
+                    else:
+                        self._say_once(str(info.get("msg") or "检查完成"), "更新")
+            except Exception as e:
+                if notify:
+                    self._say_once(f"检查更新失败：{e}", "更新")
+            finally:
+                self._update_busy = False
+        threading.Thread(target=job, daemon=True, name="komi-update-check").start()
+
+    def _start_update_apply(self):
+        """下载 + 解压 + 交给新版本替换。完成后**本进程必须退出**（否则文件被锁着换不掉）。"""
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self._say_once("正在下载新版本…", "更新中", 30.0)
+
+        def job():
+            try:
+                import wb_update
+                m = wb_update.run_apply_new()
+                self._say_once(f"v{m['version']} 就绪，正在更新…", "更新中", 10.0)
+                time.sleep(1.2)                    # 让气泡那句话有机会显示
+                _user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)   # 走正常退出路径
+            except Exception as e:
+                self._update_busy = False
+                self._say_once(f"更新失败：{e}", "更新", 12.0)
+        threading.Thread(target=job, daemon=True, name="komi-update-apply").start()
+
+    def _on_update_menu(self):
+        info = self._update_info or {}
+        if info.get("available"):
+            self._report_event("update_apply",
+                               detail=str((info.get("manifest") or {}).get("version")))
+            self._start_update_apply()
+        else:
+            self._report_event("update_check")
+            self._start_update_check(notify=True)
 
     def _start_api_guard(self):
         """看板 API 的常驻守护：**这不放在消息循环里**（见下）。

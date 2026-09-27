@@ -187,6 +187,31 @@ def free_console():
         return False
 
 
+def init_console():
+    """把控制台输出统一到 UTF-8。
+
+    中文 Windows 的控制台代码页是 **936(GBK)**，而冻结程序按 UTF-8 写 stdout →
+    用户看到一屏乱码；更糟的是打印 ✅ 这类字符会直接 `UnicodeEncodeError` 把命令打挂。
+    所有命令行入口（hover 的各个子命令、wb_setup）都该先调它。
+
+    `errors="replace"` 是兜底：万一遇到不可编码的字符，宁可显示成 `?` 也不要抛异常。
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for n in ("stdout", "stderr"):
+        s = getattr(sys, n, None)
+        if s is not None and hasattr(s, "reconfigure"):
+            try:
+                s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def runtime_summary():
     """一行摘要，供 --status / 启动日志用。"""
     return (f"形态={'打包exe' if FROZEN else '源码'}  "

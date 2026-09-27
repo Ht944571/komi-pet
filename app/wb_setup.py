@@ -36,27 +36,8 @@ RUN_API = "KomiPetUsageApi"
 LEGACY_RUN_VALUES = ("WorkBuddyWhaleWatcher",)      # 旧 skill 时代的键，顺手清掉
 
 
-def init_console():
-    """让中文输出在 cmd / PowerShell 里正常显示。
-
-    中文 Windows 的默认控制台代码页是 **936(GBK)**，而 PyInstaller 打出来的程序
-    按 UTF-8 写 stdout → 用户看到的是 `�ż�ͬѧ����`。这里把代码页与流的编码
-    都统一到 UTF-8；`安装.cmd` / `卸载.cmd` 另外也会 `chcp 65001` 兜一层。
-    """
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-            ctypes.windll.kernel32.SetConsoleCP(65001)
-        except Exception:
-            pass
-    for n in ("stdout", "stderr"):
-        s = getattr(sys, n, None)
-        if s is not None and hasattr(s, "reconfigure"):
-            try:
-                s.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+# 控制台 UTF-8 统一走运行时层（hover 的各个子命令也用它，必须同一份实现）
+init_console = RT.init_console
 
 
 def _ok(m):
@@ -166,6 +147,12 @@ def print_plan(port=8801):
     print("  HKCU\\...\\Run")
     for name, value in _entries(port):
         print(f"      [{name}] = {value}")
+    try:
+        import wb_update
+        src = wb_update.source()
+        print(f"  更新源：{src or '(未配置 → 完全不联网；用 --set-update-source 设一个)'}")
+    except Exception:
+        pass
 
 
 def show_status(port=8801):
@@ -190,6 +177,11 @@ def show_status(port=8801):
 def preflight():
     issues = []
     _ok(f"Python {sys.version.split()[0]}")
+    try:
+        import wb_version as _V
+        _ok(f"版本 {_V.display()}")
+    except Exception:
+        pass
     for n, p in (("立绘资源 assets/", os.path.join(RT.bundle_dir(), "assets", "pet_v3")),
                  ("看板页面 dashboard.html",
                   os.path.join(RT.bundle_dir(), "wb_usage", "dashboard.html"))):
