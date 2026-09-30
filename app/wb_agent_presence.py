@@ -60,7 +60,12 @@ HOOK_WINDOW_S = 90          # L1：hook 心跳多久内算"本轮活跃"
 LOG_ACTIVE_WINDOW_S = 45    # L2：日志最近写入多久内算"忙碌"（流式写入间隔远小于此）
 LOG_PROBE_TTL_S = 10.0      # L2 的 glob/mtime 扫描缓存周期（** 递归遍历有成本，不能每帧跑）
 
-_log_cache = {}             # {patterns_tuple: (checked_at, age_or_None)}
+_log_cache = {}
+_SNAP_FAIL = False            # 最近一次进程快照是否失败（True = 探测未知）
+
+
+def _procs_snapshot_failed():
+    return bool(_SNAP_FAIL)             # {patterns_tuple: (checked_at, age_or_None)}
 
 
 def _expand(pat):
@@ -154,6 +159,7 @@ def detect_detail(specs=None, now=None):
 
     need_procs = any(s["procs"] for s in specs.values())
     procs = _running_procs() if need_procs else set()
+    snap_failed = need_procs and procs is None          # 快照失败 → L3 无法判定
 
     out = {}
     for key, spec in specs.items():
@@ -172,8 +178,8 @@ def detect_detail(specs=None, now=None):
             age = log_activity_age(spec["log_paths"], now)
             if age is not None and age <= LOG_ACTIVE_WINDOW_S:
                 level = LEVEL_LOG
-        # L3 进程/端口
-        if level is None:
+        # L3 进程/端口（快照失败时跳过：拿不到进程名单 ≠ agent 不在）
+        if level is None and not snap_failed:
             if spec["procs"] and any(n in procs for n in spec["procs"]):
                 level = LEVEL_PROC
             elif spec["ports"] and any(_port_open(pt) for pt in spec["ports"]):
@@ -211,10 +217,12 @@ def load_probes():
 # ---------------------------------------------------------------------------
 
 def _running_procs():
-    """当前进程名集合（小写）。非 Windows 返回空集。"""
+    """当前进程名集合（小写）；快照失败 → None（探测未知）。非 Windows 也返回 None。"""
     if not _HAS_WIN:
-        return set()
+        return None
+    global _SNAP_FAIL
     names = set()
+    _SNAP_FAIL = False
     TH32CS_SNAPPROCESS = 0x00000002
     INVALID = ctypes.c_void_p(-1).value
 
@@ -235,7 +243,11 @@ def _running_procs():
 
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or snap == INVALID:
-        return names
+        _SNAP_FAIL = True
+        # ⚠️ 快照失败（进程高频起停时会报 BAD_LENGTH）≠ "没有进程"。
+        #    返回 None = 探测未知：调用方必须按"无法判定"处理，绝不能当作
+        #    "所有 agent 都不在"（否则守望会把桌宠误杀，2026-09-30 实锤）。
+        return None
     try:
         e = PROCESSENTRY32W()
         e.dwSize = ctypes.sizeof(PROCESSENTRY32W)
@@ -246,6 +258,7 @@ def _running_procs():
                     break
     finally:
         k32.CloseHandle(ctypes.c_void_p(snap))
+    _SNAP_FAIL = False
     return names
 
 
@@ -276,12 +289,16 @@ def detect_once(probes=None):
     （兼容既有调用与测试——显式给探针就是"我只认这些探针"）。
     """
     if probes is None:
+        if _procs_snapshot_failed():
+            return None                     # 进程快照失败 = 探测未知（宁可不判）
         return {k for k, v in detect_detail().items() if v["level"] >= 1}
     if not probes:
         return set()
 
     need_procs = any(p["procs"] for p in probes.values())
     procs = _running_procs() if need_procs else set()
+    if need_procs and procs is None:
+        return None                          # 同上：未知不判
 
     active = set()
     for key, spec in probes.items():
@@ -343,6 +360,11 @@ class PresenceDetector:
     def poll_now(self):
         """立刻探一次（测试/手动刷新用）。"""
         try:
+            if _procs_snapshot_failed():
+                # 快照失败：保留上一次结果（宿主判据不能因为一次快照失败就闪空）
+                with self._lock:
+                    self._last_error = "proc snapshot failed; keep last known"
+                return self._active
             d = detect_detail()
             with self._lock:
                 self._detail = d

@@ -112,7 +112,7 @@ def main():
             print("      " + line[:150])
     check("A1 --check 退出码为 0", p.returncode == 0, f"rc={p.returncode}")
     check("A2 打包形态被识别", "打包exe" in out)
-    check("A3 立绘资源已入包", "立绘资源 assets/ 就位" in out)
+    check("A3 写字帧序列已入包", "写字帧序列 assets/anim/ 就位" in out)
     check("A4 看板页面已入包", "看板页面 dashboard.html 就位" in out)
     check("A5 打印了自启命令行（未写入注册表）",
           "HKCU" in out and "KomiPetWhaleWatcher" in out)

@@ -185,6 +185,84 @@ finally:
     W.SETTINGS_FILE = saved_sf
     app.close()                    # 全部段共用同一实例，最后统一关闭（GDI+ 生命周期）
 
+# ---- F. 接续查询的性能契约（2026-09-30：前台切换 agent 卡顿）----
+# 事故：跟随模式**每次确认切换**都同步调 FOLLOW.handoff_last_turn，而它直查**视图**
+#      v_turn_total（多层 VIEW + 每行 json_extract）→ 实测**单次 10304ms**，连切 5 次
+#      = 46 秒 UI 冻结（用户报的"切换不同 agent 时卡顿"）。
+# 修法：走 `wb_hover_core.turn_src()`（优先**物化表** dws_turn，同查询 12.7ms）+ 5s TTL 记忆。
+# 这节把"必须走物化表"和"有记忆"钉死，防日后又有人随手写回视图。
+import sqlite3                                                     # noqa: E402
+
+print("\n[F] 接续查询：必须走物化表 + TTL 记忆（切换不再冻结）")
+_TMPF = os.path.join(HERE, "_tmp_follow_test")
+os.makedirs(_TMPF, exist_ok=True)
+_NOW_S = time.strftime("%Y-%m-%d %H:%M:%S")                        # 刚结束的一轮
+_OLD_S = time.strftime("%Y-%m-%d %H:%M:%S",
+                       time.localtime(time.time() - 7200))         # 2 小时前（窗口外）
+
+
+def _make_dw(name, table_rows, view_rows=()):
+    """造一个最小数仓：dws_turn 物化表 + 可选的 v_turn_total 视图（两者数据故意不同）。"""
+    path = os.path.join(_TMPF, name)
+    if os.path.exists(path):
+        os.unlink(path)
+    con = sqlite3.connect(path)
+    con.execute("""CREATE TABLE dws_turn(agent TEXT, last_time TEXT, first_time TEXT,
+                                        title TEXT, project TEXT, user_prompt TEXT)""")
+    for a, lt, ti in table_rows:
+        con.execute("INSERT INTO dws_turn(agent,last_time,first_time,title,project,"
+                    "user_prompt) VALUES(?,?,?,?,'','')", (a, lt, lt, ti))
+    if view_rows:
+        sel = " UNION ALL ".join(
+            "SELECT '%s' AS agent, '%s' AS last_time, '%s' AS title,"
+            " '' AS project, '' AS user_prompt" % r for r in view_rows)
+        con.execute(f"CREATE VIEW v_turn_total AS {sel}")
+    con.commit()
+    con.close()
+    return path
+
+
+_dw_t = _make_dw("t1.db", [("workbuddy", _NOW_S, "表里的标题")],
+                 [("workbuddy", _NOW_S, "视图里的标题")])
+_con = sqlite3.connect(f"file:{_dw_t}?mode=ro", uri=True)
+check("F1: turn_src 优先物化表 dws_turn", W.turn_src(_con, _dw_t) == "dws_turn")
+_con.close()
+_dw_e = _make_dw("t2.db", [], [("workbuddy", _NOW_S, "视图里的标题")])
+_con = sqlite3.connect(f"file:{_dw_e}?mode=ro", uri=True)
+check("F2: 物化表是空的 → 回退视图（不读「假空」）",
+      W.turn_src(_con, _dw_e) == "v_turn_total")
+_con.close()
+
+FOLLOW._HANDOFF_CACHE.clear()
+_r = FOLLOW.handoff_last_turn(_dw_t, "workbuddy", time.time(), ttl=0)
+check("F3: 接续检测读物化表（不是那个 10 秒的视图）",
+      _r is not None and _r[1] == "表里的标题", f"got {_r}")
+FOLLOW._HANDOFF_CACHE.clear()
+_r2 = FOLLOW.handoff_last_turn(_dw_e, "workbuddy", time.time(), ttl=0)
+check("F4: 表为空时回退视图取数", _r2 is not None and _r2[1] == "视图里的标题", f"got {_r2}")
+
+FOLLOW._HANDOFF_CACHE.clear()
+_a = FOLLOW.handoff_last_turn(_dw_t, "workbuddy", time.time(), ttl=5.0)
+try:
+    os.unlink(_dw_t)                       # 把库删了：还能拿到上次结果 = 确实有记忆
+except OSError:
+    pass
+_b = FOLLOW.handoff_last_turn(_dw_t, "workbuddy", time.time(), ttl=5.0)
+check("F5: TTL 记忆生效（库都不在了仍返回上次结果，没再查库）",
+      _a is not None and _b == _a, f"{_a} / {_b}")
+FOLLOW._HANDOFF_CACHE.clear()
+
+try:
+    _paths = W.load_paths()
+    _t0 = time.perf_counter()
+    FOLLOW.handoff_last_turn(_paths["db_path"], "workbuddy", time.time(), ttl=0)
+    _dt = (time.perf_counter() - _t0) * 1000
+    check("F6: 真实库冷查 < 500ms（护栏：回退到直查视图会是 10000ms 级）",
+          _dt < 500, f"{_dt:.0f} ms")
+except Exception as _e:
+    check("F6: 真实库冷查 < 500ms（护栏：回退到直查视图会是 10000ms 级）", False, f"异常 {_e}")
+FOLLOW._HANDOFF_CACHE.clear()
+
 print(f"\n=== 总结 ===")
 print(f"PASS: {len(PASSED)}")
 print(f"FAIL: {len(FAILED)}")

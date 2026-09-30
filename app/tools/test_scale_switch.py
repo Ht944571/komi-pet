@@ -56,10 +56,11 @@ def legacy_recreate(app):
 def main():
     app = W.WhalePet(run_seconds=26)
 
-    # 写字本子 / 帧序列动画只在「有对话任务在跑」时接管画面（见 wb_notebook / wb_anim），
-    # 而本机此刻可能真有会话在跑 —— 本测试要验的是 **v3 立绘路径**，强制回 hidden 保证确定性。
-    app._anim_clip = None
-    app._nb.phase = "hidden"
+    # 帧序列现在是**唯一形态**，不能置 None —— 那样她会整个消失。
+    # 改为把动作钉在「待机」（循环段，帧号可预期），让画面在本测试里保持确定。
+    # （本机此刻若真有会话在跑，动作会被 _sync_bubble_mode 驱动，但画的始终是同一套帧，
+    #   不影响本测试要验的「重建窗口后定时器是否还活着」。）
+    app._wr.act = "idle"
     app._drawn_sig = None
     hwnd0 = app.hwnd
 
@@ -110,7 +111,7 @@ def main():
         time.sleep(0.6)
         report["before_react"] = {
             "particles": len(app._particles),
-            "react_until": round(app._react_until - time.time(), 2),
+            "wobble_until": round(app._wobble_until - time.time(), 2),
             "quote": app._quote,
         }
 
@@ -132,7 +133,7 @@ def main():
         time.sleep(0.6)
         report["after_react"] = {
             "particles": len(app._particles),
-            "react_until": round(app._react_until - time.time(), 2),
+            "wobble_until": round(app._wobble_until - time.time(), 2),
             "quote": app._quote,
         }
 
@@ -195,8 +196,8 @@ def main():
         print("FAIL: hwnd 被重建（定时器会随旧窗口销毁）"); ok = False
     if report["after_react"]["particles"] <= 0:
         print("FAIL: 切换后点击身体无粒子（互动反馈失效）"); ok = False
-    if report["after_react"]["react_until"] <= 0:
-        print("FAIL: 切换后点击身体无反应状态（_react 未生效）"); ok = False
+    if report["after_react"]["wobble_until"] <= 0:
+        print("FAIL: 切换后点击身体无反应状态（摇摆反馈未生效）"); ok = False
     d = report.get("dashboard", {})
     if d.get("bubble_dblclk") != 1:
         print("FAIL: 切换后双击泡泡未触发看板"); ok = False

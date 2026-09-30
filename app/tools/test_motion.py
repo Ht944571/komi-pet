@@ -3,7 +3,7 @@ r"""视觉交互改进回归测试（自动化验证，不依赖人工点击）
 
 验证点（对应提案）：
   1. 待机动效：呼吸 / 尾鳍 / 漂浮 位移非零（§1）
-  2. 眨眼状态机可触发（§1）
+  2. 写字帧序列（桌宠唯一形态）可持续取帧（§1）
   3. 情绪切换：成功 / 失败 / 空数据 / 待机 状态正确（§2）
   4. 数据情绪同步：服务异常→fail，空数据→empty，正常→neutral（§2）
   5. 按压压缩曲线压扁（§3）
@@ -44,12 +44,12 @@ def main():
         report["breath_max"] = round(max(breath_vals), 2)
         report["tail_max"] = round(max(tail_vals), 2)
         report["float_max"] = round(max(float_vals), 2)
-        report["eye_cfg"] = bool(app._eye_cfg)
-
-        # ② 眨眼：直接构造眨眼态（v3 BlinkScheduler 用 blink_t0/blink_total）
-        app._blinker.blink_t0 = now
-        app._blinker.blink_total = MOTION.BLINK_TOTAL_S
-        report["blink_closing"] = app._blinker.eye_opening_ratio(now + 0.03) < 1.0
+        # ② 写字帧序列（唯一形态）：各相位都能取到合法帧号
+        clip = app._anim_clip
+        report["anim_clip"] = bool(clip)
+        report["anim_idx_ok"] = bool(clip) and all(
+            0 <= clip.index(ph, now, now + 1.5) < clip.count
+            for ph in ("hidden", "appear", "writing", "present"))
 
         # ③ 情绪切换
         app.set_emotion(MOTION.EMOTION_SUCCESS)
@@ -79,8 +79,6 @@ def main():
         # ⑥ 闭眼眼睑 + 分层位移绘制不抛异常
         app._emotion = MOTION.EMOTION_NEUTRAL
         app._squash_t0 = 0.0
-        app._blinker.blink_t0 = time.time() + 0.5
-        app._blinker.blink_total = MOTION.BLINK_TOTAL_S
         app._gaze_dx = 1.0
         app._tail_dx = 1.5
         try:
@@ -110,8 +108,8 @@ def main():
         (report.get("breath_max", 0) > 0, "呼吸位移无值"),
         (report.get("tail_max", 0) > 0, "尾鳍位移无值"),
         (report.get("float_max", 0) > 0, "漂浮位移无值"),
-        (report.get("eye_cfg") is True, "眼部配置未加载（眨眼禁用）"),
-        (report.get("blink_closing") is True, "眨眼未触发"),
+        (report.get("anim_clip") is True, "写字帧序列素材未加载"),
+        (report.get("anim_idx_ok") is True, "写字帧取帧越界"),
         (report.get("emotion_success") == MOTION.EMOTION_SUCCESS, "成功情绪状态错误"),
         ((report.get("success_particles") or 0) > 0, "成功情绪无粒子"),
         (report.get("emotion_fail") == MOTION.EMOTION_FAIL, "失败情绪状态错误"),
@@ -119,7 +117,7 @@ def main():
         (report.get("sync_empty") == MOTION.EMOTION_EMPTY, "数据同步：空数据未映射到 empty"),
         (report.get("sync_neutral") == MOTION.EMOTION_NEUTRAL, "数据同步：正常未回落 neutral"),
         (0 < report.get("squash_min", 1.0) < 1.0, "按压压缩曲线未压扁"),
-        (report.get("draw_with_blink_tilt") is True, "闭眼+分层绘制抛异常"),
+        (report.get("draw_with_blink_tilt") is True, "整帧绘制抛异常"),
         (report.get("auto_degrade") == MOTION.QUALITY_LITE, "自动降级未触发 full→lite"),
     ]
     for passed, msg in checks:

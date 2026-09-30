@@ -94,7 +94,7 @@ app.api_ok = True
 app.db_ok = ok
 app.active = active
 app.latest_turn = latest
-app._today_timeline = lambda: ([], [])   # 跟随 P2：Stub 无时间线 → row3 走回退叙述
+app._today_timeline = lambda: ([], [])   # 已无关：row3 整体下线（2026-09-29），保留 stub 防意外查库
 row1, row2, row3 = W.WhalePet._bubble_lines(app)
 print(f"  row1: {row1}")
 print(f"  row2: {row2}")
@@ -107,6 +107,8 @@ check("S1: row2 显示 tokens",
       "tok" in row2, f"got: {row2}")
 check("S1: row2 用时非 0秒",
       "0秒" not in row2, f"got: {row2}")
+check("S1: row3 恒空（第三行已下线，任何时候不出现）",
+      row3 == "", f"got: {row3!r}")
 
 
 # ---- 场景 2：workbuddy 不可读 + ODS 有数据（ODS 兜底 active）----
@@ -165,9 +167,28 @@ check("S4: latest 为 None", latest is None)
 app.active = active
 app.latest_turn = None
 row1, row2, row3 = W.WhalePet._bubble_lines(app)
-print(f"  row1: {row1}")
-check("S4: row1 显示 '当前没有活跃会话'",
-      "当前没有活跃会话" in row1, f"got: {row1}")
+print(f"  row1: {row1!r}")
+check("S4: row1 空（不显示'当前没有活跃会话'）", row1 == "", f"got: {row1!r}")
+check("S4: row2 保留引导", "双击打开看板" in row2, f"got: {row2}")
+check("S4: row3 空（'数据每秒自动刷新'已删）", row3 == "", f"got: {row3!r}")
+
+# ---- S4b: row2 积分口径（2026-09-29 用户反馈）----
+print("\n[S4b] row2 积分文案（积分制 vs 非积分 agent）")
+app.active = []
+app.latest_turn = {"credit": 12.3, "total_tokens": 45600,
+                   "first_ts": now_ms - 60_000, "last_ts": now_ms - 1_000,
+                   "title": "t"}
+row1, row2, row3 = W.WhalePet._bubble_lines(app)
+print(f"  积分制 row2: {row2}")
+check("S4b1: credit>0 → 显示'本轮 X 积分'",
+      "12.3 积分" in row2 and " 0.0" not in row2 and " 分 " not in row2, f"got: {row2}")
+app.latest_turn = {"credit": 0, "total_tokens": 45600,
+                   "first_ts": now_ms - 60_000, "last_ts": now_ms - 1_000,
+                   "title": "t"}
+row1, row2, row3 = W.WhalePet._bubble_lines(app)
+print(f"  非积分 row2: {row2}")
+check("S4b2: credit=0（zcode/codex 等非积分）→ 不显示积分",
+      "积分" not in row2 and "0.0" not in row2 and "tok" in row2, f"got: {row2}")
 
 
 # ---- 场景 5：签名变化 ----

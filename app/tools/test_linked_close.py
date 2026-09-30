@@ -64,6 +64,10 @@ class PetStub:
     def _wb_alive(self, now):
         return self._wb_alive_val
 
+    def _host_alive(self):
+        # 2026-09-30 起 _check_linked_close 会把 presence 值写进 host_gone 事件
+        return None if not self._wb_alive_val else True
+
     def _report_event(self, *a, **k):
         self.events.append((a, k))
 
@@ -143,7 +147,10 @@ check("B8 恢复后重新计时（不沿用旧起点）",
 # B9 守望拉起（expected=True）但从未见过存活 → 也会在宽限后自退（防孤儿）
 s4 = PetStub(alive=False, expected=True)
 tick(s4, 400.0)
+# CONFIRM_CHECKS=3 → 起点后还要连续确认 3 次
 tick(s4, 400.0 + M.LINKED_CLOSE_GRACE_S + 0.5)
+tick(s4, 400.0 + M.LINKED_CLOSE_GRACE_S + 1.0)
+tick(s4, 400.0 + M.LINKED_CLOSE_GRACE_S + 1.5)
 check("B9 守望拉起但从未见存活 → 宽限后自退",
       s4._linked_closed is True, f"closed={s4._linked_closed}")
 
@@ -173,6 +180,62 @@ check("C5 换了别的 agent 但仍活跃（有→有）不触发", c(A, Z) is F
 check("C6 **最后一个 agent 退出（有→空）触发**", c(A, set()) is True)
 check("C7 探测未知（有→None）不触发、绝不误杀", c(A, None) is False)
 check("C8 首次即未知（未探测→None）不触发", c(None, None) is False)
+
+
+# ============================================================
+# Part D：守望侧**灭杀去抖**（2026-09-30：单轮判空立刻下手 = 一次瞬时误判就杀桌宠）
+# ============================================================
+print("\n[D] 守望灭杀去抖（连续 N 轮 + 跨度 ≥ S 秒才确认）")
+# ⚠️ 去抖器内部会 _log() 到 %TEMP%/komi-watcher.log（生产日志）。测试必须把它堵掉，
+#    否则每次跑测试都往里写「变空/取消」，排查线上问题时会把人带沟里
+#    （2026-09-30 就这么被自己的测试骗了一轮，以为是守望在 churn）。
+_log_saved, WATCH._log = WATCH._log, (lambda msg: None)
+d = WATCH.KillDebounce(rounds=3, seconds=10.0)
+check("D1 单轮判空不杀", d.feed(True, 100.0) is False)
+check("D2 连续多轮但跨度不足不杀",
+      d.feed(True, 104.0) is False and d.feed(True, 107.0) is False)
+check("D3 轮数与跨度都够 → 确认", d.feed(True, 110.0) is True)
+d.feed(True, 111.0)
+check("D4 agent 回来 → 计时取消（不再杀）", d.feed(False, 112.0) is False)
+check("D5 取消后重新计数（轮数不足不杀）",
+      d.feed(True, 113.0) is False and d.feed(True, 116.0) is False)
+d2 = WATCH.KillDebounce()
+check("D6 默认阈值与常量一致",
+      d2.rounds == WATCH.KILL_CONFIRM_ROUNDS and d2.seconds == WATCH.KILL_CONFIRM_S,
+      f"{d2.rounds}/{d2.seconds}")
+check("D7 去抖器的日志不会污染生产日志文件（测试里已静音）",
+      WATCH._log is not _log_saved, "")
+WATCH._log = _log_saved
+
+# ============================================================
+# Part E：看板 API 的兜底判定（桌宠 + 守望都没了 → 拉守望）
+# ============================================================
+print("\n[E] API 兜底判定 _watcher_needed")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "wb_usage"))          # wb_api 在 wb_usage/ 下
+import wb_api as API                                      # noqa: E402
+n = API._watcher_needed
+check("E1 桌宠还在 → 不拉", n(True, False, 1000.0, 0.0, 600.0) is False)
+check("E2 守望还在 → 不拉", n(False, True, 1000.0, 0.0, 600.0) is False)
+check("E3 都没了但冷却未到 → 不拉", n(False, False, 1200.0, 1000.0, 600.0) is False)
+check("E4 都没了且冷却已过 → 拉", n(False, False, 1700.0, 1000.0, 600.0) is True)
+
+# ============================================================
+# Part F：守望单实例互斥体（API 兜底靠它判断"守望还在不在"）
+# ============================================================
+print("\n[F] 守望单实例互斥体")
+_held = WATCH._mutex_held()
+# 环境里可能真有守望在跑（互斥体被它持有）——两种初始状态都要自洽
+if not _held:
+    check("F1 初始无人持有 → 本进程拿锁成功且可见",
+          WATCH._acquire_single_instance() is True and WATCH._mutex_held() is True)
+else:
+    check("F1 环境中已有守望（互斥体被持有）", True)
+# 第二次创建必然拿到 ERROR_ALREADY_EXISTS（无论是别的守望持有，还是本进程刚建的）
+# → 必须返回 False，调用方据此退出：这是"永不出现双守望"的判据本身。
+check("F2 互斥体已在手时再次创建 → 明确返回 False（不产生第二个守望）",
+      WATCH._acquire_single_instance() is False)
+check("F3 探测始终可见", WATCH._mutex_held() is True)
 
 
 print(f"\n=== 总结 ===\nPASS: {len(PASSED)}\nFAIL: {len(FAILED)}")

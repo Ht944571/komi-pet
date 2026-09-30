@@ -3,15 +3,17 @@
 """
 wb_whale_win.py — WorkBuddy 用量看板 · 古见同学桌宠（Windows 原生，纯 ctypes + GDI+）
 =====================================================================================
-路线 3 v3：按参考视频重做美术 ——
-  · 桌宠本体 = v3 立绘 PNG（`assets/pet_v3/pet_<state>.png`，Q 版 8 态 × 双朝向，
-    统一画布 + 按脸宽归一 → 切表情不跳尺寸；旧的 `assets/pet_*.png` 24 张已删除）
-  · 眨眼 = 分层差分贴片（`pet_v3/blink/`，真实像素，按闭合度取 6 档）
-  · 状态切换 = 交叉溶解（对齐参考视频）
-  · 气泡 = 深蓝描边椭圆想法框 + 双小圆点（对齐 195012 系列参考图样式）
-  · 状态立绘：有活跃会话/说话 → 开心脸；空闲 → 文静脸；贴左/右边缘自动镜像朝向屏幕中心
-  · 交互对齐 DeepSeek-Balance-Whale-Widget：拖拽四边吸附、按压 Q 弹、
-    单击切台词、双击开看板（自愈拉起服务）、右键菜单（大小 0.6–2.5x / 气泡开关 / 退出）
+2026-09-28 形态收敛：**桌宠只有一种形态** —— AI 视频转来的「抱着本子写字的她」
+
+  · 桌宠本体 = 写字帧序列（`assets/anim/write/`，49 帧 @12fps 真透明 PNG）
+    有任务在跑 → 循环播写字段；任务完成 → 播一遍翻页展示段；其余时间就是写字常态
+  · 气泡 = 深蓝描边椭圆想法框 + 双小圆点（数据态 / OK 完成态）
+  · 交互：拖拽四边吸附、按压 Q 弹、双击开看板（自愈拉起服务）、
+    右键菜单（大小 0.6–2.5x / 气泡开关 / 退出）
+
+⚠️ 已删除、别加回来的东西（都在 git 历史里）：v3 八表情立绘 + 分层差分眨眼 +
+   状态交叉溶解 + 点击部位切形态 + 程序化写字本子 + 高冷版 alt + 配件层 +
+   3D 立体摆件线 + Live2D 线 —— 理由见 docs/ 下对应的交接文档。
 
 数据链路零改动：wb_hover_core（workbuddy.db working 会话 + wb_usage_dw ODS），
 与 Web 看板同一份口径。依赖：仅 Python 标准库（ctypes）+ 系统 gdiplus。
@@ -46,6 +48,7 @@ from wb_hover_core import (                                   # noqa: E402
     load_pos, save_pos, report_state, log_exception, POLL_SEC, ERR_LOG,
     rotate_if_large, today_timeline,
     fmt_tokens, fmt_duration, fmt_duration_live, fmt_ago,
+    stale_working_sessions, repair_stale_working, turn_src,
 )
 
 # ---------- 运行时环境适配（源码运行 / 打包 exe：可写目录与自身唤起命令）----------
@@ -54,8 +57,7 @@ import wb_runtime as RT                                       # noqa: E402
 # ---------- 动效设计系统（节奏 / 幅度 / 缓动 / 情绪 / 降级，全部集中管理）----------
 import wb_motion as MOTION                                    # noqa: E402
 
-# ---------- 写字本子（任务进行中写字 / 完成后展示；纯逻辑可单测）----------
-import wb_notebook as NOTEBOOK                                # noqa: E402
+# ---------- 写字动作：帧序列素材 + 相位状态机（纯逻辑，可直接单测）----------
 import wb_anim as ANIM                                         # noqa: E402
 
 # ---------- 跟随模式（聚焦信号）：纯逻辑层（去抖状态机 / 前台→agent 推断）----------
@@ -79,11 +81,12 @@ BASE_BUB_H = 128               # 气泡椭圆高
 BASE_BUBBLE_H = 162            # 气泡区总高（含想法小圆）
 # 主气泡椭圆底 → 立绘实际头顶 的连线跨度（基准 scale=1.0）。
 # ⚠️ 气泡**不再钉死在窗口顶部**，而是锚在「头顶上方 BUBBLE_CHAIN_PX」处 ——
-# 因为各态头顶在立绘区里上下浮动可达 150px（见 _sprite_content_top），
+# ⚠️ 气泡**不再钉死在窗口顶部**，而是锚在「写字帧内容顶上方 BUBBLE_CHAIN_PX」处 ——
+# 帧上方有大量透明留白，钉死在顶部会让气泡离脑袋空出一大截。
 # 钉死在顶部会让 idle/stone 时气泡离脑袋空出 100+px。
 # 调大 = 气泡离脑袋更远，调小 = 更近。
 BUBBLE_CHAIN_PX = 40
-# 立绘区高。v3 立绘是**统一画布 1191×1627**（内容只占约 60% 高，见 tools/build_pet_v3.py），
+# 写字帧区高。帧画布是 420×565（内容只占约 64% 高，见 tools/video_to_pet_frames.py），
 # 若仍用旧的 210，角色会比旧版小约 40%。按内容反算：
 #   旧 823×981 画到 210px → 角色实高 ≈ 207px；新 idle 内容 999/1627 → 210×1627/999 ≈ 342
 BASE_PET_H = 342               # 立绘区高（v3 统一画布）
@@ -101,21 +104,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 POS_FILE = os.path.join(RT.data_dir(), ".whale_pos.json")
 SETTINGS_FILE = os.path.join(RT.data_dir(), ".whale_settings.json")
 ASSETS_DIR = os.path.join(RT.bundle_dir(), "assets")
-# v3 立绘目录（8 态、统一画布、按脸宽归一）——由 tools/build_pet_v3.py 生成。
-# 高冷版（alt_*）已停用：审美线统一到 v3 的 Q 版，见 docs/眨眼重构交接-2026-09-26.md。
-SPRITE_DIR = os.path.join(ASSETS_DIR, "pet_v3")
-EYE_CFG_FILE = os.path.join(SPRITE_DIR, "_eye_config.json")
-# 眨眼贴片（分层差分）：每个态一张「闭眼」贴片 + 在画布里的矩形。
-# 由 tools/build_blink_patches.py 从 ImageGen 的闭眼变体里抠出（alpha = 与睁眼图的 diff 幅度）。
-BLINK_DIR = os.path.join(SPRITE_DIR, "blink")
-BLINK_MANIFEST = os.path.join(BLINK_DIR, "_patches.json")
-# 立绘几何元数据（构建期产出）：内容框 content_box = 角色本体在画布里的归一化矩形。
-# 点击分区要用它 —— v3 是统一画布 + 底部对齐，角色上方留空，按「立绘区高度的百分比」
-# 分区会让"点头顶判成 face、点眼睛判成 body"（实测 8 态里 7 态错）。
-META_FILE = os.path.join(SPRITE_DIR, "_build_meta.json")
-
-# 反应态集合：与立绘态同名，_draw_pet 直接取用（v3 新增 joy / surprise）
-REACT_FACES = ("blush", "pout", "stone", "joy", "surprise")
+# 写字帧序列目录（桌宠唯一形态）——由 tools/video_to_pet_frames.py 生成。
+ANIM_DIR = os.path.join(ASSETS_DIR, "anim")
 
 
 # ---------- 配色（古见同学主题：制服蓝 / 领结红 / 深紫黑 / 灰紫，对齐古见同学展示页）----------
@@ -124,6 +114,7 @@ C_BUBBLE_LINE = 0xFF39406B     # 气泡描边制服蓝（展示页 --navy）
 C_TXT_HEAD = 0xFFB4364F        # 标题领结红（展示页 --crimson 强调色）
 C_TXT_MAIN = 0xFF2A2438        # 正文深紫黑（展示页 --ink）
 C_TXT_DIM = 0xFF6A6284         # 次级灰紫（展示页 --ink-2）
+C_TXT_PINK = 0xFFE89AAE        # 积分强调樱花粉（展示页 --sakura，"本轮 X 积分"专用）
 C_SHADOW = 0x1F39406B          # 立绘底部浅影（制服蓝淡）
 
 # ---------- 气泡形态（状态机两态）----------
@@ -197,71 +188,54 @@ def ok_spec(lay, style=None, bub_y=None):
         "dot_r": bh * (3.6 / 128), "dot_gap": bh * (12 / 128),
     }
 
-# ---------- 互动反应：古见同学风格台词库（按点击频率分档）----------
+# ---------- 互动反应：古见同学风格台词（长按时用）----------
 # 古见人设：交流障碍症，几乎不说话，用笔记本/动作/微表情表达，内心戏丰富
-QUOTES_SHY = [                       # 1-2 次：害羞（睫毛颤动，耳朵尖红）
-    "（睫毛颤了颤）……诶？",
-    "（耳朵尖悄悄红了）戳、戳我吗？",
-    "（在笔记本上写：吓我一跳）",
-    "（僵住三秒，然后轻轻点头）",
-]
-QUOTES_TSUNDERE = [                  # 3-4 次：紧张（开始石像化，移开视线）
+# ⚠️ 2026-09-28：按点击频率分档的三组（SHY/POUT/OUTBURST）与按备注部位的三组
+#   （HEAD/FACE/SKIRT）随「点击切形态」一并删除，只剩长按用的这一组。
+QUOTES_TSUNDERE = [                  # 长按：紧张（开始石像化，移开视线）
     "（身体开始僵硬）……人、人有点多",
     "（写：请、请轻一点）",
     "（往后缩了半步，长发跟着抖了抖）",
     "（偷偷看你一眼，又飞快移开视线）",
 ]
-QUOTES_POUT = [                      # 5-6 次：傲娇（托腮半眯眼）
-    "（托腮，半眯着眼睛看你）",
-    "（把笔记本举到你面前：适可而止）",
-    "（写：生气了。大概。）",
-    "（哼——耳朵不服气地抖了抖）",
-]
-QUOTES_OUTBURST = [                  # 7+ 次：石化爆发（疯狂摇头，泪目）
-    "（疯狂摇头：等等等等等——）",
-    "（泪目，浑身僵硬到仿佛发光）",
-    "（把笔记本拍到桌上：STOP！）",
-    "（抱着头蹲下去：太、太近了啦……）",
-]
-
-# ---- 部位点击触发的形态 + 台词（提案 §3：点头部/脸/身体/裙摆）----
-#   head: 摸头 → 害羞低头（用 happy 表情 + 飘爱心）
-#   face: 戳脸 → 紧张石像化（stone 表情 + 红晕）
-#   body: 戳身体 → 普通互动（沿用 _react 四档）
-#   skirt: 戳裙摆 → 委屈嘟嘴（pout 表情 + 喷水）
-QUOTES_HEAD = [                      # 摸头
-    "（微微低头）……这样、这样温柔可以吗",
-    "（长发垂下遮住半边脸）……谢谢",
-    "（耳朵红透）——请、请不要停太久",
-    "（在笔记本上写：被摸头会……没办法思考）",
-]
-QUOTES_FACE = [                      # 戳脸
-    "（僵住三秒）……………………诶？",
-    "（石化）……（笔记本掉地上）",
-    "（眼睛瞪大，全身僵硬到无法呼吸）",
-    "（小声）——那里、不、不能戳……",
-]
-QUOTES_SKIRT = [                     # 戳裙摆
-    "（猛地后退，脸涨通红）——！",
-    "（用笔记本挡住裙摆）请、请不要这样……",
-    "（眼眶微红）……为什么、要做这种事……",
-    "（石像化 + 裙摆被风吹起）——啊、啊！",
-]
-
-# 点击身体部位后保持的时长（秒）：让用户看清形态 + 台词，不一闪而过
-MORPH_HOLD_S = 4.0
 REACT_WINDOW = 5.0                   # 点击计数的滑动窗口（秒）
-ANIM_MS = 66                         # 动画帧间隔（~15fps，常驻：呼吸/粒子/漂移/调度）
+ANIM_MS = 41                         # 动画帧间隔（≈24fps，**与帧素材同帧率**）
+# ⚠️ 这个值必须 ≥ 素材帧率，否则等于白转：2026-09-28 素材按源片 24fps 重转后，
+#    这里还停在 66ms（15fps）会每秒丢掉 9 帧。改 41ms ≈ 24.4fps。
+# ⚠️ 光有 41 还不够 —— 系统默认定时器粒度是 15.6ms，SetTimer(41) 实际会被拉长到
+#    **46.8ms**：2026-09-30 实测写字态只有 21.5fps，且按墙钟取帧会**不规则跳帧**
+#    （111 个 tick 里 14 次一次跳 2 帧 >> 用户看到的"写字不流畅"）。
+#    解法 = `_high_res_timer_on()`（进程级 timeBeginPeriod(1)）+ 取帧时「单 tick 最多推进 1 帧」。
 IDLE_AFTER = float(os.environ.get("WB_WHALE_IDLE_AFTER", "20"))      # 无交互 N 秒后进入自主玩耍
 BEHAVIOR_MIN = float(os.environ.get("WB_WHALE_BEHAVIOR_MIN", "6"))   # 自主行为间隔下限
 BEHAVIOR_MAX = float(os.environ.get("WB_WHALE_BEHAVIOR_MAX", "14"))  # 上限（随机化防机械感）
 GREET_DELAY = float(os.environ.get("WB_WHALE_GREET_DELAY", "1.5"))   # 启动后打招呼延迟
+
+# ---- 「写字态」防卡死三件套（2026-09-29 事故后加）----
+# 事故现象：桌宠一直卡在写字状态，怎么都不坐下。
+# 三个独立成因，这里各配一道闸：
+#   ① 判据抖动：宿主 working 行/数据源抖动 → n 在 0↔1 之间跳（实测一天 142 次
+#      write_task_start、只有 3 次 done）→ 她不停上演"拿本子→坐下→拿本子"。
+#      → 活跃数**下降**加确认窗口（上升立即生效，来任务还是要马上响应）。
+ACTIVE_FALL_DEBOUNCE_S = 3.0
+#   ② 读数持续失败：数仓读不出来时，为了不闪烁会保留上次的 active，
+#      于是"永远记得有任务在跑"。连续失败超过这个时长就不再替它记着。
+READ_STALE_SEC = 90.0
+#   ③ 残留 working 行：原来只在**启动时**修一次，中途卡住的会话要等下次重启才治。
+#      改成周期自愈（后台线程，判定仍走保守的 WB_STALE_AFTER_SEC=900）。
+REPAIR_EVERY_SEC = 600.0
 
 # ---------- Win32 常量 ----------
 WS_POPUP = 0x80000000
 WS_EX_LAYERED = 0x00080000
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+# ⚠️ WS_EX_TRANSPARENT = 鼠标**穿透**（窗口不接受命中，消息落给下层）。
+#    它和 WS_EX_TOPMOST(0x8) 长得很像但完全是两回事 —— 2026-09-29 菜单窗口就是
+#    把 0x20 当成 TOPMOST 手写进去，导致「菜单被桌宠盖住 + 鼠标全穿透」。
+#    **窗口扩展样式一律用具名常量，禁止再写字面量。**
+WS_EX_TRANSPARENT = 0x00000020
 WM_TIMER = 0x0113
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -272,10 +246,12 @@ WM_MOUSEACTIVATE = 0x0021
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_NULL = 0x0000
+WM_COMMAND = 0x0111           # 菜单命令通知（TPM_RETURNCMD 下不出现，防御性忽略）
 MA_NOACTIVATE = 3
 MK_LBUTTON = 0x0001
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 HWND_TOPMOST = -1
 SW_SHOWNA = 8
@@ -309,6 +285,7 @@ IDM_TIMELINE0 = 1400           # 1400：今日时间线摘要项；1401+i ↔ �
 IDM_FOCUS0 = 1450              # 1450+i ↔ 手动聚焦候选[i]（登记册启用 agent）
 IDM_HANDOFF = 1010             # 生成接续摘要 → 剪贴板（跟随模式 P4；仅角标活跃时出现）
 IDM_UPDATE = 1011              # 检查更新 / 更新到 vX（仅配置了更新源时出现）
+IDM_REPAIR = 1012              # 修复卡死会话（残留 working 清库；仅检测到残留时出现）
 ID_HOTKEY_FOLLOW = 1           # 全局热键 id（RegisterHotKey 的 id 命名空间独立于定时器）
 IDM_SCALE0 = 1100              # 1100+i ↔ SCALES[i]
 SCALES = (0.6, 0.8, 1.0, 1.5, 2.0, 2.5)
@@ -318,13 +295,71 @@ QUALITY_CHOICES = (
     (MOTION.QUALITY_LITE, "精简"),
     (MOTION.QUALITY_OFF, "关闭"),
 )
-IDM_STYLE0 = 1300               # 1300+i ↔ STYLE_CHOICES[i]（双版本形态风格）
-STYLE_CHOICES = (
-    ("q",   "Q 版（萌系）"),
-    ("alt", "高冷版（清冷）"),
-)
 ID_TIMER_ANIM = 5              # 反应动画定时器
 CLASS_NAME = "WBWhalePetClass"
+
+# ---- 右键菜单 owner-draw（美术 = 用量看板 dashboard.html 的设计语言）----
+MF_OWNERDRAW = 0x00000100   # ⚠️ Win32 SDK 真值（曾手抄成 0xB0 → 系统把 itemData 当
+                            #    字符串指针解引用 → access violation，菜单弹不出来）
+WM_DRAWITEM = 0x002B        # ⚠️ SDK 真值（曾手抄成 0x021B——那是 WM_EXITMENULOOP）
+WM_MEASUREITEM = 0x002C     # ⚠️ SDK 真值（曾手抄成 0x0211——那是 WM_ENTERMENULOOP，
+                            #    lparam 恒 0 → cast 炸 NULL，measure 全落空 → 菜单缩成默认尺寸）
+ODS_SELECTED, ODS_DISABLED, ODS_CHECKED = 0x0001, 0x0004, 0x0008
+MIM_BACKGROUND, MIM_APPLYTOSUBMENUS = 0x00000002, 0x80000000
+ETO_CLIPPED, TRANSPARENT_BK, PS_NULL, NULL_BRUSH_STOCK = 0x0004, 1, 5, 5
+# 色板：web 十六进制（#RRGGBB），GDI 用前经 _bgr() 转 COLORREF(0x00BBGGRR)
+MENU_BG      = 0xFFFFFF   # --card      菜单卡底
+MENU_HOVER   = 0xEFEAF7   # --bg-soft   悬停/选中底（看板 .rs-list 选中态同款）
+MENU_HOVER_D = 0xF7ECEF   # 悬停底的危险色变体（crimson 调淡）
+MENU_INK     = 0x2A2438   # --ink       正文
+MENU_INK_DIM = 0x9C94B5   # --ink-3     禁用 / 子菜单箭头
+MENU_SEL_TX  = 0x4F3F6E   # --violet-d  选中文字
+MENU_VIOLET  = 0x6B5B8A   # --violet    勾选圆点
+MENU_DOT_OFF = 0xC9C2D6   # 未勾选圆点描边
+MENU_LINE    = 0xE5DFEA   # --line      分隔线
+MENU_DANGER  = 0xB4364F   # --crimson   危险项（退出 / 修复卡死会话）
+MENU_DANGER_HOVER = 0x8E2A3E   # --crimson-d
+MENU_ITEM_H, MENU_SEP_H, MENU_W = 32, 9, 272   # 96dpi 基准，按窗口 DPI 缩放
+
+
+def menu_metrics(dpi):
+    """菜单绘制度量（96dpi 基准按窗口 DPI 缩放）。"""
+    s = dpi / 96.0
+    return {"w": round(MENU_W * s), "h": round(MENU_ITEM_H * s),
+            "sep_h": round(MENU_SEP_H * s), "inset": round(2 * s),
+            "r": round(7 * s), "pad": round(10 * s), "pad_v": round(6 * s),
+            "dot_x": round(22 * s), "dot_r": round(4 * s),
+            "tx": round(36 * s), "arrow_w": round(20 * s),
+            "font_h": max(11, round(13 * s)),
+            "font_px": max(12, round(14 * s))}
+
+
+def menu_item_style(meta, selected, checked, disabled):
+    """菜单 item 的绘制决策（纯函数，配色=看板规范；test_menu_toggles [G] 断言）。
+
+    对应看板 .rs-list button 的三态语言：常态墨色、悬停淡紫底+深紫粗体、
+    禁用灰紫；开关项左侧实心/空心圆点；危险项（退出等）用领结红。
+    """
+    if meta.get("sep"):
+        return {"kind": "sep"}
+    danger = bool(meta.get("danger"))
+    if disabled:
+        return {"kind": "item", "bg": None, "text": MENU_INK_DIM, "bold": False,
+                "dot": False, "dot_filled": False, "arrow": meta.get("arrow"),
+                "danger": False}
+    if selected:
+        return {"kind": "item", "bg": MENU_HOVER_D if danger else MENU_HOVER,
+                "text": MENU_DANGER_HOVER if danger else MENU_SEL_TX,
+                "bold": True, "dot": True, "dot_filled": checked,
+                "arrow": meta.get("arrow"), "danger": danger}
+    return {"kind": "item", "bg": None, "text": MENU_DANGER if danger else MENU_INK,
+            "bold": False, "dot": True, "dot_filled": checked,
+            "arrow": meta.get("arrow"), "danger": danger}
+
+
+# （原 owner-draw 的 _menu_fonts / _paint_menu_item 两个 GDI 绘制函数已随
+#   TrackPopupMenu 方案退役删除；现在绘制在 MenuSession._render_item 里用
+#   Surface 的 GDI+ 原语完成，配色仍走 menu_item_style。）
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -334,6 +369,71 @@ try:
     _gdiplus = ctypes.WinDLL("gdiplus", use_last_error=True)
 except OSError:
     _gdiplus = None
+try:
+    _winmm = ctypes.WinDLL("winmm", use_last_error=True)
+except OSError:
+    _winmm = None
+
+_HIRES_TIMER_ON = False
+
+
+def _high_res_timer_on():
+    """把本进程的定时器精度提到 1ms（`timeBeginPeriod(1)`），返回是否成功。
+
+    **为什么必须做**：Windows 默认定时器粒度 15.6ms → `SetTimer(41)` 实际 46.8ms。
+    动画按墙钟取帧（`AnimClip.index`），于是每 8 个 tick 就有一次「一次跳 2 帧」，
+    肉眼就是**一顿一顿**（2026-09-30 实测写字态 21.5fps / 111 tick 里 14 次跳帧）。
+    提精度后 tick 回到 41ms → 真 24.4fps，跳帧基本消失。
+    Win10 1803+ 起这是**进程级**设置，不影响其他程序；代价只是本进程略增唤醒频率。
+    """
+    global _HIRES_TIMER_ON
+    if _HIRES_TIMER_ON:
+        return True
+    if _winmm is None:
+        return False
+    try:
+        _winmm.timeBeginPeriod(1)
+        _HIRES_TIMER_ON = True
+        return True
+    except Exception:
+        return False
+
+
+# ---- 高精度动画时钟（2026-09-30 修「写字不流畅」）----
+# 实测：系统默认定时器粒度 15.6ms → `SetTimer(41)` 真实周期 **46.8ms**（动画 21.3fps）；
+# 且本机 `timeBeginPeriod(1)` **无效**（调用成功、周期不变）。改用高精度可等待定时器
+# （Win10 1803+ 的 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`，走内核高精度时钟）
+# + 后台线程 PostMessage 投递 —— 实测能稳定给出 41ms。
+WM_APP_ANIM = 0x8000 + 41            # 时钟线程投递的动画 tick（自绘消息，不走 WM_TIMER）
+
+_CWT_HIGH_RESOLUTION = 0x00000002
+_CWT_ALL_ACCESS = 0x1F0003
+_WAIT_OBJECT_0 = 0x00000000
+
+
+def _make_hires_timer(period_ms):
+    """建一个 1ms 精度、周期 `period_ms` 的可等待定时器；系统不支持 → None。"""
+    if _kernel32 is None:
+        return None
+    try:
+        _kernel32.CreateWaitableTimerExW.restype = wt.HANDLE
+        _kernel32.CreateWaitableTimerExW.argtypes = [
+            ctypes.c_void_p, wt.LPCWSTR, wt.DWORD, wt.DWORD]
+        h = _kernel32.CreateWaitableTimerExW(
+            None, None, _CWT_HIGH_RESOLUTION, _CWT_ALL_ACCESS)
+        if not h:
+            return None
+        _kernel32.SetWaitableTimer.argtypes = [
+            wt.HANDLE, ctypes.POINTER(ctypes.c_longlong), ctypes.c_long,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        due = ctypes.c_longlong(-int(period_ms) * 10000)   # 100ns 单位；负数 = 相对时间
+        if not _kernel32.SetWaitableTimer(h, ctypes.byref(due), int(period_ms),
+                                          None, None, 0):
+            _kernel32.CloseHandle(h)
+            return None
+        return h
+    except Exception:
+        return None
 
 
 def _set_dpi_aware():
@@ -370,6 +470,25 @@ class POINT(ctypes.Structure):
 
 class SIZE(ctypes.Structure):
     _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class MEASUREITEMSTRUCT(ctypes.Structure):
+    _fields_ = [("CtlType", wt.UINT), ("CtlID", wt.UINT), ("itemID", wt.UINT),
+                ("itemWidth", wt.UINT), ("itemHeight", wt.UINT),
+                ("itemData", ctypes.c_size_t)]
+
+
+class DRAWITEMSTRUCT(ctypes.Structure):
+    _fields_ = [("CtlType", wt.UINT), ("CtlID", wt.UINT), ("itemID", wt.UINT),
+                ("itemAction", wt.UINT), ("itemState", wt.UINT),
+                ("hwndItem", wt.HWND), ("hDC", wt.HDC), ("rcItem", RECT),
+                ("itemData", ctypes.c_size_t)]
+
+
+class MENUINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwMask", wt.UINT), ("dwStyle", wt.UINT),
+                ("cyMax", wt.UINT), ("hbrBack", wt.HBRUSH),
+                ("dwContextHelpID", wt.DWORD), ("dwMenuData", ctypes.c_size_t)]
 
 
 class BLENDFUNCTION(ctypes.Structure):
@@ -459,8 +578,39 @@ _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 _user32.GetDoubleClickTime.restype = wt.UINT
 _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 _user32.SetForegroundWindow.argtypes = [wt.HWND]
-_user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+_user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, ctypes.c_size_t]
 _user32.DestroyMenu.argtypes = [wt.HMENU]
+# ---- owner-draw 菜单：owner 窗口收测量/绘制消息，GDI 自绘 item ----
+_user32.GetDpiForWindow.restype = wt.UINT
+_user32.GetDpiForWindow.argtypes = [wt.HWND]
+_user32.SetMenuInfo.restype = wt.BOOL
+_user32.SetMenuInfo.argtypes = [wt.HMENU, ctypes.POINTER(MENUINFO)]
+_user32.FillRect.restype = ctypes.c_int
+_user32.FillRect.argtypes = [wt.HDC, ctypes.POINTER(RECT), wt.HBRUSH]
+_gdi32.Polygon.restype = wt.BOOL
+_gdi32.Polygon.argtypes = [wt.HDC, ctypes.POINTER(POINT), ctypes.c_int]
+_gdi32.CreateSolidBrush.restype = wt.HBRUSH
+_gdi32.CreateSolidBrush.argtypes = [wt.COLORREF]
+_gdi32.CreatePen.restype = wt.HGDIOBJ
+_gdi32.CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, wt.COLORREF]
+_gdi32.CreateFontW.restype = wt.HFONT
+_gdi32.CreateFontW.argtypes = [ctypes.c_int] * 13 + [wt.LPCWSTR]
+_gdi32.SetBkMode.restype = ctypes.c_int
+_gdi32.SetBkMode.argtypes = [wt.HDC, ctypes.c_int]
+_gdi32.SetTextColor.restype = wt.COLORREF
+_gdi32.SetTextColor.argtypes = [wt.HDC, wt.COLORREF]
+_gdi32.ExtTextOutW.restype = wt.BOOL
+_gdi32.ExtTextOutW.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, wt.UINT,
+                               ctypes.POINTER(RECT), wt.LPCWSTR, wt.UINT,
+                               ctypes.POINTER(ctypes.c_int)]
+_gdi32.RoundRect.restype = wt.BOOL
+_gdi32.RoundRect.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_gdi32.Ellipse.restype = wt.BOOL
+_gdi32.Ellipse.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_int]
+_gdi32.GetStockObject.restype = wt.HGDIOBJ
+_gdi32.GetStockObject.argtypes = [ctypes.c_int]
 _user32.EnumWindows.restype = wt.BOOL
 _user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM), wt.LPARAM]
 _user32.GetForegroundWindow.restype = wt.HWND
@@ -680,7 +830,7 @@ class Surface:
         _DrawImageRectI(self.g, img, int(x), int(self._fy(y, h)), int(w), int(h))
 
     def image_rot(self, img, iw, ih, x, y, w, h, deg):
-        """把位图画进 (x,y,w,h) 并绕**中心**旋转 deg 度（写字本子的倾斜）。
+        """把位图画进 (x,y,w,h) 并绕**中心**旋转 deg 度。
 
         走 GDI+ 的平行四边形映射：给 3 个目标点即可，缩放与旋转一次完成，
         比"自己重采样 + 逐帧旋转"省得多。
@@ -758,6 +908,34 @@ class Surface:
         _DeleteBrush(b)
         _DeletePath(path)
 
+    def round_rect(self, argb, x, y, w, h, r, line_argb=None, line_w=1.0):
+        """圆角矩形（右键菜单卡片/悬停高亮用；GDI+ path 四边四弧，alpha 全通道）。"""
+        if w <= 0 or h <= 0:
+            return
+        r = min(r, w / 2, h / 2)
+        path = P()
+        _CreatePath(0, ctypes.byref(path))
+        fy = self._fy
+        _AddPathArc(path, F(x + w - r), F(fy(y + r, 0)), F(2 * r), F(2 * r),
+                    F(-90.0), F(90.0))
+        _AddPathArc(path, F(x + w - r), F(fy(y + h - r, 0)), F(2 * r), F(2 * r),
+                    F(0.0), F(90.0))
+        _AddPathArc(path, F(x + r), F(fy(y + h - r, 0)), F(2 * r), F(2 * r),
+                    F(90.0), F(90.0))
+        _AddPathArc(path, F(x + r), F(fy(y + r, 0)), F(2 * r), F(2 * r),
+                    F(180.0), F(90.0))
+        _CloseFigure(path)
+        b = P()
+        _SolidFill(argb, ctypes.byref(b))
+        _FillPath(self.g, b, path)
+        _DeleteBrush(b)
+        if line_argb is not None:
+            p = P()
+            _CreatePen(line_argb, float(line_w), UNIT_PIXEL, ctypes.byref(p))
+            _DrawPath(self.g, p, path)
+            _DeletePen(p)
+        _DeletePath(path)
+
     def heart(self, cx, cy, r, argb):
         """小心形：双圆 + 下三角。"""
         hr = r * 0.55
@@ -818,9 +996,10 @@ class Surface:
         dst = POINT(r.left, r.top)
         blend = BLENDFUNCTION(0, 0, 255, AC_SRC_ALPHA)
         hdc_screen = _user32.GetDC(None)
-        _user32.UpdateLayeredWindow(hwnd, hdc_screen, ctypes.byref(dst), ctypes.byref(size),
-                                    self.hdc, ctypes.byref(src), 0, ctypes.byref(blend), ULW_ALPHA)
+        ok = _user32.UpdateLayeredWindow(hwnd, hdc_screen, ctypes.byref(dst), ctypes.byref(size),
+                                         self.hdc, ctypes.byref(src), 0, ctypes.byref(blend), ULW_ALPHA)
         _user32.ReleaseDC(None, hdc_screen)
+        return bool(ok)
 
     def close(self):
         try:
@@ -833,6 +1012,485 @@ class Surface:
             _gdi32.DeleteDC(self.hdc)
         except Exception:
             pass
+
+
+# ================= 自绘右键菜单（MenuSession） =================
+# 为什么不用 TrackPopupMenu owner-draw（2026-09-29 实测结论）：
+# Win11 的系统菜单窗口**背景合成不可控**——MIM_BACKGROUND 铺底不可靠，未绘制区域
+# 在 DWM 合成时透出下层窗口（视觉=文字与桌面内容"重叠"），hover 切换的擦除时机
+# 也管不到。这里改用与桌宠本体同款的自绘分层窗口（ULW，逐像素不透明 alpha），
+# 每帧全量重绘，背景天然不透明——重叠/残影/透明三类问题一起消失。
+# 语义对齐 TrackPopupMenu(TPM_RETURNCMD)：run() 模态跑消息循环，返回选中 cmd / 0。
+# 条目 = {"label","cmd","checked","disabled","danger","sep","sub":[条目...]}（sub 仅一层）。
+
+WM_KEYDOWN = 0x0100          # （模块原本未定义，菜单键盘 Esc 用）
+WM_ACTIVATE = 0x0006         # 失活 → 关菜单（点外部由 capture 兜底，这里是 Alt-Tab 路）
+WM_RBUTTONDOWN = 0x0204
+WM_RBUTTONUP = 0x0205        # （与模块首部同名常量一致；这里为菜单段落就近自证）
+_MENU_VK_ESCAPE = 0x1B
+_MENU_SHADOW = 14              # 窗口四边的阴影外边距（px @96dpi）
+# 子菜单**悬停停留**才展开（原生菜单行为）。原来一 hover 就展开 —— 鼠标顺着菜单往下扫时
+# 会一路"闪"（每个带子菜单的条目都开一次窗口、再销毁，实测 12ms/次），既卡又吵。
+SUB_OPEN_DELAY_S = 0.14
+ID_TIMER_SUB = 6               # 子菜单延迟展开的轮询定时器（挂在菜单窗口上）
+
+
+def menu_layout(items, m):
+    """条目 → 行布局 [(y0, y1, item), ...] 与内容总高（纯函数，[H] 单测）。"""
+    rows, y = [], m["pad_v"]
+    for it in items:
+        h = m["sep_h"] if it.get("sep") else m["h"]
+        rows.append((y, y + h, it))
+        y += h
+    return rows, y + m["pad_v"]
+
+
+def menu_hit(rows, y):
+    """本地 y → 条目下标；间隙/越界 → None（纯函数）。"""
+    for i, (y0, y1, _it) in enumerate(rows):
+        if y0 <= y < y1:
+            return i
+    return None
+
+
+class MenuSession:
+    _registered = False
+
+    def __init__(self, items, dpi=96):
+        self.items = items
+        self.m = menu_metrics(dpi)
+        self.scale = dpi / 96.0
+        self.margins = round(_MENU_SHADOW * self.scale)
+        self._cmd = 0
+        self._done = False
+        self._hover = None          # 主菜单悬停下标
+        self._sub = None            # {"item","hwnd","surf","rect","rows","content_h","hover"}
+        self._sub_pending = None    # (下标, 起始时刻)：停留够久才展开的子菜单
+        self._sub_timer_on = False
+        self.hwnd = None
+        self.surf = None
+        self._rows, self._content_h = menu_layout(items, self.m)
+
+    # ---------- 几何 ----------
+    def _win_size(self, content_h):
+        return (self.m["w"] + 2 * self.margins,
+                content_h + 2 * self.margins)
+
+    def _place(self, pt):
+        """弹出点 → 主窗口 (l, t)，防溢出屏幕（工作区）。"""
+        W, H = self._win_size(self._content_h)
+        wa = RECT()
+        _user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)   # SPI_GETWORKAREA
+        l = min(max(pt[0] - 4, wa.left), wa.right - W)
+        t = min(max(pt[1] - 4, wa.top), wa.bottom - H)
+        return l, t, W, H
+
+    def _sub_rect(self, item_idx):
+        """子菜单窗口位置：父条目右侧衔接，右溢出改左侧。"""
+        it = self.items[item_idx]
+        rows, ch = menu_layout(it.get("sub") or [], self.m)
+        W, H = self._win_size(ch)
+        y0, _y1, _ = self._rows[item_idx]
+        pr = RECT()
+        _user32.GetWindowRect(self.hwnd, ctypes.byref(pr))
+        wa = RECT()
+        _user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)
+        l = pr.right - self.margins + 2
+        if l + W > wa.right:
+            l = pr.left + self.margins - W - 2
+        t = min(max(pr.top + self.margins + y0 - 3, wa.top), max(wa.bottom - H, wa.top))
+        return l, t, W, H, rows, ch
+
+    # ---------- 绘制（全 GDI+，alpha 全通道） ----------
+    def _argb(self, c):
+        return 0xFF000000 | (c & 0xFFFFFF)
+
+    def _render(self):
+        s, m = self.surf, self.m
+        s.clear()
+        W, H = s.w, s.h
+        # 阴影：由外向内三层渐强黑（柔和近似）
+        for i, a in enumerate((0x24, 0x3C, 0x55)):
+            e = self.margins - 4 * i
+            s.round_rect((a << 24), e, e, W - 2 * e, H - 2 * e,
+                         self.m["r"] + 6 - i * 2)
+        # 白卡 + 描边
+        s.round_rect(self._argb(MENU_BG), self.margins, self.margins,
+                     m["w"], self._content_h, m["r"], line_argb=self._argb(MENU_LINE))
+        # 条目
+        for idx, (y0, y1, it) in enumerate(self._rows):
+            selected = (self._hover == idx)
+            sub_sel = (self._sub and self._sub["item"] is it)
+            if sub_sel:
+                selected = True
+            self._render_item(s, self.margins, self.margins + y0,
+                              y1 - y0, it, selected)
+        s.present(self.hwnd)
+        self._pin_top()                 # 每次绘制都压回桌宠之上（它每秒在抢置顶）
+        if self._sub:
+            self._render_sub()
+
+    def _render_item(self, s, ox, oy, h, it, selected):
+        m = self.m
+        st = menu_item_style(it, selected, bool(it.get("checked")),
+                             bool(it.get("disabled")))
+        if st["kind"] == "sep":
+            yy = oy + h // 2
+            s.poly(self._argb(MENU_LINE),
+                   [(ox + m["pad"], yy), (ox + m["w"] - m["pad"], yy),
+                    (ox + m["w"] - m["pad"], yy + 1), (ox + m["pad"], yy + 1)])
+            return
+        if st["bg"]:
+            s.round_rect(self._argb(st["bg"]), ox + m["inset"], oy + 1,
+                         m["w"] - 2 * m["inset"], h - 2, m["r"])
+        cy = oy + h / 2.0
+        if st["dot"]:
+            r = m["dot_r"]
+            color = MENU_VIOLET if st["dot_filled"] else MENU_DOT_OFF
+            s.ellipse(self._argb(color), ox + m["dot_x"] - r, cy - r, 2 * r, 2 * r)
+        label = it.get("label") or ""
+        if label:
+            maxw = m["w"] - m["tx"] - (m["arrow_w"] if st["arrow"] else m["pad"])
+            s.text(label, ox + m["tx"], int(cy - m["font_h"] * 0.75), m["font_px"],
+                   self._argb(st["text"]), bold=st["bold"], maxw=maxw)
+        if st["arrow"]:
+            x = ox + m["w"] - m["pad"] - m["dot_r"]
+            s.poly(self._argb(MENU_INK_DIM),
+                   [(x - 2, cy - 5), (x - 2, cy + 5), (x + 4, cy)])
+
+    def _render_sub(self):
+        sub = self._sub
+        # ⚠️ 必须用**子菜单自己的** surface。原先写成 `s = self.surf`（父菜单的）：
+        #    父菜单比子菜单高 → 子卡片画完后，下面那一段只剩三层阴影叠出来的灰块；
+        #    而 ULW 又是按这张 bitmap 的尺寸显示（`Surface.present` 用 self.w/self.h）
+        #    → 子菜单窗口"凭空多出一大截空白"（2026-09-29 用户报障
+        #    「设置面板设置时会有空出来」）。
+        s, m = sub["surf"], self.m
+        W, H = s.w, s.h
+        s.clear()                       # 每次全量重绘（hover 会反复走这里，别叠阴影）
+        for i, a in enumerate((0x24, 0x3C, 0x55)):
+            e = self.margins - 4 * i
+            s.round_rect((a << 24), e, e, W - 2 * e, H - 2 * e, m["r"] + 6 - i * 2)
+        s.round_rect(self._argb(MENU_BG), self.margins, self.margins,
+                     m["w"], sub["content_h"], m["r"],
+                     line_argb=self._argb(MENU_LINE))
+        for idx, (y0, y1, it) in enumerate(sub["rows"]):
+            self._render_item(s, self.margins, self.margins + y0, y1 - y0, it,
+                              sub["hover"] == idx)
+        s.present(sub["hwnd"])
+        self._pin_top(sub["hwnd"])      # 子菜单同样要压在桌宠（与父菜单）之上
+
+    # ---------- 窗口 ----------
+    @classmethod
+    def _ensure_class(cls):
+        global _MENU_WNDPROC_STUB
+        if cls._registered:
+            return
+        wc = WNDCLASSW()
+        _MENU_WNDPROC_STUB = WNDPROC(_menu_wndproc)     # 模块级持有防 GC
+        wc.lpfnWndProc = ctypes.cast(_MENU_WNDPROC_STUB, ctypes.c_void_p)
+        wc.lpszClassName = "WBMenuClass"
+        wc.hInstance = _kernel32.GetModuleHandleW(None)
+        wc.hCursor = _user32.LoadCursorW(None, wt.LPCWSTR(32512))   # IDC_ARROW
+        if not _user32.RegisterClassW(ctypes.byref(wc)):
+            raise RuntimeError("RegisterClassW(WBMenuClass) 失败")
+        cls._registered = True
+
+    def run(self, owner_hwnd, pt):
+        """模态弹出。pt=(x,y) 屏幕坐标（右键位置）。返回选中 cmd / 0（取消）。"""
+        if not self._open(owner_hwnd, pt):
+            self._teardown()
+            return 0
+        try:
+            msg = MSG()
+            while not self._done and _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                _user32.TranslateMessage(ctypes.byref(msg))
+                _user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self._release()
+            self._teardown()
+        return self._cmd
+
+    def _open(self, owner_hwnd, pt, grab=True):
+        """建窗口 + 首绘 + 置顶（+ 抢前台/鼠标 capture）。
+
+        拆出 `run()` 的原因：模态循环一进去就出不来，**测试/repro 没法观察窗口状态**
+        （扩展样式位 / z 序 / 命中归属）。拆开后可以先 `_open(grab=False)`、探针、再
+        `_teardown()`；`grab=False` 供测试用 —— 不抢前台、不抢 capture（否则跑一次
+        测试就会把用户当前的焦点/鼠标捕获抢走）。
+        返回是否成功建窗。
+        """
+        try:
+            self._ensure_class()
+            dpi = (_user32.GetDpiForWindow(owner_hwnd) or 96) if owner_hwnd else 96
+            self.m = menu_metrics(dpi)
+            self.scale = dpi / 96.0
+            self.margins = round(_MENU_SHADOW * self.scale)
+            self._rows, self._content_h = menu_layout(self.items, self.m)
+            l, t, W, H = self._place(pt)
+            # ★ 只用具名常量。历史教训（2026-09-29 用户报障）：
+            #   这里原写 `0x00080000 | 0x00000080 | 0x00000020`，作者以为 0x20 是
+            #   WS_EX_TOPMOST —— **0x20 其实是 WS_EX_TRANSPARENT，TOPMOST 是 0x8**。
+            #   后果正好是两个症状：
+            #     ① 没有 topmost 位 → 落在普通层 → 被每秒 `SetWindowPos(HWND_TOPMOST)`
+            #        的桌宠压住（截图：人物盖住菜单卡片）；
+            #     ② TRANSPARENT = 鼠标穿透 → hover/点击全落给下层窗口
+            #        （表现为「不用力按住右键就选不动」「点菜单变成点桌宠」）。
+            #   LAYERED 是 ULW 的前置条件（漏了不报错、只是不上屏）。
+            ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            self.hwnd = _user32.CreateWindowExW(
+                ex, "WBMenuClass", None, WS_POPUP,
+                l, t, W, H, None, None, _kernel32.GetModuleHandleW(None), None)
+            if not self.hwnd:
+                return False
+            _MENU_WINDOWS[self.hwnd] = self
+            self.surf = Surface(W, H)
+            _user32.ShowWindow(self.hwnd, SW_SHOWNA)
+            self._pin_top()                 # 建窗即置顶（CreateWindowEx 的 TOPMOST 不保证生效）
+            self._render()
+            if grab:
+                _user32.SetForegroundWindow(self.hwnd)  # 收键盘 Esc；失活即关闭
+                _user32.SetCapture(self.hwnd)           # 鼠标集中制：全屏坐标由本窗口裁决
+            return True
+        except BaseException:
+            self._teardown()
+            raise
+
+    def _teardown(self):
+        """拆窗口（run / 测试 / repro 共用，可重复调用）。"""
+        self._sub_pending = None
+        self._disarm_sub_timer()          # 定时器挂在 hwnd 上，窗口销毁时顺手清掉
+        if self.hwnd:
+            _MENU_WINDOWS.pop(self.hwnd, None)
+        if self.surf:
+            try:
+                self.surf.close()
+            except Exception:
+                pass
+            self.surf = None
+        if self.hwnd:
+            _user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+        self._close_sub()
+
+    def _pin_top(self, hwnd=None):
+        """把窗口钉到 topmost 带的最上层（建窗后 + 每次绘制后都调）。
+
+        为什么必须每次绘制都钉：桌宠本体也常驻 topmost 且 `tick()` 每秒
+        `SetWindowPos(HWND_TOPMOST)` 重新置顶自己 —— 菜单不主动钉就会被它压住。
+        （实测：桌宠 #1 / 菜单 #14，菜单卡片被人物理盖掉一半。）
+        """
+        h = hwnd or self.hwnd
+        if h:
+            _user32.SetWindowPos(h, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+    def finish(self, cmd):
+        self._cmd = cmd or 0
+        self._done = True
+        _user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)   # 踢醒模态循环
+
+    def _release(self):
+        try:
+            _user32.ReleaseCapture()
+        except Exception:
+            pass
+
+    def _close_sub(self):
+        if self._sub and self._sub.get("hwnd"):
+            _MENU_WINDOWS.pop(self._sub["hwnd"], None)
+            try:
+                self._sub["surf"].close()
+            except Exception:
+                pass
+            _user32.DestroyWindow(self._sub["hwnd"])
+        self._sub = None
+
+    # ---------- 交互（capture 集中制：全部消息换算成屏幕坐标后裁决） ----------
+    @staticmethod
+    def _scr(lparam, hwnd):
+        """鼠标消息的 client 坐标（SetCapture 时相对 capture 窗口）→ 屏幕坐标。"""
+        gx = ctypes.c_short(lparam & 0xFFFF).value
+        gy = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+        r = RECT()
+        _user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return gx + r.left, gy + r.top
+
+    def on_move(self, gx, gy):
+        # 子菜单命中
+        if self._sub:
+            l, t, _W, _H = self._sub["rect"]
+            if l <= gx < l + self._sub["win_w"] and t <= gy < t + self._sub["win_h"]:
+                li = menu_hit(self._sub["rows"], gy - t - self.margins)
+                if li != self._sub["hover"]:
+                    self._sub["hover"] = li
+                    self._render_sub()
+                return
+        # 主菜单命中（子菜单区域之外 → 若已开子菜单而指针不在父条目上 → 关）
+        pr = RECT()
+        _user32.GetWindowRect(self.hwnd, ctypes.byref(pr))
+        if pr.left <= gx < pr.right and pr.top <= gy < pr.bottom:
+            li = menu_hit(self._rows, gy - pr.top - self.margins)
+            if li != self._hover:
+                self._hover = li
+                it = self.items[li] if li is not None else None
+                if it and it.get("sub") and not it.get("disabled"):
+                    # ⚠️ 不是立刻展开：**停留** SUB_OPEN_DELAY_S 才开（见常量注释）。
+                    #    鼠标顺着菜单往下扫时，一路上的子菜单父条目就不会逐个闪一下。
+                    if not (self._sub and self._sub["item"] is it):
+                        self._close_sub()
+                        self._sub_pending = (li, time.time())
+                        self._arm_sub_timer()
+                else:
+                    self._sub_pending = None
+                    if self._sub:
+                        self._close_sub()
+                self._render()
+        elif self._sub or self._sub_pending:
+            self._sub_pending = None
+            self._close_sub()
+            self._render()
+
+    # ---------- 子菜单延迟展开 ----------
+    def _arm_sub_timer(self):
+        """挂上轮询定时器（60ms 一跳，只在有待展开的子菜单时开着）。"""
+        if not self._sub_timer_on and self.hwnd:
+            _user32.SetTimer(self.hwnd, ID_TIMER_SUB, 60, None)
+            self._sub_timer_on = True
+
+    def _disarm_sub_timer(self):
+        if self._sub_timer_on and self.hwnd:
+            try:
+                _user32.KillTimer(self.hwnd, ID_TIMER_SUB)
+            except Exception:
+                pass
+        self._sub_timer_on = False
+
+    def on_timer(self):
+        """WM_TIMER：停留够久就把待展开的子菜单打开。"""
+        pend = self._sub_pending
+        if not pend:
+            self._disarm_sub_timer()
+            return
+        idx, t0 = pend
+        if time.time() - t0 < SUB_OPEN_DELAY_S:
+            return
+        self._sub_pending = None
+        self._disarm_sub_timer()
+        it = self.items[idx] if 0 <= idx < len(self.items) else None
+        if it and it.get("sub") and self._hover == idx:      # 光标还在它身上才开
+            self._open_sub(idx)
+
+    def _open_sub(self, idx):
+        self._close_sub()
+        it = self.items[idx]
+        l, t, W, H, rows, ch = self._sub_rect(idx)
+        # LAYERED(ULW 必需) | TOPMOST(压住桌宠) | NOACTIVATE(不抢前台，
+        # 鼠标仍由父窗口 capture 裁决) | TOOLWINDOW —— 全部走具名常量（见 _open 里的教训）
+        ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        hwnd = _user32.CreateWindowExW(ex, "WBMenuClass", None, WS_POPUP,
+                                       l, t, W, H, None, None,
+                                       _kernel32.GetModuleHandleW(None), None)
+        if not hwnd:
+            return
+        _MENU_WINDOWS[hwnd] = self           # 子窗口消息也由本 session 裁决
+        self._sub = {"item": it, "hwnd": hwnd, "surf": Surface(W, H),
+                     "rect": (l, t, W, H), "rows": rows,
+                     "content_h": ch, "win_w": W, "win_h": H, "hover": None}
+        _user32.ShowWindow(hwnd, SW_SHOWNA)
+        self._pin_top(hwnd)
+        self._render()
+
+    def _in_any(self, gx, gy):
+        """点是否落在任一菜单窗口内（主菜单 or 已展开的子菜单）。"""
+        pr = RECT()
+        _user32.GetWindowRect(self.hwnd, ctypes.byref(pr))
+        if pr.left <= gx < pr.right and pr.top <= gy < pr.bottom:
+            return True
+        if self._sub:
+            l, t, _W, _H = self._sub["rect"]
+            if l <= gx < l + self._sub["win_w"] and t <= gy < t + self._sub["win_h"]:
+                return True
+        return False
+
+    def on_rbutton(self, gx, gy, up):
+        """右键落在菜单上：**不选中**（选中只认左键），菜单外松开 → 收起。
+
+        为什么要显式处理：菜单窗口修掉 WS_EX_TRANSPARENT 后不再穿透，右键会真的
+        送到菜单；不处理的话用户「在别处右键收起菜单」的习惯动作会被 capture 吞掉，
+        菜单反而赖着不走。
+        """
+        if up and not self._in_any(gx, gy):
+            self.finish(0)
+
+    def on_button(self, gx, gy, up):
+        if self._sub:
+            l, t, _W, _H = self._sub["rect"]
+            if l <= gx < l + self._sub["win_w"] and t <= gy < t + self._sub["win_h"]:
+                li = menu_hit(self._sub["rows"], gy - t - self.margins)
+                if li is not None:
+                    it = self._sub["item"]["sub"][li]
+                    if not it.get("disabled") and not it.get("sep"):
+                        self.finish(it.get("cmd") or 0)
+                return
+        pr = RECT()
+        _user32.GetWindowRect(self.hwnd, ctypes.byref(pr))
+        if pr.left <= gx < pr.right and pr.top <= gy < pr.bottom:
+            li = menu_hit(self._rows, gy - pr.top - self.margins)
+            if li is not None:
+                it = self.items[li]
+                if not it.get("disabled") and not it.get("sep") and not it.get("sub"):
+                    self.finish(it.get("cmd") or 0)
+        elif up:
+            self.finish(0)                    # 菜单外点击 → 关闭（吞掉该次点击）
+
+    def on_key(self, wp):
+        if wp == _MENU_VK_ESCAPE:
+            if self._sub:
+                self._close_sub()
+                self._render()
+            else:
+                self.finish(0)
+
+
+_MENU_WINDOWS = {}
+_MENU_WNDPROC_STUB = None       # 模块级持有：WNDPROC 回调被 GC 会导致菜单窗口崩溃
+
+
+def _menu_wndproc(hwnd, msg, wparam, lparam):
+    sess = _MENU_WINDOWS.get(hwnd)
+    if sess is None:
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+    try:
+        if msg == WM_MOUSEMOVE:
+            gx, gy = sess._scr(lparam, hwnd)
+            sess.on_move(gx, gy)
+        elif msg == WM_TIMER:
+            sess.on_timer()               # 子菜单"停留才展开"的轮询
+        elif msg in (WM_LBUTTONDOWN, WM_LBUTTONUP):
+            gx, gy = sess._scr(lparam, hwnd)
+            sess.on_button(gx, gy, up=(msg == WM_LBUTTONUP))
+        elif msg in (WM_RBUTTONDOWN, WM_RBUTTONUP):
+            gx, gy = sess._scr(lparam, hwnd)
+            sess.on_rbutton(gx, gy, up=(msg == WM_RBUTTONUP))
+        elif msg == WM_KEYDOWN and wparam == _MENU_VK_ESCAPE:
+            sess.on_key(wparam)
+        elif msg == WM_ACTIVATE and (wparam & 0xFFFF) == 0:
+            sess.finish(0)                    # 失活（Alt-Tab/点别的窗口）→ 关菜单
+        elif msg == WM_CLOSE:
+            # ⚠️ 外部关闭请求（WM_CLOSE / 任务栏关窗）：必须走正常收尾。
+            #    原来这里一律 return 0 —— 请求被吞、窗口活着、模态循环也退不出，
+            #    结果是**幽灵菜单**：菜单永远关不掉，桌宠还以为菜单开着（tick 一直被闸）。
+            sess.finish(0)
+        else:
+            return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        return 0
+    except BaseException:
+        try:
+            log_exception(f"[menu-wndproc msg=0x{msg:X}]")
+        except Exception:
+            pass
+        return 0
 
 
 # ---------- 窗口过程（模块级唯一桩防 GC） ----------
@@ -950,6 +1608,7 @@ class WhalePet:
         if _gdiplus is None:
             raise RuntimeError("未找到 gdiplus.dll")
         _set_dpi_aware()
+        _high_res_timer_on()      # 1ms 定时器精度：41ms 动画 tick 才不会被拉长到 46.8ms
         tok = P()
         si = GdiplusStartupInput()
         si.GdiplusVersion = 1
@@ -984,8 +1643,6 @@ class WhalePet:
         self._drift = None                 # 窗口漂移动画 {x0,y0,x1,y1,t0,dur}
         self._drift_back_at = 0.0          #  outward 漂移完成后的返程时刻
         self._facing = ""                  # 当前朝向（"" 或 "_f"）
-        self._flip_until = 0.0             # 自主翻身截止
-        self._flip_dir = ""
         self._follow_dir = None            # 鼠标跟随候选朝向（防抖）
         self._follow_since = 0.0
         self._last_interact = time.time()  # 最近用户交互时间（点击/拖动）
@@ -1004,6 +1661,11 @@ class WhalePet:
         #   ok      → default ：新对话开始（会话数重新 >0）——否则任务在跑却挂着"完成"会误导
         self._bub_mode = BUBBLE_DEFAULT
         self._prev_active_n = None       # 上一 tick 的运行中会话数（None = 还没取到基线）
+        # 活跃数防抖（见 ACTIVE_FALL_DEBOUNCE_S）：已生效值 / 下降起始时刻 / 窗口
+        self._n_stable = 0
+        self._n_hold_since = 0.0
+        self._fall_debounce_s = ACTIVE_FALL_DEBOUNCE_S
+        self._read_ok_at = 0.0           # 上次**成功**读到数仓的时刻（读数卡死兜底用）
         self._ok_clicks = 0              # ok 态下的连续点击计数
         self._ok_last_click = 0.0        # 上一次气泡点击时刻（连击窗口判定）
         self._ok_anim_t0 = 0.0           # 形态切换动画起点
@@ -1038,21 +1700,19 @@ class WhalePet:
         # 自更新：后台检查结果缓存 + 是否在处理（网络全在后台线程，绝不进消息循环）
         self._update_info = None
         self._update_busy = False
-        # 形态尺寸归一 + 切换时的尺寸缓入（见 _state_size / _size_factor）
-        self._size_cache = {}
-        self._canvas_ar = 0.0
-        self._size_key = None
-        self._size_from = 1.0
-        self._size_now = 1.0
         self._size_t0 = 0.0
-        # 帧序列动画（AI 视频 → 透明帧）：有对话任务在跑时用它替代立绘
-        self._anim_clip = ANIM.load("write")          # 没素材 = None → 回退 v3 立绘
-        self._anim_key = None
+        # 帧序列动作（AI 视频 → 透明帧）：坐着 / 变困 / 困了 / 拿本子 / 写字
+        # 缺哪个动作就少哪个，不报错（load_all 只收存在的）
+        self._clips = ANIM.load_all()
+        self._anim_key = None                         # (动作, 素材名)，变了就重置计时
         self._anim_t0 = 0.0
-        self._anim_cache = []
-        # 写字本子（任务进行中写字 / 完成后展示）：状态机 + 素材缓存
-        self._nb = NOTEBOOK.NotebookState()
-        self._nb_imgs = {}
+        self._anim_caches = {}                        # {动作名: [(Surface,w,h), ...]}
+        self._anim_imgs = {}                          # {动作名: {帧号: (img,w,h)}}
+        # 抽签式兜底：没有 idle 就用任意一个，保证 _spr_cbox 一开始有值
+        self._anim_clip = (self._clips.get(ANIM.ACT_IDLE)
+                           or next(iter(self._clips.values()), None))
+        # 动作状态机：任务开始/进行/完成 + 空闲犯困 → 决定播哪段
+        self._wr = ANIM.PetPhase()
         self.scale = float(self._settings.get("scale", 1.0))
         self.bubble_on = bool(self._settings.get("bubble", True))
         self.sound_on = bool(self._settings.get("sound", True))
@@ -1063,18 +1723,18 @@ class WhalePet:
         self.linked_close_on = bool(self._settings.get(
             "linked_close", MOTION.LINKED_CLOSE_ON))
         self._sounds = _make_sounds() if self.sound_on else {}
-        # 双版本立绘：'q' = 古见 Q 版（萌系）/ 'alt' = 古见高冷版（清冷疏离）
-        self.style = self._settings.get("style", "q")
-        if self.style not in ("q", "alt"):
-            self.style = "q"
+        # ---- 动作音效（AI 视频自带音轨，见 assets/anim/<动作>/_sfx.wav）----
+        # 与上面那套**合成音效**分开：这套跟着「动作」走，不是跟着点击走
+        self._anim_sfx = self._load_anim_sfx()
+        self._anim_sfx_act = None        # 当前正在播的动作音效 (动作, 素材名)
+        self._menu_open = False          # 右键菜单弹出期间：暂停重绘，把 UI 让给菜单
+        self._sfx_resume_at = 0.0        # 互动音效播完后，何时把动作音效接回来
         # ---- 动效状态（提案 §1 待机 / §2 情绪 / §3 微交互 / §6 降级）----
         self._quality = self._load_quality()
-        self._eye_cfg = self._load_eye_config()
         self._breath = 0.0            # 呼吸位移（px，向下为正）
         self._tail_dx = 0.0           # 尾鳍末端水平位移（px）
         self._float_dy = 0.0          # 漂浮位移（px）
         self._shadow_scale = 1.0      # 软阴影随漂浮缩放
-        self._blinker = MOTION.BlinkScheduler(time.time(), self._quality)
         # ---- 跟随模式（聚焦信号，设计文档 P1）：前台 → agent，去抖 + 未知态 ----
         self.follow_on = bool(self._settings.get("follow", True))
         self._follow_tracker = FOLLOW.FollowTracker()
@@ -1107,7 +1767,6 @@ class WhalePet:
         self._gaze_target = 0.0
         self._hovering = False
         self._hover_t = 0.0           # hover 淡入淡出进度 0..1
-        self._pose_masks = {}         # {sprite_key: 32×48 灰度缩略} 供状态过渡差异判定
         self._pose_diff_cache = {}    # {(k1,k2): 局部最大差异}
         self._pose_wh = (0, 0)
         self._squash = 1.0            # 点击压缩曲线值（1.0 = 常态）
@@ -1117,27 +1776,28 @@ class WhalePet:
         self._emotion_until = 0.0
         self._press_at = 0.0          # 按下时刻（长按判定）
         self._frame_ms = 0.0          # 单帧绘制耗时（自动降级用）
+        self._stale_list = []            # 残留会话清单（菜单项用，带 TTL 记忆）
+        self._stale_ts = 0.0
+        # 帧缓存（预缩放）状态：缓存依据 sig / 后台重建中 / 后台产物 / 待跟的目标
+        self._cache_sig_done = None
+        self._cache_building = False
+        self._cache_new = None
+        self._cache_pending_sig = None
         self._slow_frames = 0
         self._degraded_at = 0.0
         self._motion_sig = None       # 动效脏检测签名
         # ---- 互动反应状态 ----
-        self._clicks = []                # 立绘点击时间戳（滑动窗口计数）
-        self._react_until = 0.0          # 反应（表情）截止时间
-        self._react_face = None          # None | "blush" | "pout"
         self._wobble_until = 0.0         # 甩尾摇摆截止时间
         self._wobble_amp = 0.0           # 摇摆幅度（px）
         self._particles = []             # {x,y,vx,vy,life,max,kind,size,phase}
         self._last_quote = ""
 
-        self._sprites = self._load_sprites()
-        self._spr_cbox = self._load_sprite_boxes()         # {state: 内容框(归一化)}
+        # 帧序列的内容框：气泡锚点 / 命中区都按它算。
+        # ⚠️ 各动作内容框**不一样**（坐着是近景 0.53、写字是全身 0.36），
+        #    所以 _draw_anim_frame 每帧都会按当前动作刷新它。
+        self._spr_cbox = {}
         if self._anim_clip:
-            # 帧序列有自己的内容框：登记专用 key，气泡锚点/命中区都按它算
             self._spr_cbox["__anim__"] = list(self._anim_clip.content_box)
-        self._blink_patches = self._load_blink_patches()   # {state: (img, (x,y,w,h))}
-        self._blink_cache = {}           # 按当前 scale 预缩放的贴片
-        self._shown_key = None           # 上一帧实际画出的立绘 key（状态切换渐变用）
-        self._fade = None                # {"from":key,"to":key,"t0":ts}
         self._ok_img = self._load_ok_glyph()
         self._ok_glyph_cache = None       # (Surface, w, h) 按当前 scale 预缩放
         self._register_class()
@@ -1145,6 +1805,14 @@ class WhalePet:
         self.surf = None
         self._watch_armed = False         # WATCH 定时器是否已启用（按需挂载）
         self._visible = False             # 窗口是否已 ShowWindow
+        # ---- 动画时钟（必须在 _arm_timers 之前初始化，见 _start_anim_clock）----
+        self._anim_clock = None          # 高精度可等待定时器句柄
+        self._anim_clock_on = False
+        self._anim_clock_dead = False
+        self._anim_pending = False       # 在途的 WM_APP_ANIM（合并语义）
+        self._anim_last_tick = 0.0       # 最近一次动画 tick 时刻（看门狗）
+        self._anim_i_key = None          # 抖动钳位：上一帧的（动作, 素材名）
+        self._anim_i_prev = None         # 抖动钳位：上一帧的帧号（见 _draw_anim_frame）
         self._recreate_window(place=True)
         self.tick()
         self._arm_timers()                # 统一挂载定时器（hwnd 变化后需重新挂载）
@@ -1152,6 +1820,7 @@ class WhalePet:
         self._kick_timeline_refresh()
         self._start_api_guard()           # 看板 API 守护（后台 daemon 线程，不做网络阻塞）
         self._start_update_watch()        # 自更新检查（未配更新源 → 线程直接退出，零联网）
+        self._start_stale_repair()        # 启动自愈：残留 working 会话落回终态（重启即修复）
         # P3 全局热键（Ctrl+Alt+F9 手动聚焦轮换）：绑定桌宠 hwnd，
         # WM_HOTKEY 走既有消息泵；组合被占用 → 静默降级（右键菜单仍是兜底）
         self._install_follow_hotkey()
@@ -1191,7 +1860,6 @@ class WhalePet:
             data.update({"sound": self.sound_on, "scale": self.scale,
                          "bubble": self.bubble_on,
                          "quality": self._quality,
-                         "style": self.style,
                          "ok_autodismiss": self.ok_autodismiss_on,
                          "linked_close": self.linked_close_on,
                          "follow": self.follow_on,
@@ -1212,7 +1880,6 @@ class WhalePet:
     def set_quality(self, q):
         """切换动效强度并持久化（右键菜单 / 自动降级共用）。"""
         self._quality = q
-        self._blinker.quality = q
         self._save_settings()
         self._drawn_sig = None
         self._motion_sig = None
@@ -1378,10 +2045,12 @@ class WhalePet:
             conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True,
                                    timeout=3)
             try:
+                # ⚠️ 走 turn_src（优先物化表）：直查 v_turn_total 视图实测 10.3s
+                #    —— 点一次「生成接续摘要」就冻十秒（与跟随切换同一个坑）。
                 row = conn.execute(
-                    """SELECT COALESCE(NULLIF(user_prompt, ''), ''),
+                    f"""SELECT COALESCE(NULLIF(user_prompt, ''), ''),
                               COALESCE(NULLIF(title, ''), '')
-                         FROM v_turn_total WHERE agent = ?
+                         FROM {turn_src(conn, self.db_path)} WHERE agent = ?
                         ORDER BY last_time DESC LIMIT 1""", (h["key"],)).fetchone()
             finally:
                 conn.close()
@@ -1415,190 +2084,11 @@ class WhalePet:
         except Exception:
             log_exception("[handoff] 生成失败")
 
-    def _load_eye_config(self):
-        """读取立绘面部特征配置（眨眼眼睑 / 腮红贴图定位用）。
 
-        支持两版格式：
-          v2（推荐）：{"states": {"idle"/"happy"/"pout": {"eyes": ..., "cheeks": ...}}}
-                      —— 按立绘状态分别实测，坐标由 tools/detect_face.py 像素分析生成
-          v1（兼容）：{"eyes": {"left": ..., "right": ...}} —— 全状态共用一套
-        找不到配置时返回 None → 自动禁用眨眼（不猜坐标，避免画歪）。
-        重新生成配置：python tools/detect_face.py --write
-        """
-        try:
-            with open(EYE_CFG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            if not isinstance(cfg, dict):
-                return None
-            states = cfg.get("states")
-            if isinstance(states, dict) and states:
-                # v2：至少一个状态带完整双眼坐标才算有效
-                for st in states.values():
-                    eyes = (st or {}).get("eyes") or {}
-                    if "left" in eyes and "right" in eyes:
-                        return cfg
-                return None
-            eyes = cfg.get("eyes")
-            if eyes and "left" in eyes and "right" in eyes:
-                return cfg                              # v1 原样返回
-        except Exception:
-            pass
-        return None
-
-    def _face_cfg(self, state, facing):
-        """取当前立绘状态的眼/脸颊归一化坐标；镜像立绘（_f）时水平翻转。
-
-        双版本支持：state 已含版本前缀（'idle' → Q 版，'alt_idle' → 高冷版）。
-        返回 {"eyes": {...}, "cheeks": {...}, "eyelid_color": str}；
-        无配置返回 None。翻转规则：cx → 1 - cx，左右互换（w/h/cy 不变）。
-        """
-        cfg = self._eye_cfg
-        if not cfg:
-            return None
-        states = cfg.get("states")
-        if isinstance(states, dict) and states:
-            # state key 直接查；查不到剥离 alt_ 前缀再查
-            st = states.get(state)
-            if st is None:
-                base = state.removeprefix("alt_") if state.startswith("alt_") else state
-                st = states.get(base)
-            if not st or st.get("skip"):
-                # 2026-09-26 v3：**未标定的态就返回 None，不再回退到 idle**。
-                # 回退会把 idle 的眼睑坐标画到别的姿态上（明显错位）；
-                # 现在只给显式标定过的态画眼睑，`skip: true` 用于「眼睛本就是闭的」态（joy）。
-                return None
-            out = {"eyes": st.get("eyes") or {},
-                   "cheeks": st.get("cheeks") or {},
-                   "eyelid_color": st.get("eyelid_color") or cfg.get("eyelid_color", "#2A2438"),
-                   "skin_color": st.get("skin_color") or cfg.get("skin_color", "#FFF2EA")}
-        else:
-            out = {"eyes": cfg.get("eyes") or {},
-                   "cheeks": cfg.get("cheeks") or {},
-                   "eyelid_color": cfg.get("eyelid_color", "#2A2438"),
-                   "skin_color": cfg.get("skin_color", "#FFF2EA")}
-        if facing == "_f":
-            flipped = {"eyes": {}, "cheeks": {},
-                       "eyelid_color": out["eyelid_color"],
-                       "skin_color": out["skin_color"]}
-            for group in ("eyes", "cheeks"):
-                for key, e in out[group].items():
-                    opp = "right" if key == "left" else "left"
-                    flipped[group][opp] = {**e, "cx": 1.0 - e["cx"]}
-            return flipped
-        return out
 
     # ---- 立绘资源 ----
-    def _load_sprites(self):
-        """加载 v3 立绘：8 表情 × 正反 = 16 张（统一画布 1191×1627）。
 
-        命名约定：{state} / {state}_f
-            state ∈ idle/happy/pout/shy/blush/stone/joy/surprise
-        sprite key 形如 'q.idle' / 'q.idle_f'。
-        高冷版（alt_*）与配件层（猫/贝雷帽/玩偶）均已删除（2026-09-27）。
-        """
-        sprites = {}
-        states = ("idle", "happy", "pout", "shy", "blush", "stone", "joy", "surprise")
-        for state in states:
-            for suffix, mirror in (("", False), ("_f", True)):
-                key = f"q.{state}{suffix}"
-                path = os.path.join(SPRITE_DIR, f"pet_{state}{suffix}.png")
-                if not os.path.isfile(path):
-                    continue
-                img = P()
-                if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
-                    log_exception(f"[sprite] 加载失败 {path}")
-                    continue
-                w, h = U32(0), U32(0)
-                _GetImageW(img, ctypes.byref(w))
-                _GetImageH(img, ctypes.byref(h))
-                sprites[key] = (img, w.value, h.value)
-        if "q.idle" not in sprites:
-            log_exception(f"[sprite] 未找到 v3 立绘目录 {SPRITE_DIR}"
-                          f"（请先跑 tools/build_pet_v3.py）")
-        # 姿态掩码（构建期由 tools/build_pose_masks.py 生成）：状态过渡差异判定用
-        self._pose_masks = {}
-        self._pose_wh = (0, 0)
-        try:
-            with open(os.path.join(SPRITE_DIR, "_pose_masks.json"), encoding="utf-8") as fp:
-                pm = json.load(fp)
-            self._pose_masks = pm.get("states") or {}
-            self._pose_wh = (int(pm.get("w") or 0), int(pm.get("h") or 0))
-        except Exception:
-            pass          # 缺文件不报错：_pose_local_diff 会退回"不限制"的原行为
-        return sprites
 
-    def _load_sprite_boxes(self):
-        """读各态立绘的**内容框**（角色本体在画布里的归一化矩形），点击分区要用。
-
-        为什么离线算好再读：2D 运行时**刻意零依赖**（不 import numpy / PIL），
-        没法在运行时对位图求 bbox。构建期（tools/build_pet_v3.py 有 numpy）算进
-        `_build_meta.json` 即可。
-        """
-        out = {}
-        if not os.path.isfile(META_FILE):
-            log_exception(f"[sprite] 未找到几何元数据 {META_FILE}"
-                          f"（点击分区会退回按立绘区百分比估算）")
-            return out
-        try:
-            with open(META_FILE, encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            log_exception(f"[sprite] 几何元数据解析失败 {META_FILE}")
-            return out
-        for state, ent in meta.items():
-            b = ent.get("content_box")
-            if b and len(b) == 4:
-                out[state] = tuple(float(v) for v in b)
-        return out
-
-    def _load_blink_patches(self):
-        """加载分层差分的**闭眼贴片**（每态一组「半闭档」+ 它在画布里的矩形）。
-
-        贴片由 `tools/build_blink_patches.py` 生成：拿 ImageGen 的「只闭眼」变体与睁眼立绘
-        做像素差分，**diff 区域就是眼睛**（所以既不用重新标定眼位，也不用猜），
-        贴片 alpha 取自 diff 幅度。
-
-        为什么要多档而不是一张图配全局 alpha：半闭**不是两张图混合**——那样睁眼的暗瞳会
-        透过半透明闭眼图显出来（实测 ratio=0.5 重影明显）。真实半闭是**上睑从上往下压住眼球**，
-        所以离线按「眼睑下落位置」做出 N 档垂直遮罩，运行时按闭合度取档。
-
-        缺贴片的态自动退回旧的椭圆眼睑盖板（见 `_draw_blink`），不会因为没素材而坏掉。
-        """
-        out = {}
-        if not os.path.isfile(BLINK_MANIFEST):
-            log_exception(f"[blink] 未找到贴片清单 {BLINK_MANIFEST}"
-                          f"（可跑 tools/build_blink_patches.py；缺失时回退椭圆盖板）")
-            return out
-        try:
-            with open(BLINK_MANIFEST, encoding="utf-8") as f:
-                man = json.load(f)
-        except Exception:
-            log_exception(f"[blink] 贴片清单解析失败 {BLINK_MANIFEST}")
-            return out
-
-        def _load(p):
-            img = P()
-            if _LoadImage(p, ctypes.byref(img)) != 0 or not img:
-                return None
-            return img
-
-        for state, ent in man.items():
-            slots = []
-            n = int(ent.get("slots") or 0)
-            for i in range(1, n + 1):
-                g = _load(os.path.join(BLINK_DIR, f"{state}_c{i}.png"))
-                if g is not None:
-                    slots.append(g)
-            if not slots:                       # 只有整张贴片时退化为单档
-                g = _load(os.path.join(BLINK_DIR, f"{state}.png"))
-                if g is not None:
-                    slots.append(g)
-            if not slots:
-                continue
-            out[state] = {"slots": slots,
-                          "rect": tuple(ent.get("rect") or (0, 0, 0, 0)),
-                          "canvas": tuple(ent.get("canvas") or (0, 0))}
-        return out
 
     def _load_ok_glyph(self):
         """加载「OK」完成态字形（透明 PNG）。
@@ -1677,7 +2167,16 @@ class WhalePet:
         if self.surf:
             self.surf.close()
         self.surf = Surface(lay["W"], lay["H"])
-        self._build_sprite_cache()              # 按新尺寸预缩放缓存
+        # ★ 帧缓存只跟**显示尺寸**有关（见 _cache_sig）：气泡开关这类只改窗口高度的切换
+        #   根本不重建 —— 重建要重新解码+重采样 525 帧 ≈ 3.2s，白冻 UI 三秒。
+        #   真要改尺寸时：首次（启动）同步建（否则首帧没素材），之后**后台建**，
+        #   UI 线程立刻返回（先用旧缓存拉伸顶一下，见 _draw_anim_frame 的放宽条件）。
+        _sig = self._cache_sig()
+        if _sig != getattr(self, "_cache_sig_done", None):
+            if getattr(self, "_cache_sig_done", None) is None:
+                self._build_draw_cache()
+            else:
+                self._rebuild_cache_async(_sig)
         if place:
             self._place()
         self._drawn_sig = None
@@ -1688,14 +2187,76 @@ class WhalePet:
         self._arm_timers()
 
     def _arm_timers(self):
-        """把定时器挂到当前 hwnd 上。SetTimer 同 ID 会原地更新，可安全重复调用。"""
+        """把定时器挂到当前 hwnd 上。SetTimer 同 ID 会原地更新，可安全重复调用。
+
+        动画帧有两条路：优先**高精度时钟线程**（`_start_anim_clock`），
+        拿不到才退回 `SetTimer`（周期会被系统粒度拉长到 46.8ms，但有防抖钳位兜底）。
+        """
         if not self.hwnd:
             return
         _user32.SetTimer(self.hwnd, ID_TIMER_TICK, TICK_MS, None)
-        # 常驻动画帧：呼吸浮动 / 粒子 / 摇摆 / 漂移 / 鼠标跟随 / 自主行为调度
-        _user32.SetTimer(self.hwnd, ID_TIMER_ANIM, ANIM_MS, None)
+        if self._start_anim_clock():
+            # 别和 SetTimer 双重投递（那才是真跳帧）
+            _user32.KillTimer(self.hwnd, ID_TIMER_ANIM)
+        else:
+            _user32.SetTimer(self.hwnd, ID_TIMER_ANIM, ANIM_MS, None)
         if self._watch_armed:
             _user32.SetTimer(self.hwnd, ID_TIMER_WATCH, WATCH_MS, None)
+
+    def _start_anim_clock(self):
+        """起高精度动画时钟（后台线程 + 可等待定时器），返回是否由它接管。
+
+        **为什么要它**（2026-09-30 用户报障「写字不流畅」）：系统默认定时器粒度 15.6ms
+        → `SetTimer(41)` 实际 46.8ms，写字态实测只有 21.3fps；本机 `timeBeginPeriod(1)`
+        也无效。高精度可等待定时器走内核高精度时钟，实测稳定 41ms → 24.4fps。
+        拿不到就返回 False（调用方退回 SetTimer，行为与从前一致）。
+        """
+        if self._anim_clock_on:
+            return True
+        if self._anim_clock_dead:                # 试过且失败：别每轮重建
+            return False
+        h = _make_hires_timer(ANIM_MS)
+        if not h:
+            self._anim_clock_dead = True
+            return False
+        self._anim_clock = h
+        self._anim_clock_on = True
+        threading.Thread(target=self._anim_clock_loop, name="wb-anim-clock",
+                         daemon=True).start()
+        return True
+
+    def _anim_clock_loop(self):
+        """时钟线程：**只做「等 → 投递消息」**，绝不碰 UI / 不查库（本项目铁律）。
+
+        投递带**合并语义**（同时只有一个在途消息）—— 对齐 `WM_TIMER` 的行为：
+        万一 UI 线程被卡住 1 秒，也不会攒下 20 多个 tick 一次性补跑（那是"快进抽帧"）。
+        """
+        h = self._anim_clock
+        while self._anim_clock_on and h == self._anim_clock:
+            try:
+                r = _kernel32.WaitForSingleObject(h, 250)
+            except Exception:
+                break
+            if r != _WAIT_OBJECT_0:          # 超时（0x102）→ 回头检查退出条件
+                continue
+            hwnd = self.hwnd
+            if not hwnd or self._anim_pending:
+                continue
+            self._anim_pending = True
+            try:
+                _user32.PostMessageW(hwnd, WM_APP_ANIM, 0, 0)
+            except Exception:
+                self._anim_pending = False
+
+    def _stop_anim_clock(self):
+        self._anim_clock_on = False
+        self._anim_pending = False
+        h, self._anim_clock = self._anim_clock, None
+        if h:
+            try:
+                _kernel32.CloseHandle(h)     # 线程的等待会立刻返回并退出
+            except Exception:
+                pass
 
     def _arm_watch(self):
         """台词期间用：外部点击检测（按需挂载，记住状态以便 hwnd 变化后恢复）。"""
@@ -1704,46 +2265,58 @@ class WhalePet:
             _user32.SetTimer(self.hwnd, ID_TIMER_WATCH, WATCH_MS, None)
 
     # ---- 立绘预缩放缓存（每帧 AlphaBlend 1:1 合成，避免每帧重采样大图）----
-    def _build_sprite_cache(self):
-        for tmp in getattr(self, "_cache_surfs", []):
-            try:
-                tmp.close()
-            except Exception:
-                pass
-        self._sprite_cache = {}
-        self._cache_surfs = []
-        if not getattr(self, "surf", None):
-            return
+
+    # ---- 显示尺寸预缩放缓存（每帧 AlphaBlend 1:1 合成，避免每帧重采样大图）----
+    def _cache_sig(self):
+        """帧缓存的构建依据 —— **只跟显示尺寸有关**。
+
+        五个动作的 `head_scale` 是静态的，`pet_h`/`g_h` 都只由 `sc` 派生，所以：
+        **气泡开关（只改窗口高度）不需要重建缓存**。
+        （2026-09-29：右键菜单里点「想法气泡」原来会重建 → 重新解码+重采样 525 帧 ≈ 3.2s
+          的 UI 线程冻结，用户报的"选择设置时卡顿"就是这一下。）
+        """
+        lay = self._layout()
+        return (lay["sc"], lay["pet_h"], ok_spec(lay)["g_h"])
+
+    def _build_cache_objects(self):
+        """按当前显示尺寸产出预缩放对象（**不碰 self**，可在后台线程里跑）。
+
+        返回 (anim_caches, cache_surfs, ok_glyph_cache)；失败抛异常由调用方兜。
+        为什么拆出来：重建要重新解码 + 重采样 525 帧（GDI+ 高分插值 3.9ms/帧 ≈ 3s），
+        必须能放到后台线程做 —— 否则改一次「桌宠大小」就冻住 UI 三秒。
+        """
+        anim_caches, cache_surfs = {}, []
         lay = self._layout()
         ph = lay["pet_h"] - 8 * lay["sc"]
-        for key, (img, iw, ih) in self._sprites.items():
-            # 每个形态按**自己的尺寸系数**预缩放（形态尺寸归一，见 _state_size）
-            st = key.split(".", 1)[1].replace("_f", "")
-            phh = int(ph * self._state_size(st))
-            pw = int(phh * iw / ih)
-            if pw <= 0 or phh <= 0:
-                continue
-            tmp = Surface(pw, phh)
-            tmp.clear()
-            tmp.image(img, 0, 0, pw, phh)      # 一次性重采样到显示尺寸
-            self._sprite_cache[key] = (tmp, pw, phh)
-            self._cache_surfs.append(tmp)
-        # OK 图形同样按「当前尺寸 + 当前方案」预缩放（分层窗口要 1:1 合成，省掉每帧重采样）
-        self._ok_glyph_cache = None
-        # 帧序列动画同样预缩放（键 = 帧号）。49 帧 420x565 ≈ 46MB 内存，
-        # 与 8 张 v3 立绘（约 58MB）同一量级，可接受；显示尺寸变了会整体重建。
-        self._anim_cache = []
-        if getattr(self, "_anim_clip", None):
-            for k in range(self._anim_clip.count):
-                info = self._anim_image(k)
+        for _name, _clip in (getattr(self, "_clips", {}) or {}).items():
+            _buf = []
+            for k in range(_clip.count):
+                info = self._anim_image(k, _name)
                 if not info:
                     continue
                 aimg, aiw, aih = info
-                apw, aph = int(ph * aiw / aih), int(ph)
+                # ★ 按头大小对齐：近景动作整体缩小（见 wb_anim.HEAD_SCALE）
+                _ph = ph * _clip.head_scale
+                apw, aph = int(_ph * aiw / aih), int(_ph)
                 atmp = Surface(apw, aph)
                 atmp.clear()
                 atmp.image(aimg, 0, 0, apw, aph)
-                self._anim_cache.append((atmp, apw, aph))
+                _buf.append((atmp, apw, aph))
+                cache_surfs.append(atmp)
+            # ★ 预缩放建完就把**原始位图**扔掉：它只在建缓存时用得上。
+            #   24fps 下 5 个动作 500+ 帧，原始位图（每帧约 950KB）要占 500MB 上下，
+            #   而预缩放后的那份（每帧约 350KB）才是真正每帧要画的 —— 留一份就够。
+            #   （改窗口尺寸时会走回 _anim_image 重新加载，所以扔了不影响 resize。）
+            for _ent in (getattr(self, "_anim_imgs", {}) or {}).get(_name, {}).values():
+                if _ent:
+                    try:
+                        _DisposeImage(_ent[0])
+                    except Exception:
+                        pass
+            self._anim_imgs.pop(_name, None)
+            anim_caches[_name] = _buf
+        # OK 图形同样按「当前尺寸 + 当前方案」预缩放（分层窗口要 1:1 合成）
+        ok_glyph = None
         if getattr(self, "_ok_img", None):
             img, iw, ih = self._ok_img
             gh = max(1, int(round(ok_spec(lay)["g_h"])))
@@ -1751,32 +2324,82 @@ class WhalePet:
             tmp = Surface(gw, gh)
             tmp.clear()
             tmp.image(img, 0, 0, gw, gh)
-            self._ok_glyph_cache = (tmp, gw, gh)
-            self._cache_surfs.append(tmp)
+            ok_glyph = (tmp, gw, gh)
+            cache_surfs.append(tmp)
+        return anim_caches, cache_surfs, ok_glyph
 
-        # 眨眼贴片同样预缩放到显示尺寸：贴片坐标在「画布坐标系」里，而立绘按画布高 ph 绘制，
-        # 所以换算系数 k = ph / 画布高。每帧只做一次 1:1 AlphaBlend（带全局 alpha）。
-        self._blink_cache = {}
-        for state, ent in getattr(self, "_blink_patches", {}).items():
-            rect = ent["rect"]; cw, ch = ent["canvas"]
-            if cw <= 0 or ch <= 0 or rect[2] <= 0 or rect[3] <= 0:
-                continue
-            k = ph / ch
-            pw2 = max(1, round(rect[2] * k))
-            ph2 = max(1, round(rect[3] * k))
-            x_disp = round(rect[0] * k)
-            y_disp = round(rect[1] * k)
-            # 贴片矩形在画布坐标系里；镜像立绘（_f）时左右翻转 → 预算一份镜像 x
-            x_mirror = round((cw - (rect[0] + rect[2])) * k)
-            scaled = []
-            for g in ent["slots"]:
-                tmp = Surface(pw2, ph2)
-                tmp.clear()
-                tmp.image(g, 0, 0, pw2, ph2)
-                scaled.append(tmp)
-                self._cache_surfs.append(tmp)
-            self._blink_cache[state] = {"slots": scaled, "x": x_disp, "y": y_disp,
-                                        "w": pw2, "h": ph2, "x_mirror": x_mirror}
+    def _apply_cache(self, anim_caches, cache_surfs, ok_glyph, sig):
+        """把一份建好的缓存换上（**只能在 UI 线程调用**），并回收旧的对象。"""
+        for tmp in getattr(self, "_cache_surfs", []):
+            try:
+                tmp.close()
+            except Exception:
+                pass
+        self._anim_caches = anim_caches or {}
+        self._ok_glyph_cache = ok_glyph
+        self._cache_surfs = list(cache_surfs or [])
+        self._cache_sig_done = sig
+        self._drawn_sig = None
+
+    def _rebuild_cache_async(self, sig):
+        """后台重建帧缓存：UI 线程不等待，先用旧缓存（拉伸）顶到新就位。
+
+        期间窗口已按新尺寸重排、`_cache_building=True` 让 `_draw_anim_frame` 放宽
+        "尺寸差太多就跳过"那条规则（否则缩放跳档时她会**整帧不画 = 消失**）。
+        """
+        if self._cache_building:
+            self._cache_pending_sig = sig          # 正在建 → 记下最新目标，建完再跟一轮
+            return
+        self._cache_building = True
+
+        def job():
+            try:
+                objs = self._build_cache_objects()
+                err = None
+            except BaseException as e:             # 后台线程：异常只能自己咽下
+                objs, err = None, e
+            if err is not None:
+                try:
+                    log_exception(f"[cache] 后台重建失败: {err}")
+                except Exception:
+                    pass
+            self._cache_new = (sig, objs)          # 原子换引用，UI 线程下一 tick 取走
+
+        threading.Thread(target=job, daemon=True, name="komi-cache-build").start()
+
+    def _wait_cache_new(self):
+        """（UI 线程）把后台建好的缓存换上；有更新的目标就再跟一轮。"""
+        got = self._cache_new
+        if got is None:
+            return
+        self._cache_new = None
+        sig, objs = got
+        self._cache_building = False
+        if objs is not None:
+            self._apply_cache(objs[0], objs[1], objs[2], sig)
+            self._drawn_sig = None
+            self.draw()
+        nxt = self._cache_pending_sig
+        self._cache_pending_sig = None
+        if nxt is not None and nxt != self._cache_sig_done:
+            self._rebuild_cache_async(nxt)
+
+    def _build_draw_cache(self):
+        """同步重建（启动首建用；改尺寸一律走 `_rebuild_cache_async`）。
+
+        2026-09-28：原 `_build_sprite_cache` 里的**立绘 / 眨眼贴片 / 形态尺寸归一**
+        三部分随 v3 立绘一起删除，只剩这两样。
+        """
+        for tmp in getattr(self, "_cache_surfs", []):
+            try:
+                tmp.close()
+            except Exception:
+                pass
+        self._cache_surfs = []
+        if not getattr(self, "surf", None):
+            return
+        anim_caches, surfs, okg = self._build_cache_objects()
+        self._apply_cache(anim_caches, surfs, okg, self._cache_sig())
 
     def _place(self):
         lay = self._layout()
@@ -1786,33 +2409,57 @@ class WhalePet:
             x, y = saved
         else:
             x, y = ax + aw - lay["W"] - 20, ay + ah - lay["H"] - 16
-        x = max(ax + 4, min(x, ax + aw - lay["W"] - 4))
-        y = max(ay + 4, min(y, ay + ah - lay["H"] - 4))
+        bx0, by0, bx1, by1 = self._drag_bounds(lay)
+        x = max(bx0, min(x, bx1))
+        y = max(by0, min(y, by1))
         self._move_window(self.hwnd, int(x), int(y))
         self._home = (int(x), int(y))
 
     def _move_window(self, hwnd, x, y):
-        _user32.SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, 0, 0,
-                             SWP_NOSIZE | SWP_NOACTIVATE)
+        # 菜单开着时**只挪位置、不碰 z 序**：菜单是自绘 topmost 窗口，靠每次绘制
+        # `_pin_top()` 压在桌宠之上；桌宠若在这期间再抢一次 TOPMOST，人物就会盖回
+        # 菜单（用户报障现场）。SWP_NOZORDER 让 hWndInsertAfter 参数直接被忽略。
+        flags = SWP_NOSIZE | SWP_NOACTIVATE | (SWP_NOZORDER if self._menu_open else 0)
+        _user32.SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, 0, 0, flags)
 
     def _window_xy(self, hwnd):
         r = RECT()
         _user32.GetWindowRect(hwnd, ctypes.byref(r))
         return r.left, r.top
 
-    def _snap(self, x, y):
-        """贴边吸附：松手距边缘 ≤ DRAG_EDGE 则贴边（含四角组合）。"""
-        lay = self._layout()
+    def _drag_bounds(self, lay):
+        """窗口可移动范围 (min_x, min_y, max_x, max_y)。
+
+        ⚠️ 上界**不能**取「工作区上沿 + 4」：窗口上沿之上还有一大段**透明留白**
+        （气泡区 162*sc + 帧内上方的透明边 ≈ 300+px），拿窗口上沿当"头顶"会让
+        桌宠离屏幕上边空出一大截 —— 2026-09-29 用户报障「向上移动只能达到这里」。
+        改成按**可见内容顶**算上界（气泡开着 = 气泡上沿，关气泡 = 人物头顶）：
+        允许那段透明留白整段顶出屏幕外，可见内容能贴到屏幕上边。
+        左右与下界不用改（人物底边本就贴着窗口底边）。
+        """
         ax, ay, aw, ah = work_area()
+        min_y = int(ay - self._dead_top(lay) + 4)
+        max_y = int(ay + ah - lay["H"] - 4)
+        return (int(ax + 4), min(min_y, max_y),
+                int(ax + aw - lay["W"] - 4), max_y)
+
+    def _snap(self, x, y):
+        """贴边吸附：松手距边缘 ≤ DRAG_EDGE 则贴边（含四角组合）。
+
+        边界与拖动夹取**同源**（`_drag_bounds`）—— 否则吸附能把窗口推到
+        夹取范围之外，下次启动 `_place` 又会把它拽回来（位置会"神秘"漂移）。
+        """
+        lay = self._layout()
+        bx0, by0, bx1, by1 = self._drag_bounds(lay)
         nx, ny = x, y
-        if x - ax <= DRAG_EDGE:
-            nx = ax
-        elif ax + aw - (x + lay["W"]) <= DRAG_EDGE:
-            nx = ax + aw - lay["W"]
-        if y - ay <= DRAG_EDGE:
-            ny = ay
-        elif ay + ah - (y + lay["H"]) <= DRAG_EDGE:
-            ny = ay + ah - lay["H"]
+        if x - bx0 <= DRAG_EDGE:
+            nx = bx0
+        elif bx1 - x <= DRAG_EDGE:
+            nx = bx1
+        if y - by0 <= DRAG_EDGE:
+            ny = by0
+        elif by1 - y <= DRAG_EDGE:
+            ny = by1
         return int(nx), int(ny)
 
     # ---- 数据 / 后台健康 / 事件日志 ----
@@ -1839,10 +2486,14 @@ class WhalePet:
         """气泡三行文案。
 
         设计要点（修本轮用量实时刷新）：
-        - row1 标题 = "正在对话"（workbuddy.db 标记 working）或 "最近对话"（仅有 ODS 残留 turn）
+        - row1 标题 = "正在对话"（workbuddy.db 标记 working）或 "最近对话"（仅有 ODS 残留 turn）；
+          空态返回空串（2026-09-29 用户反馈：不显示"当前没有活跃会话"）
         - row2 数据 = self.latest_turn（ODS 最近有数据的 turn，不依赖 working 状态）
-          用时算到 now（live 模式，每 tick 重绘 +1s），保证用户能看到对话正在思考/已结束
-        - row3 副标 = 活跃时间 + 双击开看板
+          用时算到 now（live 模式，每 tick 重绘 +1s）；积分制 agent（credit>0）显示
+          "本轮 X 积分"（渲染端染粉），非积分 agent 只显示 tok/用时
+        - row3 恒为空串（2026-09-29 用户反馈：气泡第三行任何时候都不出现）——
+          原「今天：Codex 3 轮 · WorkBuddy 12 轮 · 双击开看板」/ 回退「活跃 X 分钟前」整体下线；
+          今日时间线数据保留在右键菜单「今日时间线」子菜单（_today_timeline 未删）
         """
         online = not (self.api_ok is False or not self.db_ok)
         live = self.latest_turn  # 最近 30 分钟内有数据的 turn（独立于 working）
@@ -1860,13 +2511,11 @@ class WhalePet:
             title = (live.get("title") or live.get("project") or "对话")
             row1 = f"最近对话 · {title[:12]}"
         elif not self.db_ok:
-            row1, row2, row3 = ("数据源读取中…", "等待 WorkBuddy 会话记录",
-                                "双击打开完整看板")
-            return row1, row2, row3
+            return "数据源读取中…", "等待 WorkBuddy 会话记录", ""
         else:
-            row1, row2, row3 = ("当前没有活跃会话", "双击打开看板查看今日用量",
-                                "数据每秒自动刷新")
-            return row1, row2, row3
+            # 空态（2026-09-29 用户反馈）：不显示"当前没有活跃会话"标题，
+            # 也不显示"数据每秒自动刷新"——只留一句引导（渲染端对空行跳过并聚拢）
+            return "", "双击打开看板查看今日用量", ""
 
         # ---- row2 数据：用 live（最近有数据 turn），不用 working 等待态 ----
         if live:
@@ -1877,29 +2526,23 @@ class WhalePet:
                 dur = fmt_duration_live(live)            # first_ts → now，每 tick 自动 +1
             else:
                 dur = fmt_duration(live)                # first_ts → last_ts，最终耗时
-            row2 = (f"本轮 {credit:.1f} 分 · {tokens} tok · 用时 {dur}")
+            # 积分制 agent（credit>0，如 WorkBuddy）→ "本轮 X 积分"（渲染端染樱花粉）；
+            # 非积分 agent（zcode/codex/claude 等 credit 恒 0）→ 不显示积分
+            # （原先恒显示"0.0 分"，对非积分 agent 是噪音——2026-09-29 用户反馈去除）
+            if credit > 0:
+                row2 = f"本轮 {credit:.1f} 积分 · {tokens} tok · 用时 {dur}"
+            else:
+                row2 = f"本轮 {tokens} tok · 用时 {dur}"
         else:
             # working 但 ODS 真的没数据（新对话刚开、第一笔调用未到达）——
             # 不显示 0（之前 bug），直接给"等待下一笔"
             row2 = "本轮等待首笔调用…"
 
-        # ---- row3 副标：P2 连续锚点 —— 跨 agent 叙述「今天：Codex 3 轮 · WorkBuddy 12 轮」
-        # （有数据用叙述；无数据回退"活跃 X 分钟前"；不变的是双击提示）
-        tl_summary, _tl_recent = self._today_timeline()
-        tail = " · 双击开看板"
-        if tl_summary:
-            row3 = "今天：" + format_timeline_summary(tl_summary) + tail
-        else:
-            if working_turn:
-                ago = fmt_ago(working_turn.get("_last_act")
-                              or working_turn.get("last_ts") or 0)
-            elif live:
-                ago = fmt_ago(live.get("last_ts") or 0)
-            else:
-                ago = "-"
-            proj = ((live or {}).get("project") or "").strip()
-            row3 = f"活跃 {ago}" + (f" · {proj}" if proj else "") + tail
-        return row1, row2, row3
+        # ---- row3：整体下线（2026-09-29 用户反馈「图中圈出的地方删除，任何时候都不要出现」）----
+        # 曾是 P2 连续锚点的跨 agent 叙述「今天：Codex 3 轮 · WorkBuddy 12 轮 · 双击开看板」
+        # （无数据回退「活跃 X 分钟前 · 项目 · 双击开看板」）。气泡从此固定最多两行。
+        # _today_timeline / format_timeline_summary 仍被右键菜单「今日时间线」子菜单使用，保留。
+        return row1, row2, ""
 
     def _in_talk(self):
         return self._talk_until and time.time() < self._talk_until
@@ -1938,6 +2581,52 @@ class WhalePet:
         self._motion_sig = None
         self._report_event("bubble_mode", detail=mode)
 
+    def _clear_stuck_drag(self):
+        """拖拽卡死兜底：左键实际已抬起、状态却还停在"拖拽中" → 清掉。
+
+        为什么必须兜底：`tick` 里的数据刷新被 `if not self._dragging` 包着 ——
+        一旦 `_dragging` 卡在 True，**整条数据链（活跃会话数 / 气泡 / 动作流转的
+        喂数）就永久停摆**，她就定在当前动作不动（用户报的"卡在某个状态"）。
+        成因是抬起事件没送到窗口：捕获被别的窗口抢走、菜单模态期被吃掉、
+        或鼠标在别处松开。这里只看「物理按键还在不在」——最可靠的真相。
+        """
+        if self._dragging and not (_user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000):
+            self._dragging = False
+            self._pressed = False
+            self._swallow_up = False
+            self._drawn_sig = None
+            self._report_event("drag_stuck_cleared")
+            return True
+        return False
+
+    def _read_stale(self, ok, now):
+        """读数是否已"连续失败太久"（→ 调用方应放弃记着的活跃会话）。返回 bool。
+
+        ok=True 时刷新成功时刻。ok=False 且距上次成功超过 READ_STALE_SEC → True。
+        为什么需要：`query_db` 失败时约定保留上次值防闪烁，但失败若持续下去，
+        "上次值"就变成了永久真理——她会一直以为自己有任务在跑。
+        """
+        if ok:
+            self._read_ok_at = now
+            return False
+        return bool(self._read_ok_at and now - self._read_ok_at > READ_STALE_SEC)
+
+    def _stable_active_n(self, n_raw, now):
+        """活跃数防抖：**上升立即生效**，**下降需连续 ACTIVE_FALL_DEBOUNCE_S**。
+
+        为什么只对下降防抖：来任务要马上拿本子（延迟看得出来），而"任务结束"
+        是唯一会让桌宠回落的时刻——宿主 working 行/数据源短抖会让 n 掉到 0 又弹回，
+        她就当着用户的面反复"举本子 → 坐下 → 拿本子"。几秒确认窗口即可滤掉这类抖动。
+        """
+        if n_raw >= self._n_stable:                  # 上升（或与已生效值相同）→ 立即
+            self._n_stable, self._n_hold_since = n_raw, 0.0
+        else:
+            if self._n_hold_since <= 0.0:
+                self._n_hold_since = now             # 开始计"已经降下来多久"
+            if now - self._n_hold_since >= self._fall_debounce_s:
+                self._n_stable, self._n_hold_since = n_raw, 0.0
+        return self._n_stable
+
     def _sync_bubble_mode(self):
         """用「运行中会话数」的迁移驱动形态切换（每 tick 一次）。
 
@@ -1945,17 +2634,19 @@ class WhalePet:
           n > 0 且当前是 OK                            → 回数据态
                               （新任务在跑却挂"完成"会误导，必须让位）
         首次取样只建基线（prev is None），不据它触发——否则启动瞬间就会误判。
+        n 取**防抖后的稳定值**：写字动作与气泡共用它，两者不可能不一致。
         """
-        n = len(self.active)
+        now = time.time()
+        n = self._stable_active_n(len(self.active), now)
         prev = self._prev_active_n
         self._prev_active_n = n
-        # ★ 本子与气泡**共用这一处判据**（见 wb_notebook 模块头）：
+        # ★ 写字动作与气泡**共用同一处判据**（同一个 n）—— 见 wb_anim.WritingPhase 模块头。
         #   任务开始 / 进行中 / 完成三者不可能对不上 —— 否则会出现
-        #   "气泡说完成了、本子还在写"这种自相矛盾的画面。
-        moved = self._nb.feed(n, time.time(), self._nb_stats())
+        #   "气泡说完成了、她还在写"这种自相矛盾的画面。
+        moved = self._wr.feed(n, now)
         if moved:
-            self._report_event("notebook_" + moved,
-                               detail=f"n={n} page={self._nb.page} lines={self._nb.lines}")
+            self._report_event("write_" + moved,
+                               detail=f"n={n} act={self._wr.act}")
             self._drawn_sig = None
         if prev is None:
             return
@@ -2244,6 +2935,8 @@ class WhalePet:
             return
         if not self._wb_gone_since:
             self._wb_gone_since = now
+            # 首次判定"看不见宿主" → 留痕（哪怕宽限期内又恢复，也留证据，便于查误杀）
+            self._report_event("host_gone", detail=f"presence={self._host_alive()}")
         self._wb_gone_checks += 1
         if (self._wb_gone_checks >= MOTION.LINKED_CLOSE_CONFIRM_CHECKS
                 and now - self._wb_gone_since >= MOTION.LINKED_CLOSE_GRACE_S):
@@ -2254,7 +2947,10 @@ class WhalePet:
         if self._linked_closed:
             return
         self._linked_closed = True
-        self._report_event("linked_close", detail="workbuddy_exit")
+        self._report_event("linked_close",
+                           detail="host_gone %ds checks=%d"
+                                  % (int(time.time() - (self._wb_gone_since or time.time())),
+                                     self._wb_gone_checks))
         try:
             _user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
         except Exception:
@@ -2263,6 +2959,58 @@ class WhalePet:
             except Exception:
                 pass
 
+    # ---- 动作音效（跟着动作走，不是跟着点击走）----
+
+    def _load_anim_sfx(self):
+        """读 `assets/anim/<动作>/_sfx.wav`。缺哪个就少哪个，不报错。"""
+        out = {}
+        if winsound is None:
+            return out
+        # 注意：写字那段**也有音轨**，别漏（2026-09-28 漏过一次）
+        for name in ("idle", "sleepy", "pickup", "write"):
+            p = os.path.join(ASSETS_DIR, "anim", name, "_sfx.wav")
+            try:
+                with open(p, "rb") as f:
+                    out[name] = f.read()
+            except Exception:
+                pass
+        return out
+
+    def _play_anim_sfx(self, act, clip_name):
+        """动作切换 → 换音效。待机/困了循环播，其余播一遍。
+
+        幂等：同一个 (动作, 素材) 重复调用不会重头开始（否则每帧都会重播）。
+        """
+        key = (act, clip_name)
+        if self._anim_sfx_act == key:
+            return
+        self._anim_sfx_act = key
+        if winsound is None or not self.sound_on:
+            return
+        data = self._anim_sfx.get(clip_name)
+        if not data:
+            self._stop_anim_sfx()          # 这个动作没音轨（如变困）→ 保持安静
+            self._anim_sfx_act = key       # 但记住它，别每帧重试
+            return
+        flags = winsound.SND_MEMORY | winsound.SND_ASYNC
+        # 循环播的三种：待机 / 困了 / 写字 —— 都是**持续状态**，
+        # 播一遍就没声了，必须挂 SND_LOOP。素材与循环动画几乎等长，音画基本同步。
+        if act in (ANIM.ACT_IDLE, ANIM.ACT_SLEEPY, ANIM.ACT_WRITE):
+            flags |= winsound.SND_LOOP
+        try:
+            winsound.PlaySound(data, flags)
+        except Exception:
+            pass
+
+    def _stop_anim_sfx(self):
+        """停掉动作音效（切换动作、关掉开关、退出时用）。"""
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+        self._anim_sfx_act = None
+
     # ---- 互动反应（傲娇四档）----
     def _play(self, key):
         if not (self.sound_on and key in self._sounds):
@@ -2270,53 +3018,11 @@ class WhalePet:
         try:
             winsound.PlaySound(self._sounds[key],
                                winsound.SND_MEMORY | winsound.SND_ASYNC)
+            # winsound 一次只播一个：互动音效把动作音效顶掉了，0.6s 后接回来
+            self._sfx_resume_at = time.time() + 0.6
         except Exception:
             pass
 
-    def _react(self):
-        """点立绘触发：按 4s 窗口内点击次数分档（害羞→傲娇→嘟嘴→爆发喷水）。"""
-        now = time.time()
-        self._clicks = [t for t in self._clicks if now - t < REACT_WINDOW]
-        self._clicks.append(now)
-        n = len(self._clicks)
-        if n <= 2:
-            tier, pool, face, snd = 1, QUOTES_SHY, "blush", "pop"
-            hearts, spray, wamp, wdur, rdur = 3, 0, 0.0, 0.0, 3.0
-        elif n <= 4:
-            tier, pool, face, snd = 2, QUOTES_TSUNDERE, "blush", "chirp"
-            hearts, spray, wamp, wdur, rdur = 5, 0, 4.0, 0.5, 3.2
-        elif n <= 6:
-            tier, pool, face, snd = 3, QUOTES_POUT, "pout", "hmph"
-            hearts, spray, wamp, wdur, rdur = 0, 0, 6.0, 0.7, 3.2
-        else:
-            # 2026-09-26 v3：第四档 face 由 "pout" 改为 "stone"——它的文案标签本来就写着
-            # 「石化」，旧值与标签自相矛盾（改后 stone 态也有了稳定触发入口）
-            tier, pool, face, snd = 4, QUOTES_OUTBURST, "stone", "splash"
-            hearts, spray, wamp, wdur, rdur = 0, 12, 7.0, 0.9, 3.5
-        q = random.choice(pool)
-        while q == self._last_quote and len(pool) > 1:
-            q = random.choice(pool)
-        self._last_quote = q
-        self._quote = q
-        self._quote_dur = f"{ {1:'害羞',2:'紧张',3:'傲娇',4:'石化'}[tier] } · 第 {n} 次"
-        self._talk_until = now + rdur
-        self._react_until = now + rdur
-        self._react_face = face
-        if wdur:
-            self._wobble_until = now + wdur
-            self._wobble_amp = wamp * self.scale
-            self._wobble_dur = wdur
-        lay = self._layout()
-        cx = lay["W"] / 2
-        head_y = lay["bubble_h"] + lay["pet_h"] * 0.16
-        if hearts:
-            self._spawn_particles("heart", hearts, cx, head_y + lay["pet_h"] * 0.2)
-        if spray:
-            self._spawn_particles("drop", spray, cx, head_y)
-        self._play(snd)
-        self._arm_watch()
-        self._report_event(f"react_tier{tier}", detail=f"n={n}")
-        self._drawn_sig = None
 
     def _spawn_particles(self, kind, count, cx, cy):
         for _ in range(count):
@@ -2342,7 +3048,20 @@ class WhalePet:
 
     # ---- 生命力：动画帧驱动（常驻 66ms）----
     def _anim_tick(self):
+        """逐帧动效。**菜单弹出期间照常跑**（2026-09-29 改）。
+
+        原来这里的 `if self._menu_open: return` 是 owner-draw 时代的产物 —— 那时菜单
+        是系统 `TrackPopupMenu`（同线程 + 系统擦除），重绘会和它抢 UI 线程。
+        现在菜单是**独立的自绘分层窗口**（各自 Surface / 各自 ULW），谁也干扰不到谁，
+        所以闸门只剩一个副作用：**菜单一开人物就冻住**（用户报障原话）。
+        唯一要防的是「桌宠把自己重新置顶、把菜单压下去」→ 见 `_move_window`。
+        """
         now = time.time()
+        self._anim_last_tick = now        # 高精度时钟看门狗用（见 tick）
+        # ⓪ 拖拽卡死兜底（见 _clear_stuck_drag）
+        self._clear_stuck_drag()
+        # ⓪.5 后台重建好的帧缓存该换上了（改「桌宠大小」后不阻塞 UI）
+        self._wait_cache_new()
         dt = ANIM_MS / 1000.0
         # ① 粒子物理
         alive = []
@@ -2358,8 +3077,6 @@ class WhalePet:
             p["y"] += p["vy"] * dt
             alive.append(p)
         self._particles = alive
-        if now > self._react_until:
-            self._react_face = None
         # ② 窗口漂移插值（随机游动）
         if self._drift and not self._dragging:
             d = self._drift
@@ -2395,29 +3112,32 @@ class WhalePet:
         # ④ 空闲自主行为调度（用户交互/反应期间暂停）
         if (now - self._last_interact > IDLE_AFTER
                 and now >= self._next_behavior
-                and not self._dragging and now > self._react_until):
+                and not self._dragging):
             self._behavior()
         # ⑤ 视线 / 悬停：由光标位置推导（提案 §3）
         self._update_pointer_state()
         # ⑤ 提案 §1 待机三件套 + §3 微交互 + §2 情绪：统一计算本帧的位移量
         self._update_motion(now)
-        # ⑥ 写字本子：阶段流转 + 逐行落墨（纯逻辑，不绘制）
-        self._nb.tick(now)
+        # ⑥ 动作流转：一次性动作播完自动接下一段；待机久了开始犯困
+        self._wr.note_activity(self._last_interact)   # 用户多久没搭理（拖拽/点击都会刷新）
+        moved = self._wr.tick(now)
+        if moved:
+            self._drawn_sig = None
+        # 互动音效早该播完了 → 把动作音效接回来（否则点一下之后就永远静音）
+        if self._sfx_resume_at and now >= self._sfx_resume_at:
+            self._sfx_resume_at = 0.0
+            self._anim_sfx_act = None
+            self._play_anim_sfx(self._wr.act, self._wr.clip_name(self._clips))
         # ⑥ 脏检测：把全部动效量化后拼成签名，只有签名变化才重绘（省电关键）
-        facing = self._current_facing(now)
         sig = self._sig()
-        msig = self._motion_signature(now, facing)
+        msig = self._motion_signature(now)
         dirty = (bool(self._particles) or self._drift is not None
-                 or now < self._wobble_until or now < self._react_until
+                 or now < self._wobble_until
                  or self._ok_animating(now)          # 气泡形态切换 / 点击脉冲 / 完成保持
-                 or self._fade is not None           # ★ 状态切换过渡期间必须每帧重绘
-                 or self._nb.visible()            # 本子在写字/展示 → 逐帧重绘
-                 or self._anim_play_now()         # 帧序列在播 → 逐帧重绘
+                 or self._anim_play_now()         # 帧序列在播 → 逐帧重绘（常态恒为真）
                  or msig != self._motion_sig
-                 or facing != getattr(self, "_facing_drawn", None)
                  or sig != self._drawn_sig)
         if dirty:
-            self._facing_drawn = facing
             self._motion_sig = msig
             self.draw()
             self._drawn_sig = sig
@@ -2425,156 +3145,25 @@ class WhalePet:
             self._auto_degrade(now)
 
     # ---- 提案 §3：点击身体部位切形态 ----
-    def _face_metrics(self, state, cbox):
-        """把眼部锚点换算成「内容框内的相对坐标」，供点击分区用。
 
-        返回 (ey, eh, ux0, ux1)：眼心在角色高度上的位置、眼高、脸列（左右眼外扩 35%）。
-        无锚点的态（如 joy，眼睛本就是闭的）返回 None，调用方走兜底比例。
-        """
-        fc = self._face_cfg(state, "")          # 用未镜像锚点：调用方已把坐标统一回未镜像系
-        eyes = (fc or {}).get("eyes") or {}
-        if len(eyes) < 2:
-            return None
-        vals = list(eyes.values())
-        cy = sum(v["cy"] for v in vals) / len(vals)
-        h = sum(v["h"] for v in vals) / len(vals)
-        left = min(v["cx"] - v["w"] / 2 for v in vals)
-        right = max(v["cx"] + v["w"] / 2 for v in vals)
-        x0, y0, x1, y1 = cbox
-        cw, ch = max(1e-6, x1 - x0), max(1e-6, y1 - y0)
-        mid = (left + right) / 2
-        half = (right - left) * 0.85            # 眼跨 + 两侧外扩
-        # 脸列宽度上限 = 角色宽度的 62%：紧凑趴姿的眼跨占身体比例极大，不夹的话
-        # 整条身体都会被判成 face，body 区消失（blush/stone 实测 body 只剩 1%）
-        half = min(half, 0.31 * cw)
-        return ((cy - y0) / ch, h / ch,
-                max(0.0, (mid - half - x0) / cw), min(1.0, (mid + half - x0) / cw))
 
-    def _body_region(self, x, y, lay):
-        """将立绘点击坐标映射到 4 个部位之一：'head' / 'face' / 'body' / 'skirt'。
-
-        2026-09-26 重写：旧实现按「立绘区高度的百分比」分区，前提是**立绘填满立绘区**。
-        v3 立绘是统一画布 + 底部对齐（角色上方留空，各态内容高只占画布 50%~95%），
-        那个前提不成立 —— 实测 8 态里 7 态错位：**点头顶判成 face、点眼睛判成 body**，
-        导致「摸头→joy」「戳脸→surprise」两个交互根本点不出来。
-
-        现在按**真实几何**分区：立绘实际绘制矩形（self._spr_rect，每帧记录）→
-        换算到画布归一化坐标 → 与该态的内容框、眼部锚点比对。
-        拿不到矩形时（首帧之前）退回旧口径，保证不会因为顺序问题崩。
-        """
-        rect = getattr(self, "_spr_rect", None)
-        key = getattr(self, "_spr_key", None)
-        if rect and key:
-            state, facing = key
-            cbox = getattr(self, "_spr_cbox", {}).get(state)
-            if cbox:
-                sx, sy, sw, sh = rect
-                # 点击点 → 画布归一化坐标；镜像立绘翻回未镜像系（与内容框、锚点一致）
-                cx = (x - sx) / max(1.0, sw)
-                cy = (y - sy) / max(1.0, sh)
-                if facing == "_f":
-                    cx = 1.0 - cx
-                x0, y0, x1, y1 = cbox
-                # ⚠️ 边界判定必须留**亚像素容差**：点击坐标来自 int() 取整（鼠标/测试都一样），
-                # 而取整会向下截断最多 1px。若某态内容框的上边缘离采样行不足 1px（实测 stone
-                # 只有约 0.7px），"点头发最顶上那一两个像素"就会被判成框外 → 返回 body，
-                # 表现为「点头顶没反应/反应不对」（test_hit_regions 的 stone 用例就是这么挂的）。
-                eps_x = 1.5 / max(1.0, sw)
-                eps_y = 1.5 / max(1.0, sh)
-                if not (x0 - eps_x <= cx <= x1 + eps_x and y0 - eps_y <= cy <= y1 + eps_y):
-                    return "body"           # 落在角色本体之外（画布留白，通常已被穿透）
-                ux = min(1.0, max(0.0, (cx - x0) / max(1e-6, x1 - x0)))   # 钳制：容差区按边界算
-                uy = min(1.0, max(0.0, (cy - y0) / max(1e-6, y1 - y0)))
-                fm = self._face_metrics(state, cbox)
-                if fm:
-                    ey, eh, ux0, ux1 = fm
-                    if ux0 <= ux <= ux1 and (ey - 0.60 * eh) < uy <= (ey + 1.40 * eh):
-                        return "face"       # 眼→嘴那一段，且限定在脸的窄列里
-                    if uy <= max(0.35, min(0.62, ey + 1.60 * eh)):
-                        return "head"       # 眼线以上：头发/刘海/额头
-                else:
-                    if uy <= 0.20:
-                        return "head"
-                    if 0.20 <= uy <= 0.45 and 0.35 <= ux <= 0.65:
-                        return "face"
-                if uy >= 0.78:
-                    return "skirt"          # 裙摆/膝
-                return "body"
-        # ---- 兜底：拿不到立绘矩形时按旧口径 ----
-        ph = lay["pet_h"]
-        bh = lay["bubble_h"]
-        if not (bh <= y <= bh + ph):
-            return "body"
-        ry = (y - bh) / max(1.0, ph)
-        rw = x / max(1.0, lay["W"])
-        if 0.00 <= ry <= 0.18:
-            return "head"
-        if 0.18 <= ry <= 0.45 and 0.35 <= rw <= 0.65:
-            return "face"
-        if ry >= 0.78:
-            return "skirt"
-        return "body"
-
-    def _morph_by_region(self, region):
-        """根据点击部位切形态 + 写人设台词（摸头害羞/戳脸石化/戳身互动/戳裙委屈）。
-
-        形态保持 MORPH_HOLD_S 秒后自动消失，期间 _draw_pet 优先用此形态。
-        """
-        now = time.time()
-        if region in ("head", "face"):
-            # 交互级 §三.2：点击头部/脸部 → 受惊连眨（快速双连眨）
-            self._blinker.startle(time.time())
-        if region == "head":
-            # 2026-09-26 v3：摸头顶 → joy（比耶开心），替代旧的 blush；
-            # blush 仍由 _react 一/二档（戳身）与打招呼触发，不会失联
-            pool, face, snd, state = QUOTES_HEAD, "joy", "chirp", "joy"
-            hearts = 3; spray = 0; wamp = 0.0; wdur = 0.0; rdur = 0.0
-            self._react_until = now + MORPH_HOLD_S   # 抑制 _react 重入
-        elif region == "face":
-            # 2026-09-26 v3：戳脸 → surprise（睁大眼+张嘴，被戳一下愣住）；
-            # 旧映射是 stone（石化），现由 _react 第四档承接（其标签本就叫"石化"）
-            pool, face, snd, state = QUOTES_FACE, "surprise", "splash", "surprise"
-            hearts = 0; spray = 0; wamp = 6.0; wdur = 0.6; rdur = MORPH_HOLD_S
-            self._react_until = now + MORPH_HOLD_S
-        elif region == "skirt":
-            pool, face, snd, state = QUOTES_SKIRT, "pout", "hmph", "pout"
-            hearts = 0; spray = 6; wamp = 5.0; wdur = 0.7; rdur = MORPH_HOLD_S
-            self._react_until = now + MORPH_HOLD_S
-        else:
-            # 'body'：保持原 _react 四档逻辑（4s 内点击次数分档）
-            self._react()
-            return
-        q = random.choice(pool)
-        while q == self._last_quote and len(pool) > 1:
-            q = random.choice(pool)
-        self._last_quote = q
-        self._quote = q
-        # 文案标签：摸头→开心 / 戳脸→愣住 / 戳裙→委屈
-        labels = {"head": "开心", "face": "愣住", "skirt": "委屈"}
-        self._quote_dur = labels.get(region, region)
-        self._talk_until = now + MORPH_HOLD_S
-        self._react_face = face
-        if wdur:
-            self._wobble_until = now + wdur
-            self._wobble_amp = wamp * self.scale
-            self._wobble_dur = wdur
-        lay = self._layout()
-        cx = lay["W"] / 2
-        head_y = lay["bubble_h"] + lay["pet_h"] * 0.16
-        if hearts:
-            self._spawn_particles("heart", hearts, cx, head_y + lay["pet_h"] * 0.2)
-        if spray:
-            self._spawn_particles("drop", spray, cx, head_y)
-        self._play(snd)
-        self._arm_watch()
-        self._report_event(f"morph_{region}", detail=q)
-        # 关键：设临时形态，让 _draw_pet 在 MORPH_HOLD_S 内优先用此 sprite
-        self._morph_state = state
-        self._morph_until = now + MORPH_HOLD_S
-        self._drawn_sig = None
-        self._motion_sig = None
 
     # ---- 提案 §1：待机动效与微交互的逐帧计算 ----
+    def _body_tap_feedback(self, lay):
+        """点身体的轻量反馈（2026-09-28 起**不再切形态**）：晃一下 + 冒颗爱心 + 音效。
+
+        单击与双击身体**共用这一处** —— 以前两处各自调 `_react()`，那套「按点击频率
+        分档切形态」已随 v3 立绘删除。
+        """
+        fb = getattr(MOTION, "CLICK_FEEDBACK_S", 1.2)
+        self._wobble_until = time.time() + fb
+        self._wobble_amp = 3.0 * self.scale
+        self._wobble_dur = fb
+        self._spawn_particles("heart", 1, lay["W"] / 2,
+                              self._anim_content_top(lay) - 6 * lay["sc"])
+        self._play("chirp")
+        self._drawn_sig = None
+
     def _long_press_release(self, lay):
         """提案 §3 长按：憋了半天 → 松手时噗地喷几滴水花。"""
         cx = lay["W"] / 2
@@ -2676,21 +3265,8 @@ class WhalePet:
             self._float_dy = 0.0
             self._shadow_scale = 1.0
 
-        # ④ 眨眼状态机 v2（精简/完整档才有）——三层标准：
-        #    注视（悬停）/工作中 → 8~12s 注视式慢眨；夜间 → 频率降 + 半眯眼；
-        #    常态 3~8s 完全随机；拖拽/被端详/反应动画禁眨；久无人偶发慢眨
-        if q != MOTION.QUALITY_OFF:
-            bl = self._blinker
-            bl.attention = self._hovering          # 鼠标注视联动（§三.1）
-            bl.busy = bool(self.active)            # 工作中（会话 running）→ 专注态
-            bl.night = self._night_mode()          # 夜间联动（§三.4）
-            bl.suppressed = self._blink_vetoed(now)
-            bl.idle = idle_long
-            bl.tick(now)
-            # §一.2 眨眼不是孤立运动：伴随 1~2px 头部微点（nod 包络随眨眼起伏）
-            self._breath += self._blinker.nod(now) * MOTION.BLINK_NOD_PX
-        else:
-            self._blinker.closed_until = self._blinker.open_until = 0.0
+        # ④ 原「眨眼状态机」随 v3 立绘一并删除 —— 写字帧序列里她本来就在眨，
+        #    不需要再用贴片去驱动一层眼皮。
 
         # ⑤ 视线：头部朝光标方向轻微偏移（±1.5px，lerp 平滑）
         if q == MOTION.QUALITY_OFF:
@@ -2721,23 +3297,6 @@ class WhalePet:
             self._emotion = MOTION.EMOTION_NEUTRAL
             self._emotion_until = 0.0
 
-    def _blink_vetoed(self, now):
-        """眨眼否决（这些时刻闭眼是 bug，进行中的眨眼由调度器跳睁开段收尾）：
-        - 拖拽 / 被端详（悬停）：用户在端详她时闭眼是缺陷
-        - 按压及其回弹（squash 曲线全程）
-        - OK 气泡弹入/弹出动画期间（眨眼永不与反应动画同期）
-        - 成功/欢迎情绪：眨眼让位给眯眼笑，不叠加
-        """
-        if self._dragging or self._hovering:
-            return True
-        if self._pressed or self._squash_t0:
-            return True
-        if self._bub_mode == BUBBLE_OK and self._ok_anim_dur \
-                and now < self._ok_anim_t0 + self._ok_anim_dur:
-            return True
-        if self._emotion in (MOTION.EMOTION_SUCCESS, MOTION.EMOTION_WELCOME):
-            return True
-        return False
 
     # ---- 跟随模式（设计文档 P1）：前台 → agent，去抖 + 未知态 ----
     def _today_timeline(self):
@@ -2946,7 +3505,7 @@ class WhalePet:
         self._squash_t0 = 0.0
         return 1.0
 
-    def _motion_signature(self, now, facing):
+    def _motion_signature(self, now):
         """把本帧所有动效量化成可比较的元组（脏检测用）。"""
         return (
             int(round(self._breath)),
@@ -2956,11 +3515,7 @@ class WhalePet:
             int(round(self._hover_t * 12)),
             int(round(self._squash * 100)),
             int(round(self._drag_tilt)),
-            # 眨眼态：量化到 4 级（≈15fps 的 2–4 帧）——部分眨眼最低只闭到 30–60%，
-            # 按 >0.5 判定会整段漏掉重绘，眼皮动了画面却不动
-            int(round(self._blinker.eye_opening_ratio(now) * 3)),   # 眨眼态
             self._emotion,
-            facing,
         )
 
     def _auto_degrade(self, now):
@@ -3007,9 +3562,6 @@ class WhalePet:
                                   lay["bubble_h"] + lay["pet_h"] * 0.3)
             self._play("chirp")
 
-    def _emotion_rise(self):
-        """当前情绪带来的身体上下偏置（px，正=上抬）。"""
-        return MOTION.EMOTION_RISE_PX.get(self._emotion, 0.0) * self.scale
 
     def _sync_data_emotion(self):
         """提案 §2：根据数据状态自动同步情绪（服务异常→委屈 / 空数据→空态）。
@@ -3044,8 +3596,6 @@ class WhalePet:
         self._quote = f"（在笔记本上写：{hello}，今天也一起加油吧）"
         self._quote_dur = "打招呼"
         self._talk_until = time.time() + 4.0
-        self._react_until = time.time() + 2.5
-        self._react_face = "blush"
         self._wobble_until = time.time() + 0.6
         self._wobble_amp = 4.0 * self.scale
         self._wobble_dur = 0.6
@@ -3071,21 +3621,6 @@ class WhalePet:
             dx = random.choice([-1, 1]) * random.uniform(20, 50)
             dy = random.uniform(-24, 24)
             self._start_drift(dx, dy, dur=random.uniform(1.4, 2.0))
-        elif choice == "flip":                   # 翻身（朝向翻转 3 秒）
-            self._flip_dir = "_f" if not self._current_facing(now) else ""
-            self._flip_until = now + 3.0
-            self._wobble_until = now + 0.5
-            self._wobble_amp = 3.0 * self.scale
-            self._wobble_dur = 0.5
-        elif choice == "emote":                  # 变换表情（脸红/开心一小会儿）
-            self._react_face = "blush"
-            self._react_until = now + 2.0
-            if self.bubble_on and random.random() < 0.4:
-                self._quote = random.choice(["盯——你在干嘛呀？", "嘿嘿，心情不错",
-                                             "今天的用量也很健康哦"])
-                self._quote_dur = "自言自语"
-                self._talk_until = now + 2.5
-                self._arm_watch()
         else:                                    # 扭扭身子
             self._wobble_until = now + 0.6
             self._wobble_amp = 3.5 * self.scale
@@ -3108,34 +3643,6 @@ class WhalePet:
         self._drift = {"x0": x, "y0": y, "x1": tx, "y1": ty,
                        "t0": time.time(), "dur": dur, "ret": ret}
 
-    def _current_facing(self, now):
-        """朝向决策：自主翻身覆盖 > 鼠标跟随（**须在判定范围内**，0.4s 防抖）> 保持。
-
-        ⚠️ 2026-09-27 用户要求：只在光标落入 `_cursor_in_gaze_box`（固定 443×465）时
-        才朝向鼠标；出范围保持当前朝向 —— 以前是「屏幕任何位置都翻转」。
-        """
-        if now < self._flip_until:
-            return self._flip_dir
-        if self._dragging:
-            return self._facing
-        lay = self._layout()
-        pt = POINT()
-        _user32.GetCursorPos(ctypes.byref(pt))
-        wx, wy = self._window_xy(self.hwnd)
-        if self._cursor_in_gaze_box(pt, wx, wy, lay):
-            off = pt.x - (wx + lay["W"] / 2)
-            if abs(off) > 60:                    # 鼠标明显偏向一侧 → 面朝鼠标
-                d = "_f" if off > 0 else ""
-                if d != self._facing:
-                    if self._follow_dir != d:
-                        self._follow_dir = d
-                        self._follow_since = now
-                    elif now - self._follow_since > 0.4:
-                        self._facing = d
-        else:
-            self._follow_dir = None
-            self._follow_since = 0.0
-        return self._facing
 
     # ---- 绘制 ----
     def draw(self):
@@ -3146,48 +3653,60 @@ class WhalePet:
         if self.bubble_on:
             self._draw_bubble(s, lay, now)
         self._draw_pet(s, lay)
-        # 写字本子画在立绘**之上**（她抱在身前，必须挡住身体）；
-        # 但它不占气泡区，想法小圆与气泡的位置完全不受影响。
-        self._draw_notebook(s, lay, now)
         s.present(self.hwnd)
 
-    def _sprite_content_top(self, lay):
-        """当前立绘**实际内容顶**的屏幕 y（拿不到就退回「气泡区下沿」）。
 
-        为什么必须动态取：v3 各态共用同一张画布（1167×1570），但**上方留白差别极大** ——
-        内容顶归一化位置 happy 0.041 / joy 0.120 / idle 0.355 / stone 0.489。
-        早期把想法小圆的终点写死在 `lay["bubble_h"]`（等于假设"头发顶正好在气泡区下沿"），
-        于是头顶偏低的态（pout/shy/idle/blush/stone）小圆与头顶之间会空出一大截
-        —— 正是用户反馈的「想法泡泡与桌宠连接空隙太大」（实测相差 18~167px）。
+    def _anim_content_top(self, lay):
+        """写字帧**实际内容顶**的屏幕 y（拿不到就退回「气泡区下沿」）。
 
-        直接用 `_spr_rect`/`_spr_key` 即可：`_draw_bubble` 比 `_draw_pet` 先跑，
-        这里读到的是**上一帧**记录的立绘矩形（1 帧 = 66ms，肉眼无感）。
+        为什么还是动态取：帧上方也有透明留白（content_box y0 = 0.357），
+        按画布矩形算会让气泡离脑袋空出一大截。`_draw_bubble` 比 `_draw_pet` 先跑，
+        所以这里读到的是**上一帧**的矩形（1 帧 66ms，肉眼无差别）。
         """
-        rect = getattr(self, "_spr_rect", None)
-        key = getattr(self, "_spr_key", None)
-        if rect and key:
-            cbox = getattr(self, "_spr_cbox", {}).get(key[0])
-            if cbox:
-                top = rect[1] + cbox[1] * rect[3]
-                sc = lay["sc"]
-                # 兜底钳制：首帧 / 极端缩放时别让连线缩进气泡里或跑出窗口
-                return min(max(top, lay["bubble_h"] + 6 * sc), lay["H"] - 24 * sc)
+        spr = getattr(self, "_spr_rect", None)
+        cbox = (getattr(self, "_spr_cbox", {}) or {}).get("__anim__")
+        if spr and cbox:
+            _x, y, _w, h = spr
+            return y + cbox[1] * h
         return lay["bubble_h"]
 
     def _bubble_box(self, lay):
         """主气泡椭圆的盒 (x, y, w, h)。
 
-        y 锚在「立绘实际内容顶上方 BUBBLE_CHAIN_PX」—— **不再钉死在窗口顶部**。
-        窗口顶部预留的气泡区高度是固定的，而各态头顶在立绘区里上下浮动（最大差 150px），
-        钉死会让 idle / pout / shy / blush / stone 这些"头顶偏低"的态离脑袋空出 100+px
-        （用户反馈「泡泡离脑袋太远」）。锚定后「气泡底 → 头顶」在各态下观感一致。
-
-        顶出窗口上沿时钳到 2px（happy 态头顶最高，本来几乎就贴着顶）。
+        y 锚在「帧内容顶上方 BUBBLE_CHAIN_PX」—— **不再钉死在窗口顶部**。
+        顶出窗口上沿时钳到 2px。**唯一的调参旋钮 = BUBBLE_CHAIN_PX**。
         """
         sc = lay["sc"]
         bh = lay["bub_h"]
-        by = self._sprite_content_top(lay) - BUBBLE_CHAIN_PX * sc - bh
+        by = self._anim_content_top(lay) - BUBBLE_CHAIN_PX * sc - bh
         return 6 * sc, max(2 * sc, by), lay["W"] - 12 * sc, bh
+
+    def _static_content_top(self, lay):
+        """**不开帧**也算得出的「人物可见内容顶」（拖动上界用；没素材 → None）。
+
+        与 `_draw_anim_frame` 的矩形算法同源，只忽略 hover / squash / 呼吸
+        （几 px 级动态项）—— 这样启动首帧（`_spr_rect` 还是 None）也算得准，
+        用户上次把桌宠停在贴屏顶部的位置能原样恢复。
+        """
+        clips = getattr(self, "_clips", None) or {}
+        name = (getattr(self, "_anim_key", None) or (None, None))[1]
+        clip = clips.get(name) or next(iter(clips.values()), None)
+        if clip is None:
+            return None
+        sc = lay["sc"]
+        ph_draw = (lay["pet_h"] - 8 * sc) * clip.head_scale
+        return lay["H"] - 4 * sc - ph_draw + clip.content_box[1] * ph_draw
+
+    def _dead_top(self, lay):
+        """窗口上沿 → 「可见内容最上沿」的距离（这一段全是透明留白）。
+
+        气泡开着算气泡上沿（气泡也是可见内容，不能让它被推出屏幕），
+        关气泡才算到人物头顶。拖动上界用它把这段留白"还"给用户。
+        """
+        if self.bubble_on:
+            return self._bubble_box(lay)[1]
+        top = self._static_content_top(lay)
+        return self._anim_content_top(lay) if top is None else top
 
     def _in_bubble(self, lay, py):
         """纵向坐标是否落在**主气泡椭圆**上（双击开看板 / 单击切台词的分区判定）。
@@ -3206,7 +3725,7 @@ class WhalePet:
         漫画思考泡惯例：圆从大到小指向源头，给眼睛一条"从头顶冒出"的引导线。
         数据态与 OK 态共用同一套几何，只换描边色 —— 形态切换时小圆不跳位。
 
-        终点锚在**当前态立绘的实际内容顶**（见 `_sprite_content_top`，各态可差 150px），
+        终点锚在**写字帧的实际内容顶**（见 `_anim_content_top`），
         并让颗数随跨度自适应：**首颗贴住气泡下沿、末颗贴住头顶**，
         跨度大就按 ~30px 步距多排几颗 —— 不再出现"小圆飘在半空、离头一大截"。
         """
@@ -3216,7 +3735,7 @@ class WhalePet:
         p0x = W / 2 - 22 * sc                       # 起点：主气泡底偏左
         p0y = by + bh + 4 * sc                      # 距主气泡下沿 4px
         p1x = W / 2 - 4 * sc                        # 终点：头顶偏中
-        p1y = self._sprite_content_top(lay) - 4 * sc    # 立绘实际内容顶上方 4px
+        p1y = self._anim_content_top(lay) - 4 * sc      # 帧内容顶上方 4px
 
         r_big, r_sml = 8.0 * sc, 3.8 * sc           # 大→小：近气泡的大、近头顶的小
         y0 = p0y + r_big                            # 首颗圆心：贴着气泡下沿
@@ -3235,7 +3754,7 @@ class WhalePet:
                       line_argb=line_argb, line_w=(3.0 - 0.6 * t) * sc)
 
     def _draw_bubble(self, s, lay, now):
-        """气泡分形态绘制：OK 态走 _draw_bubble_ok，其余走数据态三行文案。"""
+        """气泡分形态绘制：OK 态走 _draw_bubble_ok，其余走数据态文案（≤2 行）。"""
         if self._bub_mode == BUBBLE_OK or self._ok_animating(now):
             self._draw_bubble_ok(s, lay, now)
             return
@@ -3245,9 +3764,9 @@ class WhalePet:
         # 主椭圆（白底 + 藏蓝描边）
         s.ellipse(C_BUBBLE, bx, by, bw, bh, line_argb=C_BUBBLE_LINE, line_w=3.5 * sc)
         self._draw_thought_circles(s, lay, C_BUBBLE_LINE)
-        # 文案（藏蓝粗体，垂直居中三段）
+        # 文案（藏蓝粗体，垂直居中；第三行已下线 —— 2026-09-29 用户反馈"任何时候都不要出现"）
         if self._in_talk():
-            lines = [self._quote_dur, self._quote, "双击开看板 · 点我继续互动"]
+            lines = [self._quote_dur, self._quote, ""]
             sizes = (13 * sc, 15 * sc, 9.5 * sc)
             bolds = (True, True, False)
             cols = (C_TXT_HEAD, C_TXT_MAIN, C_TXT_DIM)
@@ -3256,9 +3775,16 @@ class WhalePet:
             sizes = (14.5 * sc, 12.5 * sc, 9.5 * sc)
             bolds = (True, True, False)
             cols = (C_TXT_HEAD, C_TXT_MAIN, C_TXT_DIM)
-        total_h = sum(sz * 1.5 for sz in sizes) + 8 * sc * 2
+            # 积分制会话（latest_turn.credit>0，见 _bubble_lines）→
+            # "本轮 X 积分" 染樱花粉（看板 --sakura）；非积分保持墨色
+            if (self.latest_turn or {}).get("credit"):
+                cols = (C_TXT_HEAD, C_TXT_PINK, C_TXT_DIM)
+        # 空行跳过（空态气泡只留一行引导）并垂直聚拢，避免留出空行位
+        rows = [(ln, sz, bd, col) for ln, sz, bd, col
+                in zip(lines, sizes, bolds, cols) if ln]
+        total_h = sum(sz * 1.5 for _, sz, _, _ in rows) + 8 * sc * 2
         ty = by + (bh - total_h) / 2
-        for ln, sz, bd, col in zip(lines, sizes, bolds, cols):
+        for ln, sz, bd, col in rows:
             s.ctext(ln, W / 2, ty, sz, col, bold=bd, maxw=bw - 56 * sc)
             ty += sz * 1.5 + 8 * sc
 
@@ -3352,261 +3878,92 @@ class WhalePet:
         # 整张平移：单次 blit 走 GDI 硬件 alpha 混合，自带抗锯齿，不存在接缝。
         s.blit(cached, x + head_dx, y, w, h)
 
-    def _pose_local_diff(self, k1, k2):
-        """两张立绘的"局部最大差异"（3×3 块的灰度均差最大值）。
 
-        为什么不用全图均值：均值会被大面积同色区（头发/外套）稀释——
-        实测 idle↔surprise 的全图均值只有 2.8（看不见差异），
-        但它俩的脸（半眯 vs 瞪眼张嘴）恰恰是双重曝光最刺眼的地方。
-        改用局部最大：能抓到"任何一小块是否差异够大"。
+
+
+
+    # ================= 帧序列：桌宠唯一形态「写字的她」=================
+    # 触发相位与气泡 OK 态**同源**（都是运行中会话数 n），见 wb_anim.WritingPhase。
+    # 常态（hidden / appear / writing）循环播「写字段」；
+    # 任务完成（present）播一遍「翻页 + 举本子展示」段，播完回到写字循环。
+
+    def _anim_image(self, i, name=None):
+        """按「动作 + 帧号」加载并缓存 GDI+ 位图。
+
+        以前只有写字一个动作，缓存 key 就是帧号；现在按动作分桶
+        （不同动作的帧号会撞车，混在一起会串帧）。
         """
-        if not self._pose_masks:
-            return 0.0            # 没有掩码数据 → 不做限制（退回原行为）
-        key = (k1, k2) if k1 <= k2 else (k2, k1)
-        hit = self._pose_diff_cache.get(key)
-        if hit is not None:
-            return hit
-        a, b = self._pose_masks.get(k1), self._pose_masks.get(k2)
-        w, h = self._pose_wh
-        if not a or not b or w <= 0:
-            self._pose_diff_cache[key] = 0.0
-            return 0.0
-        best = 0.0
-        for y in range(0, h - 2, 2):
-            row = y * w
-            for x in range(0, w - 2, 2):
-                s = 0
-                for dy in (0, 1, 2):
-                    o = row + dy * w + x
-                    s += abs(a[o] - b[o]) + abs(a[o + 1] - b[o + 1]) + abs(a[o + 2] - b[o + 2])
-                if s / 9.0 > best:
-                    best = s / 9.0
-        self._pose_diff_cache[key] = best
-        return best
-
-    def _draw_state_fade(self, s, key, x, y, w, h, now, state):
-        """状态切换的**交叉溶解**：把上一张立绘以递减 alpha 叠在新立绘之上。
-
-        为什么做：参考视频里姿态切换是**交叉溶解**而非硬切；本项目 09-25 的设计稿
-        也明确要求"2 帧渐入 / 2 帧渐出"，但当时因为「GDI 的 AlphaBlend 没有全局 alpha」
-        而改成"只用位移+缩放表达出现"。
-        **那个结论不准确** —— BLENDFUNCTION 的第 3 字节就是 SourceConstantAlpha，
-        `Surface.blit_a` 用的就是它（2026-09-26 实测确认）。
-
-        实现前提：v3 立绘**同画布、同底边**，所以两张图直接叠即可，无需额外对齐。
-        另：从反应态回到待机时先让角色眨一次眼（"回神"，设计稿 §4.3）。
-        """
-        prev = getattr(self, "_shown_key", None)
-        if not prev or prev == key:
-            self._fade = None
-            self._shown_key = key
-            return
-        # ★ 溶解闸门：两张立绘差异够大时**直接硬切**，不做交叉溶解。
-        # 为什么：交叉溶解只在两帧姿态/表情相近时才好看（参考视频就是如此）。
-        # 这套 8 态 Q 版姿态与表情差异都很大（实测局部最大差异 78~218，阈值 60），
-        # 硬做溶解 = 两张脸叠在一起的双重曝光 —— 用户反馈的"点击时多个重叠"就是它。
-        if self._pose_local_diff(prev, key) > MOTION.POSE_FADE_MAX_DIFF:
-            self._fade = None
-            self._shown_key = key
-            return
-        fade = getattr(self, "_fade", None)
-        if not fade or fade.get("from") != prev or fade.get("to") != key:
-            self._fade = fade = {"from": prev, "to": key, "t0": now}
-            prev_state = prev.split(".")[-1].replace("_f", "")
-            if state == "idle" and prev_state in REACT_FACES:
-                self._blinker.blink_now(now)   # 反应态回待机 → 先眨一次再回神
-        self._shown_key = key
-        p = (now - fade["t0"]) / max(1e-3, MOTION.STATE_FADE_S)
-        if p >= 1.0:
-            self._fade = None
-            return
-        src = self._sprite_cache.get(fade["from"])
-        if not src:
-            self._fade = None
-            return
-        a = int(round(255 * (1.0 - p)))        # 旧图淡出，露出新图
-        if a > 2:
-            s.blit_a(src[0], x, y, w, h, a)
-
-    def _draw_blink(self, s, x, y, w, h, now, state="idle", facing=""):
-        """三段式拟真眨眼绘制（依赖 BlinkScheduler 三段缓动）。
-
-        三阶段绘制（依 blink_phase）：
-          ① 闭眼段 (close)：上睑盖板从眼缝框顶下落 + 下睑微抬，闭得越多盖得越多
-          ② 保持段 (hold)：上下睑在框高 80% 处接触，画睫毛阴影线 + 重睑线
-          ③ 睁眼段 (open)：盖板反向收回
-          + idle (ratio=1)：不绘制
-
-        v4 眼缝锚定（_eye_config v4 / calib_face.py 标定）：框 = 上睑缘→下睑缘
-        之间的**可见暗区**。盖板行程全部发生在"看得见的眼睛"上——旧版从
-        "整眼框顶"下落，行程一半消耗在睫毛/头发区，部分眨眼（40-70% 深度）
-        几乎不可见，且盖板越界盖掉刘海发丝。盖板色用各状态实测的
-        lid_skin（眼底皮肤带均值），与发影下的脸色融合，不再是"亮胶带"。
-        部分眨眼（close_depth<1）上下睑不接触 → 永远不画接触线。
-        """
-        fc = self._face_cfg(state, facing)
-        if not fc:
-            return
-        ratio = self._blinker.eye_opening_ratio(now)
-        droop = False
-        if ratio >= 1.0:
-            # 夜间慵懒态（§三.4）：非眨眼时段的常驻半眯眼（眼睑覆盖 30%）；
-            # 拖拽中不画（避免和拖拽反馈叠加）。白天不画——诚实 > 氛围。
-            if self._night_mode() and not self._dragging:
-                ratio = 1.0 - MOTION.BLINK_NIGHT_DROOP
-                droop = True
-            else:
-                return
-        phase = self._blinker.blink_phase(now) if not droop else "droop"
-
-        # ---- 分层差分：有闭眼贴片的态直接合成**真实像素**（不再是椭圆盖板）----
-        # 按闭合度取「半闭档」：贴片是离线按"眼睑下落位置"做的垂直遮罩，
-        # 睑线以上用闭眼像素、以下保留睁眼像素 —— 这才是半闭，不是两张图混合。
-        # 夜间慵懒态（droop）仍走下面的椭圆路径：它是常驻半眯、不是眨眼。
-        patch = None if droop else self._blink_cache.get(state)
-        if patch:
-            slots = patch["slots"]
-            n = len(slots)
-            closure = 1.0 - max(0.0, min(1.0, ratio))
-            idx = int(round(closure * n))          # 0 = 完全睁眼（不画）
-            if idx >= 1:
-                idx = min(idx, n) - 1
-                px = patch["x_mirror"] if facing == "_f" else patch["x"]
-                s.blit(slots[idx], x + px, y + patch["y"], patch["w"], patch["h"])
-            return
-
-        skin = _lerp_argb(_argb(fc.get("lid_skin") or fc.get("skin_color")
-                                or "#FFF2EA"), _argb(fc.get("eyelid_color", "#2A2438")),
-                          MOTION.BLINK_LID_SHADE)
-        lid = _argb(fc.get("eyelid_color", "#2A2438"))
-        # 闭眼进度 0..1（close_p=1 全闭 → 0 不闭；ratio 是睁开度，1=全开 0=全闭）
-        close_p = 1.0 - ratio
-        for key in ("left", "right"):
-            e = (fc.get("eyes") or {}).get(key)
-            if not e:
-                continue
-            cx = x + e["cx"] * w
-            cy = y + e["cy"] * h
-            ew = e["w"] * w
-            eh = e["h"] * h
-            if eh < 1 or ew < 1:
-                continue
-
-            # === 眼缝几何（v4 约定）：top=上睑缘, bot=下睑缘 ===
-            top = cy - eh / 2
-            bot = cy + eh / 2
-            pad = max(1.0, eh * 0.10)          # 盖板与睫线带的重叠量，防漏缝
-            meet_y = top + (bot - top) * 0.80  # 全闭接触点：框高 80%（上睑主导）
-            rest = top + (bot - top) * MOTION.BLINK_LID_REST   # 盖板静止位（睫线带下缘）
-            # 闭眼越多，眼皮越往中间挤（宽度微收 6%，避免眼皮扁塌）
-            width_factor = 1.0 - close_p * 0.06
-
-            # === ①/③ 上睑盖板：从睫线带下缘钻出，全闭到 meet_y ===
-            # 立绘自带的深色睫线/发影带保持可见、充当"闭眼的上睑"——
-            # 盖板若从框顶出发会盖进刘海，发丝被"擦掉"（真机 4x 验证过）
-            cover_h = (meet_y - rest + pad * 0.6) * close_p
-            if cover_h > 0.5:
-                s.ellipse(skin,
-                          cx - ew * 0.52 * width_factor,
-                          rest - pad * 0.6,
-                          ew * 1.04 * width_factor,
-                          cover_h + pad * 0.6)
-
-            # === 下睑微抬：量取 BLINK_LOWER_LID=10%（上睑主导，下睑轻辅助）===
-            low_h = (bot - top) * MOTION.BLINK_LOWER_LID * close_p
-            if low_h > 0.5:
-                s.ellipse(skin,
-                          cx - ew * 0.52 * width_factor,
-                          bot - low_h,
-                          ew * 1.04 * width_factor,
-                          low_h + max(1.0, eh * 0.06))
-
-            # === ② 保持段：上下睑接触线 + 重睑线（部分眨眼不接触 → 不画）===
-            if phase == "hold" or (ratio < 0.18 and phase != "idle"):
-                # 睫毛阴影线：扁平深紫椭圆（眼睑接缝处的暗影，自然感）
-                lid_w = max(2.0, ew * 0.85)
-                lid_h = max(1.5, eh * 0.07)
-                s.ellipse(lid, cx - lid_w / 2, meet_y - lid_h / 2, lid_w, lid_h)
-                # 重睑线（古见是大眼，双睑效果明显）：上眼睑内沿一道细弧
-                # 用更浅的暗紫色（半透明模拟重睑阴影）+ 宽度略窄
-                fold_color = (int(0xC8 * (0.5 + 0.5 * ratio)) << 24) | 0x2A2438
-                fold_w = max(2.0, ew * 0.70)
-                fold_h = max(1.0, eh * 0.03)
-                fold_y = meet_y - eh * 0.04    # 接触线上方一点点（眼窝褶痕）
-                s.ellipse(fold_color, cx - fold_w / 2, fold_y - fold_h / 2,
-                          fold_w, fold_h)
-
-    def _draw_blush(self, s, x, y, w, h, state, facing, color):
-        """按当前立绘状态的实测脸颊坐标画腮红（配置缺失时回退几何估算）。"""
-        fc = self._face_cfg(state, facing)
-        cheeks = (fc or {}).get("cheeks") or {}
-        if cheeks.get("left") and cheeks.get("right"):
-            for key in ("left", "right"):
-                c = cheeks[key]
-                cx = x + c["cx"] * w
-                cy = y + c["cy"] * h
-                s.ellipse(color, cx - c["w"] * w / 2, cy - c["h"] * h / 2,
-                          c["w"] * w, c["h"] * h)
-        else:
-            # 无脸颊配置（旧 v1 配置）→ 按眼位几何估算：眼外下方
-            eyes = (fc or {}).get("eyes") or {}
-            for key in ("left", "right"):
-                e = eyes.get(key)
-                if not e:
-                    continue
-                sign = -1.0 if key == "left" else 1.0
-                cx = x + (e["cx"] + sign * e["w"] * 0.30) * w
-                cy = y + (e["cy"] + e["h"] * 0.85) * h
-                s.ellipse(color, cx - e["w"] * w * 0.26, cy - e["h"] * h * 0.18,
-                          e["w"] * w * 0.52, e["h"] * h * 0.36)
-
-    # ================= 帧序列动画（AI 视频 → 透明帧）=================
-    # 触发条件与写字本子/气泡**同一套任务判据**（见 wb_notebook 模块头）：
-    # 有任务在跑 → 循环播「写字段」；任务完成 → 播一遍「翻页+举本子」段；其余回退 v3 立绘。
-    # 播放期间程序化本子**不画**（视频里她本来就抱着本子，叠两层 = 穿帮）。
-
-    def _anim_image(self, i):
-        """按帧号加载并缓存 GDI+ 位图。"""
-        clip = self._anim_clip
-        key = f"f{i}"
-        cache = getattr(self, "_anim_imgs", None)   # 惰性：__init__ 顺序不保证（同旧 _acc_image）
-        if cache is None:
-            cache = self._anim_imgs = {}
-        if key in cache:
-            return cache[key]
+        if name is None:
+            name = self._wr.clip_name(self._clips)
+        clip = (getattr(self, "_clips", {}) or {}).get(name)
+        if clip is None:
+            return None
+        bucket = self._anim_imgs.setdefault(name, {})
+        if i in bucket:
+            return bucket[i]
         path = clip.frame_path(i)
         img = P()
         if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
             log_exception(f"[anim] 缺帧 {path}")
-            cache[key] = None
+            bucket[i] = None
         else:
             w, h = U32(0), U32(0)
             _GetImageW(img, ctypes.byref(w))
             _GetImageH(img, ctypes.byref(h))
-            cache[key] = (img, w.value, h.value)
-        return self._anim_imgs[key]
+            bucket[i] = (img, w.value, h.value)
+        return bucket[i]
 
     def _anim_play_now(self):
-        """现在该不该播帧序列（而不是 v3 立绘）。"""
-        return bool(self._anim_clip) and self._nb.phase in (
-            NOTEBOOK.PHASE_WRITING, NOTEBOOK.PHASE_PRESENT, NOTEBOOK.PHASE_APPEAR)
+        """现在该不该播帧序列 —— 帧序列是桌宠**唯一**的表现方式，有素材就恒为真。"""
+        return bool(self._clips)
 
     def _draw_anim_frame(self, s, lay, now):
         """画当前帧，并把 _spr_rect/_spr_key 指到帧序列的内容框上
         （气泡锚点 / 命中区 / 视线全部照常工作）。返回是否真的画了。"""
-        clip = self._anim_clip
-        if self._anim_key != self._nb.phase:
-            self._anim_key = self._nb.phase
-            self._anim_t0 = now
-        i = clip.index(self._nb.phase, self._anim_t0, now)
-        ent = self._anim_cache[i] if i < len(self._anim_cache) else None
+        name = self._wr.clip_name(self._clips)
+        clip = (getattr(self, "_clips", {}) or {}).get(name)
+        if clip is None:
+            return False
+        # 帧号按**单调高精度时钟**（perf_counter）算，不用传进来的墙钟 `now`：
+        # Windows 的 `time.time()` 只有 ~15.6ms 粒度，采样抖动会让 `int(dt*fps)`
+        # 每隔十几帧漏掉一帧（实测 145 tick 里 9 次）——那是肉眼能看见的微顿。
+        # ⚠️ `_anim_t0` 从此是 perf_counter 基准（只在下面重置、只在 index 里相减）。
+        mono = time.perf_counter()
+        if self._anim_key != (self._wr.act, name):
+            self._anim_key = (self._wr.act, name)
+            self._anim_t0 = mono
+            # 内容框也跟着换 —— 各动作的近景/全身程度不同，锚点必须跟着走
+            self._spr_cbox["__anim__"] = list(clip.content_box)
+            # 音效跟着动作走（待机/困了循环，其余播一遍）
+            self._play_anim_sfx(self._wr.act, name)
+        i = clip.index(self._wr.act, self._anim_t0, mono)
+        # 循环动作（idle / sleepy / write）：**固定步进 —— 每 tick 恰好 +1 帧**。
+        # 为什么不按墙钟取帧（2026-09-30 用户报障「写字不流畅」）：
+        #   墙钟取帧 `int(dt*fps)` 会时而 +2（定时器被系统拉长）时而 +0（`time.time()`
+        #   只有 15.6ms 粒度 → 采样抖动），肉眼就是"一顿一顿"。固定步进 = **每一帧都播、
+        #   顺序不乱、节奏均匀**；代价只是节奏跟着 tick 走（tick 慢了画面略慢，但绝不跳帧）
+        #   —— 正合本项目"流畅优先、帧数不要减少"的口径。
+        # 一次性动作仍按墙钟走（必须赶在状态切换前播到末帧），换动作时用墙钟算出的
+        # `i`（此时 `_anim_t0` 刚重置 → 从头开始）起头。
+        _prev_i = getattr(self, "_anim_i_prev", None)
+        _same = (getattr(self, "_anim_i_key", None) == (self._wr.act, name)
+                 and _prev_i is not None)
+        if _same and clip.act_is_loop(self._wr.act):
+            # 循环区间由素材给（写字段可能带「进入写字」前摇 → 首轮播完再循环尾巴）
+            _lo, _hi = clip.loop_range(self._wr.act)
+            _nxt = _prev_i + 1
+            i = _nxt if _nxt <= _hi else _lo
+        self._anim_i_key = (self._wr.act, name)      # 换动作/换素材时这里自然重置
+        self._anim_i_prev = i
+        cache = self._anim_caches.get(name) or []
+        ent = cache[i] if i < len(cache) else None
         if not ent:
             return False
         sc = lay["sc"]
         W, H = lay["W"], lay["H"]
         ph = lay["pet_h"] - 8 * sc
         hover_s = 1.0 + (MOTION.HOVER_SCALE - 1.0) * MOTION.ease_out_cubic(self._hover_t)
-        ph_draw = ph * hover_s * self._squash
+        ph_draw = ph * hover_s * self._squash * clip.head_scale
         pw = ph_draw * clip.canvas[0] / float(clip.canvas[1])
         x = (W - pw) / 2
         y_bottom = H - 4 * sc + self._breath + self._float_dy
@@ -3616,374 +3973,46 @@ class WhalePet:
         sw = pw * 0.72 * self._shadow_scale
         s.ellipse(C_SHADOW, W / 2 - sw / 2, y_bottom - 6 * sc, sw,
                   8 * sc * self._shadow_scale)
-        if abs(ent[2] - ph_draw) <= max(2.0, ph_draw * 0.16):
+        if abs(ent[2] - ph_draw) <= max(2.0, ph_draw * 0.16) or self._cache_building:
+            # 尺寸差得远通常跳过（别硬拉伸出鬼影）；但**后台正在按新尺寸重建**例外 ——
+            # 那 1~3 秒里宁可略糊也要看得见她（否则缩放跳档时整帧不画 = 消失）。
             self._blit_pet(s, ent[0], None, x, y_bottom - ph_draw, pw, ph_draw)
         else:
-            # 尺寸差太多（罕见）：这帧跳过，别硬拉伸出鬼影
             pass
         return True
 
-    # ================= 写字本子（任务进行中写字 / 完成后展示）=================
-    # 参考视频 `Q版古见同学写字.mp4` 三段：写字 → 翻页 → 展示。
-    # 视频是 AI 生成且带水印，只当**动作参考**；本子素材是自己画的（tools/make_notebook.py）。
-    # 触发条件与气泡 OK 态**共用同一判据**（见 _sync_bubble_mode），不可能对不上。
-
-    def _nb_image(self, name):
-        """加载并缓存本子素材（GDI+ 位图，进程内只加载一次）。"""
-        if name not in self._nb_imgs:
-            path = os.path.join(ASSETS_DIR, "notebook", name)
-            img = P()
-            if _LoadImage(path, ctypes.byref(img)) != 0 or not img:
-                log_exception(f"[notebook] 素材缺失 {path}（跑 tools/make_notebook.py 生成）")
-                self._nb_imgs[name] = None
-            else:
-                w, h = U32(0), U32(0)
-                _GetImageW(img, ctypes.byref(w))
-                _GetImageH(img, ctypes.byref(h))
-                self._nb_imgs[name] = (img, w.value, h.value)
-        return self._nb_imgs[name]
-
-    def _nb_stats(self):
-        """本子展示页要写的数据 —— **真实值**，不是装饰（页面其余是手写波浪线）。"""
-        a = self.active or []
-        lt = self.latest_turn or {}
-        credit = sum(float(x.get("credit") or 0) for x in a)
-        tokens = sum(int(x.get("total_tokens") or 0) for x in a)
-        title = ""
-        for x in a:
-            title = (x.get("_wb_title") or x.get("title") or x.get("project") or "")
-            if title:
-                break
-        if not title:
-            title = (lt.get("_wb_title") or lt.get("title") or lt.get("project") or "")
-        # 用时口径与气泡一致：running 用 first_ts → now（每秒刷新）
-        first = min([x.get("first_ts") or 0 for x in a if x.get("first_ts")] or [0])
-        dur = ""
-        if first:
-            secs = max(0, int(time.time() - first / 1000.0))
-            dur = f"{secs // 60}:{secs % 60:02d}" if secs >= 60 else f"{secs}秒"
-        return {"title": title, "dur": dur,
-                "tokens": (fmt_tokens(tokens) if tokens else ""),
-                "credit": (f"{credit:.1f}" if credit else "")}
-
-    def _nb_deck(self, now=None):
-        """当前该把本子画在哪（拿不到立绘几何就返回 None）。"""
-        if not self._spr_rect:
-            return None
-        st, _facing = self._spr_key
-        cbox = self._spr_cbox.get(st)
-        if not cbox:
-            return None
-        fm = self._face_metrics(st, cbox)
-        eye_y = fm[0] if fm else None       # 该态眼位（内容高里的相对位置）
-        return self._nb.deck(self._spr_rect, cbox, self.scale,
-                             now or time.time(), eye_y=eye_y)
-
-    def _draw_notebook(self, s, lay, now):
-        """本子三层读感（对齐参考视频）：
-          ① 写字 —— 按立绘内容框定位在膝头、微微倾斜，随手腕起伏；
-             墨迹**逐行从左长出来**，正写的那行末端点一个笔尖墨点。
-          ② 翻页 —— 写满一页时本子横向压扁再弹回（2D 里读作"纸翻过去"）。
-          ③ 展示 —— 转正、放大、升到胸前，封面换成摊开的内页，
-             页脚给出**可读的结果**（用时 / tokens / 积分）+ 一颗小爱心；点它开看板。
-
-        说明：本子不做全局 alpha 淡入淡出（GDI+ 位图走的是 DrawImage 系列，
-        没有现成的全局 alpha），改用**缩放 + 位移 + 压扁**表达进出场 —— 观感够用，
-        也省掉三处 ImageAttributes 绑定。
-        """
-        if self._anim_play_now():
-            return                            # 帧序列动画里她抱着视频里的本子，别再叠一层
-        if not self._nb.visible():
-            return
-        d = self._nb_deck(now)
-        if not d or d["alpha"] <= 0.01:
-            return
-        img = self._nb_image(d["asset"])
-        if not img:
-            return
-        _st, facing = self._spr_key
-        tilt = -d["tilt"] if facing == "_f" else d["tilt"]
-        x, y, w, h = d["x"], d["y"], d["w"], d["h"]
-        if abs(tilt) < 0.15:
-            s.image(img[0], x, y, w, h)
-        else:
-            s.image_rot(img[0], img[1], img[2], x, y, w, h, tilt)
-        self._nb_draw_ink(s, d, now)
-
-    def _nb_page_lines(self, showing, now):
-        """页面上要画的墨迹行。展示态 = 写满整页；写字态 = 已写的行（末行还在长）。"""
-        if not showing:
-            return self._nb.ink_lines(now)
-        out = []
-        for i in range(NOTEBOOK.LINES_PER_PAGE):
-            out.append({"i": i,
-                        "span": NOTEBOOK.line_span(i + (self._nb.page - 1) * 100),
-                        "indent": NOTEBOOK.line_indent(i), "ink": 1.0})
-        return out
-
-    def _nb_draw_ink(self, s, d, now):
-        """页面上的墨迹：写字态逐行长出来，展示态是写满的一整页。
-
-        两处讲究：
-          · **跳过中缝**（跨中缝写字物理上不对，凑近看很假）；
-          · 正写的那一行末端点一个略大的笔尖墨点 —— "她在写"的读感主要靠它。
-        """
-        pg = d["page"]
-        px, py, pw, ph = pg["x"], pg["y"], pg["w"], pg["h"]
-        if pw < 8 or ph < 8:
-            return
-        showing = d["showing"]
-        lines = self._nb_page_lines(showing, now)
-        if not lines:
-            return
-        rows = NOTEBOOK.LINES_PER_PAGE if showing else max(1, len(lines))
-        lh = ph / (rows + 1.6)
-        dot = max(1.7, lh * 0.27)          # 下限 1.7px：小缩放时墨迹也读得出来
-        g0, g1 = pg["gut0"], pg["gut1"]
-
-        def in_gutter(x):
-            return g0 - dot <= x <= g1 + dot
-
-        for k, ln in enumerate(lines):
-            ly = py + lh * (k + 0.75)
-            if ly > py + ph - lh * 0.5:
-                break
-            x0 = px + pw * ln["indent"]
-            span = pw * ln["span"] * (1.0 if showing else ln["ink"])
-            if span <= 0:
-                continue
-            steps = max(3, int(span / max(1.3, dot * 1.35)))
-            for j in range(steps):
-                t = j / max(1, steps - 1)
-                dx = x0 + span * t
-                if in_gutter(dx):
-                    continue
-                s.ellipse(NOTEBOOK.INK, dx,
-                          ly + math.sin(t * 6.4 + k * 1.31) * dot * 0.85, dot, dot)
-            if not showing and ln["ink"] < 0.999:
-                ex = x0 + span - dot * 0.4
-                if not in_gutter(ex):
-                    s.ellipse(NOTEBOOK.PEN_DOT, ex,
-                              ly + math.sin(6.4 + k * 1.31) * dot * 0.85,
-                              dot * 1.6, dot * 1.6)
-        if showing:
-            self._nb_draw_footer(s, d)
-
-    def _nb_draw_footer(self, s, d):
-        """展示页页脚：**可读的真实结果** + 一颗小爱心（呼应参考视频末帧）。
-
-        页宽太小（缩放很低）时只画爱心、不画字 —— 字号会小到糊成一团，不如不画。
-        """
-        pg = d["page"]
-        px, py, pw, ph = pg["x"], pg["y"], pg["w"], pg["h"]
-        hs = max(3, int(min(pw, ph) * 0.075))
-        hx, hy = px + pw - hs * 2.2, py + ph - hs * 2.4
-        s.ellipse(NOTEBOOK.HEART, hx, hy, hs, hs)
-        s.ellipse(NOTEBOOK.HEART, hx + hs * 0.95, hy, hs, hs)
-        s.poly(NOTEBOOK.HEART, [(hx - 0.1, hy + hs * 0.62),
-                                (hx + hs * 1.95, hy + hs * 0.62),
-                                (hx + hs * 0.92, hy + hs * 1.95)])
-        txt = self._nb.present_text()
-        if not txt or pw < 54:
-            return
-        size = max(7, int(min(pw * 0.082, ph * 0.17)))
-        s.ctext(txt, px + pw / 2.0 - hs * 1.1, py + ph - size * 1.7, size,
-                NOTEBOOK.INK, maxw=pw - hs * 2.4)
-
-    def _nb_hit(self, mx, my):
-        """点在**展示态**的本子上 → 视为"我要细看"。写字态不抢点击（那属于身体互动）。"""
-        if self._nb.phase != NOTEBOOK.PHASE_PRESENT:
-            return False
-        d = self._nb_deck()
-        if not d:
-            return False
-        pad = 4
-        return (d["x"] - pad <= mx <= d["x"] + d["w"] + pad
-                and d["y"] - pad <= my <= d["y"] + d["h"] + pad)
-
-    def _on_nb_click(self):
-        """点本子：收起本子并打开看板（写在本子上的东西，看板里有明细）。"""
-        self._report_event("notebook_click", detail=self._nb.present_text())
-        self._play("pop")
-        self._nb.dismiss_now(time.time())
-        self._drawn_sig = None
-        self.open_dashboard()
 
     # ---- 形态尺寸归一（点击换姿势时的"忽大忽小"）----
 
-    def _state_size(self, state):
-        """形态之间的**尺寸归一系数**（乘在立绘绘制高度上）。
 
-        为什么需要：v3 八态共用一张画布，构建期只归一到「脸宽一致」，
-        **姿势本身的高低没管** —— 实测屏幕上内容高 169px(stone) ~ 318px(happy)，差 1.88 倍。
-        点一下就换姿势，看着就是"忽大忽小"。
-
-        做法：把「视觉大小」（内容框的几何均值 √(w·h)）往全体平均值拉
-        `MOTION.SIZE_NORM_ALPHA` 倍：
-            0   = 不动（脸一致，姿势高度差 1.88×）
-            0.5 = 折中 —— 实测缩放只有 0.96~1.10（**脸最多变 10%**），高度差降到 1.56×
-            1   = 完全按视觉大小（高度差 1.30×，但**脸会变 1.45×**，一眼看得出头在缩放）
-
-        ⚠️ 刻意不取 1：对 chibi 角色，"头的大小"比"整体高度"更影响观感，
-        脸跟着抖会显得廉价。要更彻底就调 MOTION.SIZE_NORM_ALPHA。
-        """
-        if not self._size_cache:
-            a = getattr(MOTION, "SIZE_NORM_ALPHA", 0.5)
-            boxes = getattr(self, "_spr_cbox", {}) or {}
-            ar = self._canvas_ar
-            if not ar and self._sprites:
-                spr = next(iter(self._sprites.values()))
-                ar = spr[1] / max(1, spr[2])          # 画布宽高比
-                self._canvas_ar = ar
-            ar = ar or 1.0
-            # 内容框是**归一化**坐标：宽要乘画布宽高比，才和高度在同一物理尺度上
-            gm = {st: (((b[2] - b[0]) * ar) * (b[3] - b[1])) ** 0.5
-                  for st, b in boxes.items() if len(b) >= 4}
-            if a <= 0 or len(gm) < 2:
-                self._size_cache = {st: 1.0 for st in gm}
-            else:
-                mean = sum(gm.values()) / len(gm)
-                self._size_cache = {st: (mean / g) ** a for st, g in gm.items()}
-        return self._size_cache.get(state, 1.0)
-
-    def _size_factor(self, state, now):
-        """带**尺寸过渡**的形态系数：换形态时从旧尺寸缓入新尺寸（SIZE_MORPH_S 内）。
-
-        为什么还要过渡：8 个姿势差异太大，`_draw_state_fade` 的**溶解闸门**会判定"硬切"
-        （避免两张脸叠成双重曝光）。硬切 + 尺寸差 = 突跳，所以这里单独把"尺寸"这一维做成缓入
-        —— 新姿势**长/缩到它该有的大小**，观感是"她站起来了"，而不是"啪地换了一张图"。
-        """
-        target = self._state_size(state)
-        if self._size_key != state:
-            self._size_from = self._size_now
-            self._size_key = state
-            self._size_t0 = now
-        dur = getattr(MOTION, "SIZE_MORPH_S", 0.2)
-        u = 1.0 if dur <= 0 else min(1.0, max(0.0, (now - self._size_t0) / dur))
-        self._size_now = (self._size_from
-                          + (target - self._size_from) * MOTION.ease_out_cubic(u))
-        return self._size_now
 
     def _draw_pet(self, s, lay):
-        """立绘：状态选图（开心/文静/嘟嘴）+ 镜像 + 按压 Q 弹 + 摇摆 + 脸红 + 粒子。"""
-        sc = lay["sc"]
-        W, H = lay["W"], lay["H"]
-        ph = lay["pet_h"] - 8 * sc
-        # 帧序列动画（AI 视频）优先：有任务在跑时整个角色换成视频帧，
-        # 程序化本子也不画（视频里她本来就抱着本子）。
+        """桌宠本体 —— 唯一形态「写字的她」（AI 视频 → 透明帧序列）。
+
+        2026-09-28 之前这里是八套立绘 + 眨眼贴片 + 腮红 + 状态交叉溶解 +
+        点击切形态，现已**全部删除**；只剩帧序列一条路径，**没有回退分支**。
+        """
         if self._anim_play_now() and self._draw_anim_frame(s, lay, time.time()):
             return
-        # 提案 §3：悬停放大（ease-out-cubic 淡入）+ 点击压缩（squash 曲线）
-        hover_s = 1.0 + (MOTION.HOVER_SCALE - 1.0) * MOTION.ease_out_cubic(self._hover_t)
-        hover_s = min(hover_s, MOTION.SCALE_MAX)          # 提案 §5 克制上限
-        sq = self._squash
-        # 压扁时横向补偿（squash & stretch，体积感）
-        pw_ratio = min(1.0 + (1.0 - sq) * 0.7, MOTION.SCALE_MAX)
-        if self._pressed:
-            pass                                  # 压缩改由 squash 曲线驱动（不再写死 0.92）
-        now = time.time()
-        # ---- 情绪优先于数据状态选图（提案 §2）----
-        reacting = now < self._react_until
-        # 部位点击触发的临时形态切换：self._morph_state 非空时优先
-        if self._morph_state and self._morph_until > now:
-            state = self._morph_state
-        elif reacting and self._react_face in REACT_FACES:
-            # 反应态与立绘态同名，直接取用（含 v3 新增的 joy / surprise）
-            state = self._react_face
-        elif self._emotion in (MOTION.EMOTION_SUCCESS, MOTION.EMOTION_WELCOME):
-            state = "happy"
-        elif self._emotion == MOTION.EMOTION_FAIL:
-            state = "pout"                  # 失败 = 委屈（不是怒容）
-        else:
-            state = "happy" if (self.active or self._in_talk()) else "idle"
-        # ---- 形态尺寸归一 × 尺寸过渡 ----
-        # 各姿势内容高差 1.88×（stone 169px vs happy 318px），点一下就换姿势；
-        # 不处理就是"忽大忽小"，硬切时还会突跳（见 _state_size / _size_factor）
-        ph_draw = ph * hover_s * sq * self._size_factor(state, now)
-        facing = self._current_facing(now)  # 翻身覆盖 > 鼠标跟随 > 保持
-        # 双版本 sprite key：'q.idle' / 'alt.idle' / 带 _f 后缀等
-        style_prefix = getattr(self, "style", "q")
-        key = f"{style_prefix}.{state}{facing}"
-        spr = (self._sprites.get(key)
-               or self._sprites.get(f"{style_prefix}.{state}")
-               or self._sprites.get(f"{style_prefix}.idle"))
-        # 提案 §1：呼吸 + 漂浮 + 情绪姿态偏置（全部量化到整数像素）
-        bob = self._breath + self._float_dy + self._emotion_rise()
-        if self._drift:                      # 游动漂移时加强起伏
-            bob += math.sin(now * 6.0) * 2.0 * sc
-        y_bottom = H - 4 * sc + bob
-        # 甩尾摇摆：衰减正弦水平位移
-        wob = 0.0
-        if now < self._wobble_until:
-            t = self._wobble_until - now
-            wob = self._wobble_amp * math.sin(t * 18.0) \
-                * (t / max(0.3, getattr(self, "_wobble_dur", 0.9)))
-        if spr:
-            img, iw, ih = spr
-            pw = (ph * iw / ih) * pw_ratio
-            x = (W - pw) / 2 + wob
-            # 记录本帧立绘矩形与状态键：命中区 / 气泡锚点据此定位（与 _draw_blush 同一套归一化锚点）
-            self._spr_rect = (x, y_bottom - ph_draw, pw, ph_draw)
-            self._spr_key = (state, facing)
-            # 提案 §4：软阴影随漂浮高度缩放（漂浮越高阴影越小越淡）
-            sw = pw * 0.72 * self._shadow_scale
-            s.ellipse(C_SHADOW, W / 2 - sw / 2, y_bottom - 6 * sc, sw,
-                      8 * sc * self._shadow_scale)
-            # 优先用预缩放缓存（AlphaBlend 合成，GDI 负责缩放）；尺寸差异过大回退原图
-            cache_key = f"{style_prefix}.{state}{facing}"
-            cached = (self._sprite_cache.get(cache_key)
-                      or self._sprite_cache.get(f"{style_prefix}.{state}"))
-            if cached and abs(cached[2] - ph_draw) <= max(2.0, ph_draw * 0.16):
-                self._blit_pet(s, cached[0], img, x, y_bottom - ph_draw, pw, ph_draw)
-            else:
-                self._blit_pet(s, None, img, x, y_bottom - ph_draw, pw, ph_draw)
-            # 状态切换交叉溶解（对齐参考视频；见 _draw_state_fade）
-            self._draw_state_fade(s, cache_key, x, y_bottom - ph_draw,
-                                  pw, ph_draw, now, state)
-            # 立绘整体平移量（视线跟随 + 拖拽倾斜）——表情贴图必须同步平移，
-            # 否则凝视/拖拽时眼睑、腮红会与眼睛、脸颊错位
-            face_x = x + self._gaze_dx + self._drag_tilt
-            # 眨眼/腮红 key 用 style-aware（高冷版眼睛更细长，配置独立）
-            face_state_key = f"alt_{state}" if style_prefix == "alt" else state
-            # 提案 §1 眨眼：闭眼时按当前立绘实测眼位画眼睑（配置缺失则自动跳过）
-            self._draw_blink(s, face_x, y_bottom - ph_draw, pw, ph_draw, now,
-                             face_state_key, facing)
-            # 提案 §4 腮红：按当前立绘实测脸颊锚点定位（ shy 档更红 ）
-            if reacting and self._react_face == "blush":
-                blush = MOTION.COLOR_BLUSH_LOUD
-            elif self._emotion == MOTION.EMOTION_SUCCESS:
-                blush = MOTION.COLOR_BLUSH_SOFT
-            elif state in ("shy", "blush"):
-                blush = MOTION.COLOR_BLUSH_SOFT        # 害羞立绘自带
-            else:
-                blush = None
-            if blush:
-                self._draw_blush(s, face_x, y_bottom - ph_draw, pw, ph_draw,
-                                 face_state_key, facing, blush)
-            # 跟随模式：领结位的身份色徽章（聚焦=当前前台 agent；未知=灰半透明）
-            self._draw_follow_badge(s, x, pw, ph_draw, y_bottom, now)
-        else:
-            s.ellipse(0xFF39406B, W / 2 - 50 * sc, y_bottom - ph_draw, 100 * sc, ph_draw,
-                      line_argb=C_BUBBLE_LINE, line_w=2)
-            s.ctext("古见同学缺席中", W / 2, y_bottom - ph_draw / 2 - 8 * sc, 11 * sc,
-                    C_BUBBLE, bold=True)
-        # 粒子（爱心 / 石化爆发樱花 / OK 迸发小点，随生命值淡出）——古见主题配色
-        # ⚠️ 2026-09-27：「吐蓝色水泡泡」的 bubble 粒子已按要求删除
-        for p in self._particles:
-            a = max(0.0, min(1.0, p["life"] / p["max"]))
-            if p["kind"] == "heart":
-                s.heart(p["x"], p["y"], p["size"],
-                        (int(0xEF * a) << 24) | 0xE89AAE)
-            elif p["kind"] == "spark":
-                # OK 弹入迸发：浅橙小点，随生命淡出
-                s.ellipse((int(0xE6 * a) << 24) | (MOTION.COLOR_OK_SPARK & 0xFFFFFF),
-                          p["x"] - p["size"], p["y"] - p["size"],
-                          p["size"] * 2, p["size"] * 2)
-            else:
-                # 石化爆发樱花瓣（默认档）
-                s.ellipse((int(0xDD * a) << 24) | 0xE89AAE,
-                          p["x"] - p["size"], p["y"] - p["size"],
-                          p["size"] * 2, p["size"] * 2)
+        if getattr(self, "_anim_missing_logged", False):
+            return
+        self._anim_missing_logged = True
+        # 两种情形分开说清（曾混成一句"素材缺失"+假异常栈，把排查带进沟里——
+        # 实际绝大多数是启动首绘/重建窗口期的瞬时缓存未命中，下一帧自愈）。
+        try:
+            with open(ERR_LOG, "a", encoding="utf-8") as _f:
+                if not self._clips:
+                    _msg = ("[anim] 素材缺失 assets/anim/<动作>/ —— 桌宠无内容可画"
+                            "（跑 tools/video_to_pet_frames.py 重建）")
+                else:
+                    _sizes = {k: len(v) for k, v in self._anim_caches.items()}
+                    _msg = (f"[anim] 帧缓存瞬时未命中（自愈型，观察即可）："
+                            f"act={self._wr.act} clip={self._wr.clip_name(self._clips)} "
+                            f"cache={_sizes}")
+                _f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {_msg}\n")
+        except Exception:
+            pass
+
 
     # ---- 消息 ----
     def on_message(self, hwnd, msg, wparam, lparam):
@@ -3993,10 +4022,17 @@ class WhalePet:
             _user32.PostQuitMessage(0)
             return 0
         if msg == WM_CLOSE:
+            # ⚠️ 外部关闭请求（守望 kill_whale / 任务栏关窗）走这里：必须留痕，
+            #    否则"桌宠无声消失"完全没法归因（2026-09-30 排查时吃过这个亏）。
+            self._report_event("close_req", detail="wm_close")
             _user32.DestroyWindow(hwnd)
             return 0
         if msg == WM_TIMER:
             return self._on_timer(hwnd, wparam)
+        if msg == WM_APP_ANIM:                  # 高精度动画时钟投递的 tick
+            self._anim_pending = False
+            self._anim_tick()
+            return 0
         if msg in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK,
                    WM_MOUSEMOVE, WM_RBUTTONUP):
             return self._pet_mouse(hwnd, msg, wparam, lparam)
@@ -4020,6 +4056,8 @@ class WhalePet:
         return 0
 
     def _pet_mouse(self, hwnd, msg, wparam, lparam):
+        if self._menu_open:
+            return 0        # 菜单模态中：鼠标全归菜单（capture 集中制），桌宠一律不响应
         lay = self._layout()
         if msg == WM_LBUTTONDOWN:
             pt = POINT()
@@ -4044,9 +4082,9 @@ class WhalePet:
             dx, dy = pt.x - self._down[0], pt.y - self._down[1]
             if abs(dx) + abs(dy) > 3:
                 self._moved = True
-                ax, ay, aw, ah = work_area()
-                nx = max(ax + 4, min(self._win0[0] + dx, ax + aw - lay["W"] - 4))
-                ny = max(ay + 4, min(self._win0[1] + dy, ay + ah - lay["H"] - 4))
+                bx0, by0, bx1, by1 = self._drag_bounds(lay)
+                nx = max(bx0, min(self._win0[0] + dx, bx1))
+                ny = max(by0, min(self._win0[1] + dy, by1))
                 self._move_window(hwnd, int(nx), int(ny))
                 # 提案 §3：拖拽时身体朝运动方向倾斜（上限 ±6px，松手 4 帧内回正）
                 lim = MOTION.DRAG_TILT_MAX_PX * self.scale
@@ -4066,7 +4104,7 @@ class WhalePet:
                 self.open_dashboard()
             else:
                 self._report_event("double_click", detail="body")
-                self._react()
+                self._body_tap_feedback(lay)
             return 0
         if msg == WM_LBUTTONUP:
             _user32.ReleaseCapture()
@@ -4087,7 +4125,6 @@ class WhalePet:
                 save_pos(POS_FILE, nx, ny)
                 self._last_interact = time.time()
                 self._report_event("drag_snap", ok=True, detail=f"{nx},{ny}")
-                self._blinker.blink_now(time.time())   # §三.3：回待机先眨一次
                 return 0
             if was_press:                          # 单击：按区域即时分发（不等双击窗口）
                 self._last_interact = time.time()
@@ -4103,97 +4140,83 @@ class WhalePet:
                 elif held_ms >= MOTION.LONGPRESS_MS:
                     self._long_press_release(lay)   # 提案 §3：长按憋气后"噗"地喷水
                 else:
-                    # 身体点击 → 按区域切形态（提案 §3：点击头/脸/身/裙摆触发不同形态）
-                    if self._nb_hit(px, py):
-                        self._on_nb_click()          # 展示态点本子 → 看明细
-                    else:
-                        region = self._body_region(px, py, lay)
-                        self._morph_by_region(region)
+                    # 身体点击：2026-09-28 起「按区域切形态」随 v3 立绘删除
+                    # （只剩写字一种形态）。反馈与双击同源，见 `_body_tap_feedback`。
+                    self._body_tap_feedback(lay)
             return 0
         if msg == WM_HOTKEY and wparam == ID_HOTKEY_FOLLOW:
             self._hotkey_cycle_focus()      # P3 全局热键：手动聚焦轮换
             return 0
         if msg == WM_RBUTTONUP:
+            if self._menu_open:
+                return 0                 # 菜单模态中忽略再入右键（防嵌套菜单）
             self._report_event("menu_open")
             self.context_menu(hwnd)
             return 0
         return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     # ---- 菜单 / 看板 ----
+    # （owner-draw 的 measure/draw/AppendMenuW 协议代码已随 TrackPopupMenu 一并退役；
+    #   菜单渲染改由 MenuSession 自绘分层窗口完成，见模块级 MenuSession 段落。）
+
     def context_menu(self, hwnd):
         pt = POINT()
         _user32.GetCursorPos(ctypes.byref(pt))
-        menu = _user32.CreatePopupMenu()
-        _user32.AppendMenuW(menu, MF_STRING, IDM_DASHBOARD, "打开完整看板")
-        _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.bubble_on else 0),
-            IDM_BUBBLE, "想法气泡")
-        _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.sound_on else 0),
-            IDM_SOUND, "互动音效")
-        # P2：行为开关（此前只能改 wb_motion 的 *_ON 后重启）
-        _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.ok_autodismiss_on else 0),
-            IDM_OK_AUTO, "完成态自动收起")
-        _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.linked_close_on else 0),
-            IDM_LINKED, "随 Agent 退出联动关闭")
-        _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.follow_on else 0),
-            IDM_FOLLOW, "跟随前台切换聚焦")
-        _user32.AppendMenuW(
-            menu, MF_STRING | (MF_CHECKED if self.focus_pin else 0),
-            IDM_PIN, "锁定聚焦（pin）")
-        # （早期此处有「切换到 3D 桌宠」菜单项；3D 线已于 2026-09-26 退役移除）
+
+        def _it(label, cmd, **kw):
+            return {"label": label, "cmd": cmd, **kw}
+
+        items = [_it("打开完整看板", IDM_DASHBOARD),
+                 _it("想法气泡", IDM_BUBBLE, checked=self.bubble_on),
+                 _it("音效", IDM_SOUND, checked=self.sound_on),
+                 # P2：行为开关（此前只能改 wb_motion 的 *_ON 后重启）
+                 _it("完成态自动收起", IDM_OK_AUTO, checked=self.ok_autodismiss_on),
+                 _it("随 Agent 退出联动关闭", IDM_LINKED, checked=self.linked_close_on),
+                 _it("跟随前台切换聚焦", IDM_FOLLOW, checked=self.follow_on),
+                 _it("锁定聚焦（pin）", IDM_PIN, checked=self.focus_pin),
+                 {"sep": True}]
         # P2 连续锚点：今日时间线（跨 agent 轮次，点条目开看板）
         _tl_summary, _tl_recent = self._today_timeline()
-        subt = _user32.CreatePopupMenu()
-        _user32.AppendMenuW(
-            subt, MF_STRING, IDM_TIMELINE0,
-            "今天：" + (format_timeline_summary(_tl_summary) or "暂无轮次"))
-        _user32.AppendMenuW(subt, MF_SEPARATOR, 0, None)
-        for i, (hhmm, agent, title) in enumerate(_tl_recent):
-            _user32.AppendMenuW(subt, MF_STRING, IDM_TIMELINE0 + 1 + i,
-                                f"{hhmm}  {agent} · {title[:20]}")
+        sub_tl = [_it("今天：" + (format_timeline_summary(_tl_summary) or "暂无轮次"),
+                      IDM_TIMELINE0), {"sep": True}]
+        sub_tl += [_it(f"{hhmm}  {agent} · {title[:20]}", IDM_TIMELINE0 + 1 + i)
+                   for i, (hhmm, agent, title) in enumerate(_tl_recent)]
         if not _tl_recent:
-            _user32.AppendMenuW(subt, MF_GRAYED, 0, "（今天还没有轮次）")
-        _user32.AppendMenuW(menu, MF_POPUP, subt, "今日时间线")
+            sub_tl.append(_it("（今天还没有轮次）", 0, disabled=True))
+        items.append({"label": "今日时间线", "sub": sub_tl})
         # P3 手动聚焦：锁定或跟随失效时的兜底（登记册启用 agent，accent 打点）
-        subf = _user32.CreatePopupMenu()
-        _focusables = [(k, v) for k, v in sorted(REG.load()["agents"].items(),
+        _agents = REG.load()["agents"]        # 只读一次（原先进出两次，每次都要解析 JSON）
+        _focusables = [(k, v) for k, v in sorted(_agents.items(),
                                                  key=lambda kv: kv[1].get("order", 100))
                        if v.get("enabled")]
-        for i, (k, v) in enumerate(_focusables):
-            chk = MF_CHECKED if (self._follow_focus or {}).get("key") == k else 0
-            _user32.AppendMenuW(subf, MF_STRING | chk, IDM_FOCUS0 + i,
-                                f"{v.get('label') or k}")
-        _user32.AppendMenuW(menu, MF_POPUP, subf, "手动聚焦（Ctrl+Alt+F9 轮换）")
+        items.append({"label": "手动聚焦（Ctrl+Alt+F9 轮换）",
+                      "sub": [_it(f"{v.get('label') or k}", IDM_FOCUS0 + i,
+                                  checked=(self._follow_focus or {}).get("key") == k)
+                              for i, (k, v) in enumerate(_focusables)]})
         # P4 接续：仅当角标活跃时出现（用户触发才生成——零隐私风险、无主动打扰）
         _h = self._handoff
         if _h and time.time() - _h.get("since", 0) <= MOTION.HANDOFF_SHOW_MAX_S:
-            _hlabel = ((REG.load()["agents"].get(_h["key"]) or {}).get("label")
-                       or _h["key"])
-            _user32.AppendMenuW(menu, MF_STRING, IDM_HANDOFF,
-                                f"生成接续摘要（{_hlabel}）→ 剪贴板")
+            _hlabel = ((_agents.get(_h["key"]) or {}).get("label") or _h["key"])
+            items.append(_it(f"生成接续摘要（{_hlabel}）→ 剪贴板", IDM_HANDOFF))
+        items.append({"sep": True})
         # 大小子菜单（0.6–2.5x，对齐上游挂件）
-        sub = _user32.CreatePopupMenu()
-        for i, sc in enumerate(SCALES):
-            chk = MF_CHECKED if abs(self.scale - sc) < 1e-6 else 0
-            _user32.AppendMenuW(sub, MF_STRING | chk, IDM_SCALE0 + i,
-                                f"{sc:.1f}x" + ("（默认）" if sc == 1.0 else ""))
-        _user32.AppendMenuW(menu, MF_POPUP, sub, "桌宠大小")
+        items.append({"label": "桌宠大小", "sub": [
+            _it(f"{sc:.1f}x" + ("（默认）" if sc == 1.0 else ""), IDM_SCALE0 + i,
+                checked=abs(self.scale - sc) < 1e-6)
+            for i, sc in enumerate(SCALES)]})
         # 动效质量子菜单（提案 §6：完整 / 精简 / 关闭，用户可手动降级）
-        subq = _user32.CreatePopupMenu()
-        for i, (q, label) in enumerate(QUALITY_CHOICES):
-            chk = MF_CHECKED if self._quality == q else 0
-            _user32.AppendMenuW(subq, MF_STRING | chk, IDM_QUALITY0 + i, label)
-        _user32.AppendMenuW(menu, MF_POPUP, subq, "动效质量")
-        # 形态风格子菜单（双版本切换：Q 版 / 高冷版）
-        subs = _user32.CreatePopupMenu()
-        for i, (st, label) in enumerate(STYLE_CHOICES):
-            chk = MF_CHECKED if self.style == st else 0
-            _user32.AppendMenuW(subs, MF_STRING | chk, IDM_STYLE0 + i, label)
-        _user32.AppendMenuW(menu, MF_POPUP, subs, "形态风格")
+        items.append({"label": "动效质量", "sub": [
+            _it(label, IDM_QUALITY0 + i, checked=self._quality == q)
+            for i, (q, label) in enumerate(QUALITY_CHOICES)]})
+        # 修复卡死会话（2026-09-28 事故）：宿主崩溃留下残留 working → 气泡永远"运行中"。
+        # 显示层已自动兜底（wb_hover_core 残留过滤）；这一项做真修复=写库落回 completed。
+        # 带 TTL 的记忆（见 _stale_list_cached）：菜单在 UI 线程上，不该每次弹都查库
+        self._stale_list = self._stale_list_cached()
+        if self._stale_list:
+            _mins = max(v["age_sec"] for v in self._stale_list) // 60
+            items.append(_it(f"修复卡死会话（{len(self._stale_list)} 个 · 停更 {_mins} 分）",
+                             IDM_REPAIR, danger=True))
+        items.append({"sep": True})
         # 自更新：只有「配了更新源」或「已知有新版」才出现 —— 默认不联网就别摆个没用的项
         try:
             import wb_update as _UP
@@ -4202,22 +4225,21 @@ class WhalePet:
             _up_src = ""
         _up_m = (self._update_info or {}).get("manifest") or {}
         if (self._update_info or {}).get("available") and _up_m.get("version"):
-            _user32.AppendMenuW(menu, MF_STRING, IDM_UPDATE,
-                                f"更新到 v{_up_m['version']}")
+            items.append(_it(f"更新到 v{_up_m['version']}", IDM_UPDATE))
         elif _up_src:
-            _user32.AppendMenuW(menu, MF_STRING, IDM_UPDATE, "检查更新")
-        _user32.AppendMenuW(menu, MF_STRING, IDM_QUIT, "退出古见同学")
-        _user32.SetForegroundWindow(hwnd)
-        cmd = _user32.TrackPopupMenu(
-            menu, TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
-            pt.x, pt.y, 0, hwnd, None)
-        _user32.PostMessageW(hwnd, WM_NULL, 0, 0)
-        _user32.DestroyMenu(sub)
-        _user32.DestroyMenu(subq)
-        _user32.DestroyMenu(subs)
-        _user32.DestroyMenu(subt)
-        _user32.DestroyMenu(subf)
-        _user32.DestroyMenu(menu)
+            items.append(_it("检查更新", IDM_UPDATE))
+        items.append(_it("退出古见同学", IDM_QUIT, danger=True))
+        # ★ 菜单是**模态**的：MenuSession.run 自己跑消息循环。这里只闸住 `tick`
+        #   （查库 + 重绘气泡）—— 菜单开着时气泡内容不必刷新，省得在模态循环里插一次
+        #   SQLite 查询。**动画照常跑**（`_anim_tick` 不再被闸）：菜单是独立分层窗口，
+        #   和桌宠重绘互不干扰；闸住动画只会让人物当着用户的面冻住（2026-09-29 修复）。
+        self._menu_open = True
+        try:
+            dpi = (_user32.GetDpiForWindow(hwnd) or 96) if hwnd else 96
+            cmd = MenuSession(items, dpi=dpi).run(hwnd, (pt.x, pt.y))
+        finally:
+            self._menu_open = False
+        self._drawn_sig = None          # 菜单关了强制重绘一帧（补上定格期间的变化）
         if cmd == IDM_TIMELINE0:
             self._report_event("timeline_open", detail="dashboard")
             self.open_dashboard()
@@ -4242,6 +4264,10 @@ class WhalePet:
             self.sound_on = not self.sound_on
             if self.sound_on and not self._sounds:
                 self._sounds = _make_sounds()
+            if self.sound_on:
+                self._anim_sfx_act = None       # 立刻把当前动作的音效接上
+            else:
+                self._stop_anim_sfx()           # 关掉就立刻安静
             self._report_event("menu_sound", detail=str(self.sound_on))
             self._save_settings()
         elif cmd == IDM_OK_AUTO:
@@ -4256,6 +4282,19 @@ class WhalePet:
             self._gen_handoff()
         elif cmd == IDM_UPDATE:
             self._on_update_menu()
+        elif cmd == IDM_REPAIR:
+            try:
+                n = repair_stale_working(self.db_path, self.wb_db)
+            except Exception:
+                n = -1
+            self._report_event("menu_repair_stale", ok=(n > 0), detail=str(n))
+            if n > 0:
+                self._say_once(f"修复了 {n} 个卡死的会话状态", "修复完成", 6.0)
+            elif n == 0:
+                self._say_once("没有需要修复的会话", "提示", 4.0)
+            else:
+                self._say_once("修复失败：workbuddy.db 写不进去（宿主在运行？）", "修复失败", 6.0)
+            self._drawn_sig = None
         elif cmd == IDM_QUIT:
             self._report_event("menu_quit")
             _user32.PostQuitMessage(0)
@@ -4266,18 +4305,6 @@ class WhalePet:
             self._recreate_window()
         elif IDM_QUALITY0 <= cmd < IDM_QUALITY0 + len(QUALITY_CHOICES):
             self.set_quality(QUALITY_CHOICES[cmd - IDM_QUALITY0][0])
-        elif IDM_STYLE0 <= cmd < IDM_STYLE0 + len(STYLE_CHOICES):
-            new_style = STYLE_CHOICES[cmd - IDM_STYLE0][0]
-            if new_style != self.style:
-                self.style = new_style
-                self._report_event("menu_style", detail=new_style)
-                self._save_settings()
-                # 形态风格切换不重建窗口（避免打断动画）；只重置 sprite 缓存 key 前缀
-                self._drawn_sig = None
-                self._motion_sig = None
-                # 重置临时形态，让用户立即看到新风格的 idle
-                self._morph_state = ""
-                self._morph_until = 0.0
 
     def _dashboard_port(self):
         try:
@@ -4412,6 +4439,55 @@ class WhalePet:
             self._report_event("update_check")
             self._start_update_check(notify=True)
 
+    def _stale_list_cached(self, ttl=20.0):
+        """残留会话清单（右键菜单用）：带 TTL 的记忆。
+
+        菜单整条路径都跑在 UI 线程上，而 `stale_working_sessions` 是两次 SQL（宿主库 +
+        数仓），实测 ~10ms —— 每次弹菜单都查一遍没必要。它只决定「修复卡死会话」那一项
+        显不显示，20 秒的新鲜度完全够（周期自愈另有 10 分钟一轮，见 _start_stale_repair）。
+        """
+        now = time.time()
+        if self._stale_ts and now - self._stale_ts < ttl:
+            return self._stale_list
+        try:
+            self._stale_list = stale_working_sessions(self.db_path, self.wb_db)
+        except Exception:
+            self._stale_list = []
+        self._stale_ts = now
+        return self._stale_list
+
+    def _start_stale_repair(self):
+        """启动自愈 + **周期自愈**：把残留的 working 会话落回终态。
+
+        背景（2026-09-28 事故）：宿主崩溃/被杀不会把 working 落回终态，
+        桌宠会永远显示"会话运行中"。显示层有停更过滤兜底（wb_hover_core），
+        这里做的是真修复=写库。判定与写法见 repair_stale_working：
+        只动停更超阈值的行、UPDATE 复查 status='working'，误杀面趋近于零。
+        SQLite 写很快，但仍按铁律放后台线程，绝不进消息循环。
+
+        2026-09-29：原来只跑**启动那一次** —— 中途卡死的会话得等下次重启才治
+        （用户现场就是"一直卡在写字状态"）。现在改成每 REPAIR_EVERY_SEC 跑一轮，
+        首轮仍按启动自愈口径记录事件（`startup_repair_stale`），后续只记
+        `periodic_repair_stale`（不弹气泡，避免打扰）。
+        """
+        def job():
+            time.sleep(5.0)               # 等系统落定（数仓/库句柄就绪、宿主若在启动先让它走）
+            first = True
+            while True:
+                try:
+                    n = repair_stale_working(self.db_path, self.wb_db)
+                    if n > 0:
+                        if first:
+                            self._report_event("startup_repair_stale", ok=True, detail=str(n))
+                            self._say_once(f"修复了 {n} 个卡死的会话状态", "开机自愈", 6.0)
+                        else:
+                            self._report_event("periodic_repair_stale", ok=True, detail=str(n))
+                except Exception:
+                    log_exception("[stale-repair] 自愈失败")
+                first = False
+                time.sleep(REPAIR_EVERY_SEC)
+        threading.Thread(target=job, daemon=True, name="komi-stale-repair").start()
+
     def _start_api_guard(self):
         """看板 API 的常驻守护：**这不放在消息循环里**（见下）。
 
@@ -4506,7 +4582,7 @@ class WhalePet:
         lt_sig = (lt.get("credit"), lt.get("total_tokens"),
                   lt.get("first_ts"), lt.get("last_ts"),
                   lt.get("title") or lt.get("project") or "")
-        return (self.db_ok, self.api_ok, talk, self._pressed, self._react_face,
+        return (self.db_ok, self.api_ok, talk, self._pressed,
                 self._bub_mode, self._ok_clicks,
                 tuple((x.get("_wb_title") or x.get("title") or "",
                        x.get("credit"), x.get("total_tokens"),
@@ -4518,8 +4594,29 @@ class WhalePet:
                 self._timeline_cache and self._timeline_cache[1][0])
 
     def tick(self):
+        if self._menu_open:
+            return          # 菜单模态中：不查库、不刷新气泡（动画在 _anim_tick 里照跑）
+        # 高精度动画时钟看门狗：时钟线程若异常/被系统掐掉（>2s 没有 tick），
+        # 立刻退回 SetTimer —— 最坏也只是回到 21fps 的旧行为，绝不让动画整个冻住。
+        if (self._anim_clock_on and self._anim_last_tick
+                and time.time() - self._anim_last_tick > 2.0):
+            self._stop_anim_clock()
+            self._anim_clock_dead = True
+            if self.hwnd:
+                _user32.SetTimer(self.hwnd, ID_TIMER_ANIM, ANIM_MS, None)
+            self._report_event("anim_clock_stalled", ok=False,
+                               detail="退回 SetTimer")
         if not self._dragging:
+            now = time.time()
             _kpi, active, ok, latest = query_db(self.db_path, self.wb_db)
+            if self._read_stale(ok, now) and self.active:
+                # 数仓连续读不出来 → 不能一直替它"记着"上次的活跃会话，
+                # 否则她会永远卡在写字态（读数失败时保留旧值是防闪烁的权宜，
+                # 见 query_db 的约定——但必须有个上限）。
+                self.active = []
+                self._drawn_sig = None
+                self._report_event("read_stale", ok=False,
+                                   detail=f"读数失败 {int(now - self._read_ok_at)}s → 视为无任务")
             if active is not None:
                 self.active = active
             if latest is not None:
@@ -4532,7 +4629,7 @@ class WhalePet:
             # live 模式下"用时"按 first_ts → now 算，每秒要 +1s 实时跳动
             # 强制每 tick 重绘（开销可忽略；只在 latest_turn 存在时）
             live_tick = bool(self.latest_turn and self.active)
-            if live_tick or self._fade is not None or sig != self._drawn_sig:
+            if live_tick or sig != self._drawn_sig:
                 self.draw()
                 self._drawn_sig = sig
             _user32.SetWindowPos(self.hwnd, ctypes.c_void_p(HWND_TOPMOST),
@@ -4547,6 +4644,7 @@ class WhalePet:
             _user32.PostQuitMessage(0)
 
     def close(self):
+        self._stop_anim_clock()           # 动画时钟线程 + 定时器句柄
         if self._wb_proc_handle:
             try:
                 _kernel32.CloseHandle(self._wb_proc_handle)
@@ -4554,15 +4652,18 @@ class WhalePet:
                 pass
             self._wb_proc_handle = None
         self._uninstall_follow_hotkey()   # P3：全局热键随窗口销毁注销
+        self._stop_anim_sfx()             # 动作音效（循环播的那种）必须显式停
         try:
             self.surf.close()
         except Exception:
             pass
-        for spr in self._sprites.values():
-            try:
-                _DisposeImage(spr[0])
-            except Exception:
-                pass
+        for _bucket in getattr(self, "_anim_imgs", {}).values():
+            for spr in _bucket.values():
+                try:
+                    if spr:
+                        _DisposeImage(spr[0])
+                except Exception:
+                    pass
         try:
             _GdiplusShutdown(self._gp_token)
         except Exception:

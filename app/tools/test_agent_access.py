@@ -243,6 +243,157 @@ try:
 finally:
     CC.CACHE_DIR, CC._node_available, CC._source_enabled, CC._refresher = saved
 
+# ===== F. 库型源：opencode（SQLite）=====
+# 2026-09-30：看板上「opencode 无用量数据」→ 它的用量在 ~/.local/share/opencode/opencode.db
+# 的 session_message（assistant 消息 data.tokens）。夹具库照实机 schema 造。
+print("\n[F] 库型源：opencode（SQLite）")
+import sqlite3 as _sq                          # noqa: E402
+from agents.opencode import OpenCodeSource as _OC   # noqa: E402
+
+_ocdb = os.path.join(tmpdir, "opencode-fixture.db")
+if os.path.exists(_ocdb):
+    os.remove(_ocdb)
+_c = _sq.connect(_ocdb)
+_c.executescript("""
+CREATE TABLE project(id TEXT PRIMARY KEY, worktree TEXT);
+CREATE TABLE session_v2(id TEXT PRIMARY KEY, project_id TEXT, title TEXT,
+                        model TEXT, directory TEXT, time_created INTEGER);
+CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT,
+                             seq INTEGER, time_created INTEGER, data TEXT);
+""")
+_c.execute("INSERT INTO project VALUES('p1','C:/work/demo-proj')")
+_c.execute("INSERT INTO session_v2 VALUES('ses_1','p1','问个项目问题',"
+           "'{\"id\":\"m-x\",\"providerID\":\"prov\"}',NULL,1790700000000)")
+_msgs = [
+    ("m_u1", "user", 1, {"text": "帮我写个函数", "time": {"created": 1790700001000}}),
+    ("m_a1", "assistant", 2, {"time": {"created": 1790700002000},
+                              "model": {"id": "m-x", "providerID": "prov"},
+                              "cost": 0,
+                              "tokens": {"input": 1000, "output": 50, "reasoning": 10,
+                                         "cache": {"read": 800, "write": 20}}}),
+    ("m_idle", "idle", 3, {"time": {"created": 1790700003000}, "outcome": "succeeded"}),
+    ("m_u2", "user", 4, {"text": "再改一下", "time": {"created": 1790700004000}}),
+    ("m_a2", "assistant", 5, {"time": {"created": 1790700005000},
+                              "model": {"id": "m-x", "providerID": "prov"},
+                              "tokens": {"input": 2000, "output": 60, "reasoning": 0,
+                                         "cache": {"read": 0, "write": 0}}}),
+]
+for _mid, _t, _seq, _d in _msgs:
+    _c.execute("INSERT INTO session_message VALUES(?,?,?,?,?,?)",
+               (_mid, "ses_1", _t, _seq, _d["time"]["created"],
+                json.dumps(_d, ensure_ascii=False)))
+_c.commit()
+_c.close()
+
+oc = _OC()                                     # 夹具库替换掉真实路径
+oc.db_path = lambda: _ocdb
+oc.root = lambda: tmpdir
+check("F1: available() 认数据库文件", oc.available() is True)
+check("F2: change_hint() 是两张表的行号指纹", isinstance(oc.change_hint(), str)
+      and oc.change_hint().startswith("5:"), oc.change_hint())
+
+_tdb = os.path.join(tmpdir, "komi-oc-test.db")
+for _suf in ("", "-wal", "-shm"):
+    if os.path.exists(_tdb + _suf):
+        os.remove(_tdb + _suf)
+_tconn = C.get_conn(_tdb)
+_got = []
+
+
+def _fake_insert(conn, path, src_obj, rows):        # 库型源的 insert_rows 是 4 参
+    _got.append((path, rows))
+    return C.insert_rows(conn, path, src_obj, rows)
+
+
+n_oc = oc.collect(_tconn, _tdb, _fake_insert)
+u1 = json.loads(_tconn.execute(
+    "SELECT raw_usage_json FROM ods_jsonl_event WHERE id='opencode:m_a1'").fetchone()[0])
+check("F3: assistant 的 tokens → 规范用量",
+      u1["prompt_tokens"] == 1000 and u1["completion_tokens"] == 50
+      and u1["total_tokens"] == 1060 and u1["prompt_cache_hit_tokens"] == 800
+      and u1["prompt_cache_write_tokens"] == 20
+      and u1["completion_thinking_tokens"] == 10, json.dumps(u1))
+check("F4: 轮次按「最近一条用户提问」聚合（两条 assistant 分属两轮）",
+      _tconn.execute("SELECT COUNT(DISTINCT request_id) FROM ods_jsonl_event "
+                     "WHERE event_type='usage'").fetchone()[0] == 2)
+check("F5: 用户提问单独成行（气泡/时间线要用）",
+      _tconn.execute("SELECT user_prompt FROM ods_jsonl_event "
+                     "WHERE event_type='message' AND role='user'").fetchone()[0] == "帮我写个函数")
+check("F6: cwd 取自 project.worktree（项目名跟着派生）",
+      _tconn.execute("SELECT cwd, project FROM ods_jsonl_event "
+                     "WHERE id='opencode:m_a1'").fetchone()[:] == ("C:/work/demo-proj", "demo-proj"))
+check("F7: agent 列 = 登记 key", _tconn.execute(
+    "SELECT DISTINCT agent FROM ods_jsonl_event").fetchone()[0] == "opencode")
+check("F8: 幂等（重采不重复）",
+      oc.collect(_tconn, _tdb, _fake_insert) == 0
+      and _tconn.execute("SELECT COUNT(*) FROM ods_jsonl_event").fetchone()[0] == 4)
+_tconn.close()
+for _suf in ("", "-wal", "-shm"):
+    if os.path.exists(_tdb + _suf):
+        os.remove(_tdb + _suf)
+
+# ===== G. 整文件 JSON 源：qwen-code =====
+# 2026-09-30：本机 ~/.qwen 有目录结构但没有会话文件 → 用**合成样本**（Gemini CLI 系格式）
+# 验证解析逻辑；认不出来的文件必须**不出行**（宁缺勿错）。
+print("\n[G] 整文件 JSON 源：qwen-code（合成样本）")
+from agents.qwen_code import QwenCodeSource as _QW      # noqa: E402
+
+_qroot = os.path.join(tmpdir, "qwen-home")
+_cdir = os.path.join(_qroot, "projects", "c--work-demo-proj", "chats")
+os.makedirs(_cdir, exist_ok=True)
+json.dump({"schema_version": 1, "pid": 1, "session_id": "sess-q1",
+           "work_dir": "C:/work/demo-proj", "started_at": 1790700000.0},
+          open(os.path.join(_cdir, "sess-q1.runtime.json"), "w"))
+json.dump({"sessionId": "sess-q1", "messages": [
+    {"type": "user", "timestamp": "2026-09-30T10:00:00Z",
+     "content": [{"text": "帮我看下这个报错"}]},
+    {"type": "gemini", "model": "qwen3-coder",
+     "timestamp": "2026-09-30T10:00:05Z",
+     "tokens": {"input": 500, "output": 80, "cached": 300, "thoughts": 20, "total": 600}},
+    {"type": "gemini", "model": "qwen3-coder", "timestamp": "2026-09-30T10:00:09Z",
+     "tokens": {"input": 0, "output": 0}},                       # 全 0 → 不出行
+]}, open(os.path.join(_cdir, "sess-q1.json"), "w"), ensure_ascii=False)
+# 一个"认不出来"的会话（老版本/别的格式）：必须是零行
+json.dump({"sessionId": "sess-q2", "messages": [{"type": "gemini", "foo": "bar"}]},
+          open(os.path.join(_cdir, "sess-q2.json"), "w"))
+
+qw = _QW()
+qw.root = lambda: _qroot
+check("G1: available() 认 chats 目录", qw.available() is True)
+check("G2: change_hint() 跟随文件数与 mtime",
+      (qw.change_hint() or "").startswith("2:"), qw.change_hint())
+_tdb2 = os.path.join(tmpdir, "komi-qw-test.db")
+for _suf in ("", "-wal", "-shm"):
+    if os.path.exists(_tdb2 + _suf):
+        os.remove(_tdb2 + _suf)
+_tconn2 = C.get_conn(_tdb2)
+def _ins2(conn, path, src_obj, rows):
+    return C.insert_rows(conn, path, src_obj, rows)
+
+
+n_qw = qw.collect(_tconn2, _tdb2, _ins2)
+_qrow = _tconn2.execute("SELECT raw_usage_json, cwd, model, request_id FROM ods_jsonl_event "
+                        "WHERE event_type='usage'").fetchone()
+_qu = json.loads(_qrow[0]) if _qrow else {}
+check("G3: tokens 块映射（input/output/cached/thoughts）",
+      n_qw == 2 and _qu.get("prompt_tokens") == 500 and _qu.get("completion_tokens") == 80
+      and _qu.get("total_tokens") == 600 and _qu.get("prompt_cache_hit_tokens") == 300
+      and _qu.get("completion_thinking_tokens") == 20, f"n={n_qw} u={_qu}")
+check("G4: cwd 取自同目录 runtime.json 的 work_dir（项目名派生）",
+      _qrow and _qrow[1] == "C:/work/demo-proj"
+      and _tconn2.execute("SELECT project FROM ods_jsonl_event WHERE event_type='usage'"
+                          ).fetchone()[0] == "demo-proj", _qrow and _qrow[1])
+check("G5: 全 0 / 认不出的消息不出行（宁缺勿错）",
+      _tconn2.execute("SELECT COUNT(*) FROM ods_jsonl_event WHERE session_id='sess-q2'"
+                      ).fetchone()[0] == 0)
+check("G6: 幂等（重采不重复）",
+      qw.collect(_tconn2, _tdb2, _ins2) == 0
+      and _tconn2.execute("SELECT COUNT(*) FROM ods_jsonl_event").fetchone()[0] == 2)
+_tconn2.close()
+for _suf in ("", "-wal", "-shm"):
+    if os.path.exists(_tdb2 + _suf):
+        os.remove(_tdb2 + _suf)
+
 print(f"\n=== 总结 ===")
 print(f"PASS: {len(PASSED)}")
 print(f"FAIL: {len(FAILED)}")

@@ -29,6 +29,29 @@ import wb_runtime as RT          # 运行时环境适配（可写数据目录 / 
 POLL_SEC = 1              # 最短刷新间隔（秒）
 ACTIVE_WINDOW_SEC = 3     # 降级时用：近 N 秒有活动 = 活跃对话
 WB_CACHE_TTL = 3.0        # workbuddy.db 查询节流缓存（秒）
+# 残留会话兜底（2026-09-28 事故）：宿主崩溃/被杀不会把 working 落回终态，
+# 桌宠会永远显示"会话运行中"。working 且数据停更超过此时长 → 判为残留，
+# 不计入活跃（真修复=写库，走 repair_stale_working）。
+# 15 分钟：真在跑的会话每个 turn 都会有 ODS 事件，15 分钟一笔都没有
+# 实际上只在"卡死"时发生；误判的代价也只是气泡提前回落，下一笔事件自愈。
+WB_STALE_AFTER_SEC = 900
+# 独立 CLI agent（ZCode 等）的会话**不在 workbuddy.db**（那是宿主自己的会话表），
+# 它们的运行踪迹只有 ODS 数仓里的 LLM 调用。近窗有调用 = 会话在跑——
+# 写字态/气泡"运行中"必须把它算进去，否则宿主静默时桌宠永远不写字。
+# 5 分钟：agent 跑长本地工具时几分钟没有新调用属正常，太窄会写字/坐下反复抖；
+# 对话结束后她最多多写 5 分钟才回落。
+ODS_ACTIVE_SEC = 300
+# 显示层"还在干活"的停更上限（2026-09-29 修正）：**与 ODS 活跃窗同宽**。
+#   · 原来显示层直接用 WB_STALE_AFTER_SEC(900) → 一轮对话结束后她还多写 15 分钟，
+#     用户看到的就是"一直卡在写字状态"；
+#   · 300s = 文档里给用户的承诺「最多多写 5 分钟」。
+#   · WB_STALE_AFTER_SEC(900) 继续只用于**写库真修复**（那里要保守，宁漏勿误杀）。
+ACTIVE_STALE_SEC = 300
+# 「刚开的会话」宽限：working 但**一笔 LLM 调用都还没产生**时，只在这段时间内计入。
+# 2026-09-29 事故：有个会话整天只有 4 条 session-meta（零 LLM 调用），却在宿主库里
+# 一直 status='working'，而宿主偶尔刷 last_activity_at → 兜底分支永远判它"新鲜"
+# → n 永久 ≥1 → 桌宠一直写字。过宽限仍无调用 = 光开着没干活，不计入。
+NO_CALL_GRACE_SEC = 90
 LIVE_LOOKBACK_SEC = 30 * 60   # "本轮"统计回溯窗口：取最近 30 分钟内有数据的 turn（不依赖 working 状态）
 TMPDIR = tempfile.gettempdir()
 # P1：文件名带项目前缀（komi-）。旧技能目录的遗留进程还在写同名旧文件
@@ -191,10 +214,18 @@ def api_healthy(dashboard_url):
 
 # ---------- 取数 ----------
 _wb_cache = {"ts": 0.0, "sids": [], "key": None}
+# 最近一次活跃判定的快照（只读排查用：tools/_diag_active.py 打印它 + 逐会话原因）
+_active_debug = {}
 
 
 def _active_sessions(conn, wb_db, window_sec):
-    """活跃会话 = workbuddy.db sessions.status='working'（官方权威状态，非时间窗口猜测）。
+    """活跃会话 = workbuddy.db status='working' ∪ ODS 近窗（ODS_ACTIVE_SEC）有调用的会话。
+
+    例外（2026-09-28 事故兜底）：working 但数据停更超过 WB_STALE_AFTER_SEC 的残留
+    （宿主崩溃/被杀不落终态）不计入活跃，否则桌宠永远显示"会话运行中"。
+    真修复（写库回终态）走 repair_stale_working。
+    并入 ODS 近窗（2026-09-28 事故）：ZCode 等独立 CLI 的会话不在宿主库，
+    只有 ODS 收得到它们的调用——不并入的话宿主静默时桌宠永远不写字。
 
     window_sec 仅在 workbuddy.db 不可读时用于 ODS 时间窗口兜底。
     每个会话的最新轮次用 ODS 补充（积分/tokens/请求）。
@@ -217,22 +248,26 @@ def _active_sessions(conn, wb_db, window_sec):
         except Exception:
             wb_ok = False
 
-    if not sids and not wb_ok:
-        # workbuddy.db 不可读 → ODS 时间窗口兜底（宽窗 60s，避免闪烁归零）
-        fallback_sec = max(window_sec, 60)
+    # 恒定并入 ODS 近窗会话（独立 CLI agent 的唯一运行踪迹；与 working 行按
+    # session_id 去重）。原"wb 不可读才走 60s 兜底"由这条更宽的并集取代。
+    try:
+        seen = {s[0] for s in sids}
         now_ms = int(now * 1000)
-        try:
-            sids = [(r[0], "", 0) for r in conn.execute(
+        for (sid,) in conn.execute(
                 """SELECT DISTINCT session_id FROM ods_jsonl_event
                    WHERE raw_usage_json IS NOT NULL AND ts_ms >= ?""",
-                (now_ms - fallback_sec * 1000,))]
-        except Exception:
-            sids = []
+                (now_ms - ODS_ACTIVE_SEC * 1000,)).fetchall():
+            if sid and sid not in seen:
+                sids.append((sid, "", 0))
+                seen.add(sid)
+    except Exception:
+        pass
 
     active = []
     for sid, wb_title, last_act in sids:
         t = conn.execute(
-            """SELECT o.request_id AS turn_id,
+            """SELECT o.session_id AS session_id,
+                      o.request_id AS turn_id,
                       MIN(o.ts_ms) AS first_ts, MAX(o.ts_ms) AS last_ts,
                       COUNT(*) AS api_calls,
                       ROUND(SUM(COALESCE(json_extract(o.raw_usage_json,'$.credit'),0)),2) AS credit,
@@ -256,15 +291,107 @@ def _active_sessions(conn, wb_db, window_sec):
             d["user_prompt"] = up[0] if up else ""
         else:
             # working 但 ODS 尚无调用事件（新对话刚开、还没产生 LLM 调用）——
-            # 用 workbuddy.db 信息构造最小条目，保证活跃数 = working 数，不丢会话
+            # ★ 只在宽限期内计入：过时仍无调用 = "光开着没干活"，不计入。
+            #   （否则零调用的 working 行 + 宿主偶尔刷 last_activity_at = 永久活跃，
+            #     桌宠会一直卡在写字态，见 NO_CALL_GRACE_SEC 的注释）
+            _age_act = (time.time() - _to_epoch(last_act)) if last_act else None
+            if _age_act is None or _age_act > NO_CALL_GRACE_SEC:
+                continue
             d = {"turn_id": "", "first_ts": last_act or 0, "last_ts": last_act or 0,
                  "api_calls": 0, "credit": 0.0, "total_tokens": 0, "project": "",
                  "title": wb_title, "user_prompt": ""}
         d["_wb_title"] = wb_title
         d["_last_act"] = last_act
+        d["_sid"] = sid
+        # 残留兜底（显示层口径）：最后一条**带用量的调用**老于 ACTIVE_STALE_SEC
+        # → 不算"在干活"，不计入活跃（她最多多写 5 分钟）。
+        # last_ts 是 ms，_to_epoch 统一口径。
+        _ref_ms = d.get("last_ts") or 0
+        if not _ref_ms:
+            continue                  # 无任何可用的活动参考 → 宁漏（防"永久算活跃"）
+        if time.time() - _to_epoch(_ref_ms) > ACTIVE_STALE_SEC:
+            continue
         active.append(d)
     active.sort(key=lambda x: x["last_ts"], reverse=True)
+    # 记下每个会话被判活跃/排除的原因（排查用；`_active_debug` 只读快照）
+    _active_debug.clear()
+    _active_debug.update({"ts": now, "kept": [d.get("_sid") for d in active]})
     return active
+
+
+def stale_working_sessions(db_path, wb_db, after_sec=None):
+    """列出卡死的残留会话：status='working' 但数据停更超过 after_sec 秒。
+
+    停更判据：ODS 里该会话最新事件时间；ODS 没有则用 last_activity_at
+    （ms/s 自动适配）。两者都没有 → 不判（宁漏勿误杀，比如刚开的新对话）。
+    返回 [{"id", "title", "age_sec"}, ...]；库不可读 → []。
+    故意不走 _wb_cache：修复动作要的是当下真相，不是 3 秒前的快照。
+    """
+    if after_sec is None:
+        after_sec = WB_STALE_AFTER_SEC
+    try:
+        wb = sqlite3.connect(f"file:{wb_db}?mode=ro", uri=True, timeout=3)
+        rows = wb.execute(
+            "SELECT id, title, last_activity_at FROM sessions "
+            "WHERE status='working'").fetchall()
+        wb.close()
+    except Exception:
+        return []
+    if not rows:
+        return []
+    last_ev = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
+        qs = ",".join("?" * len(rows))
+        # ★ 只认**带用量**的事件（= 真发生过 LLM 调用）。session-meta 之类的
+        #   采集元数据不是"活动"——否则一个零调用的会话靠 session-meta 就能
+        #   永远显得"新鲜"，残留永远修不掉（2026-09-29 踩过）。
+        for sid, mx in conn.execute(
+                f"""SELECT session_id, MAX(ts_ms) FROM ods_jsonl_event
+                    WHERE session_id IN ({qs}) AND raw_usage_json IS NOT NULL
+                    GROUP BY session_id""",
+                [r[0] for r in rows]):
+            last_ev[sid] = mx or 0
+        conn.close()
+    except Exception:
+        pass                          # 数仓不可读 → 只按 last_activity_at 判
+    now_ms = time.time() * 1000.0
+    out = []
+    for sid, title, last_act in rows:
+        ref_ms = last_ev.get(sid) or (_to_epoch(last_act) * 1000.0)
+        if not ref_ms:
+            continue
+        age = (now_ms - ref_ms) / 1000.0
+        if age > after_sec:
+            out.append({"id": sid, "title": title or "", "age_sec": int(age)})
+    return out
+
+
+def repair_stale_working(db_path, wb_db, after_sec=None):
+    """把残留会话落回终态（status='completed'）——"修复卡死会话"的写库入口。
+
+    只动 stale_working_sessions 认定的行，且 UPDATE 带 status='working' 复查，
+    两次查询之间恢复活跃的会话不会被误杀。返回修复行数；库不可写 → -1。
+    写库时机：桌宠启动自动一次 + 右键菜单手动；宿主若真在跑同一会话，
+    下一笔事件会把状态写回 working（桌宠侧无永久影响）。
+    """
+    victims = stale_working_sessions(db_path, wb_db, after_sec)
+    if not victims:
+        return 0
+    try:
+        wb = sqlite3.connect(wb_db, timeout=3)
+        try:
+            qs = ",".join("?" * len(victims))
+            cur = wb.execute(
+                f"""UPDATE sessions SET status='completed'
+                    WHERE status='working' AND id IN ({qs})""",
+                [v["id"] for v in victims])
+            wb.commit()
+            return cur.rowcount
+        finally:
+            wb.close()
+    except Exception:
+        return -1
 
 
 def query_db(db_path, wb_db, window_sec=ACTIVE_WINDOW_SEC):
@@ -360,8 +487,28 @@ def save_pos(pos_file, x, y):
         pass
 
 
+def turn_src(conn, db_path=None):
+    """轮次数据源：优先**物化表** `dws_turn`，否则退回视图 `v_turn_total`。
+
+    🔴 为什么必须优先物化表：`v_turn_total` 是多层 VIEW + 每行 `json_extract`
+    （基础表 1GB+，视图**无法建索引**），实测**单次 1.6~10.3 秒**；`dws_turn` 是它的
+    快照，**同样的查询 12.7ms**（2026-09-30 实测：切换 agent 的那次接续查询 = 10304ms）。
+    退回条件：表不存在、或表还是空的（尚未物化）→ 用原视图，避免读到"假空"。
+
+    ⚠️ 任何"顺带查一下轮次"的地方都必须用它 —— 直查视图 = 在 UI 线程上按秒冻。
+    """
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='dws_turn'").fetchone() \
+           and conn.execute("SELECT 1 FROM dws_turn LIMIT 1").fetchone():
+            return "dws_turn"
+    except Exception:
+        pass
+    return "v_turn_total"
+
+
 def today_timeline(db_path, limit=8):
-    """跨 agent 统一时间线（跟随模式 P2 连续锚点）——零新链路，只查 v_turn_total。
+    """跨 agent 统一时间线（跟随模式 P2 连续锚点）——零新链路，只读轮次表。
 
     返回 (summary, recent)：
       summary = [(agent_label, 轮次数), ...]   今天各 agent 轮次数（按轮次降序，≤3）
@@ -373,17 +520,7 @@ def today_timeline(db_path, limit=8):
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
         try:
             day = conn.execute("SELECT date('now','localtime')").fetchone()[0]
-            # 优先读**物化表** dws_turn（v_turn_total 的快照，2026-09-26 性能修复）：
-            # 原视图是多层 VIEW + 每行 json_extract，实测 1646~3700ms；物化表 0.0ms。
-            # 退回条件：表不存在、或表还是空的（尚未物化）→ 用原视图，避免读到"假空"。
-            src = "v_turn_total"
-            try:
-                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                                "AND name='dws_turn'").fetchone() \
-                   and conn.execute("SELECT 1 FROM dws_turn LIMIT 1").fetchone():
-                    src = "dws_turn"
-            except Exception:
-                src = "v_turn_total"
+            src = turn_src(conn, db_path)      # ★ 优先物化表，见 turn_src 注释
             summary = conn.execute(
                 f"""SELECT agent, COUNT(*) FROM {src}
                    WHERE day = ? AND agent != '' GROUP BY agent

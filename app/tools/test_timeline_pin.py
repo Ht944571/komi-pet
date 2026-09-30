@@ -4,7 +4,7 @@ r"""跟随模式 P2 连续锚点 + P3 pin 锁定 专项测试
 验证点（对照《桌宠跨Agent体验设计.md》§4.2/§8 P2·P3）：
   A. 叙述格式化：「今天：Codex 3 轮 · WorkBuddy 12 轮」
   B. today_timeline 数据层（真库只读）：summary/recent 形状
-  C. 气泡 row3：有数据 → 跨 agent 叙述；无数据 → 回退「活跃 X 分钟前」
+  C. 气泡 row3：已整体下线（2026-09-29 用户反馈"任何时候都不要出现"）→ 恒空串
   D. P3 pin：锁定 → 跟随不覆盖；解开 → 跟随即刻接管；手动聚焦生效；持久化
 
 用法：python tools/test_timeline_pin.py
@@ -63,7 +63,7 @@ check("B3: recent 形状 = (HH:MM, agent, 标题)",
 check("B4: recent 按时间降序",
       all(recent[i][0] >= recent[i + 1][0] for i in range(len(recent) - 1)))
 
-print("\n[C] 气泡 row3：跨 agent 叙述 / 无数据回退")
+print("\n[C] 气泡 row3：已下线（任何时候都不出现）")
 tmpdir = os.path.join(HERE, "_tmp_tl_test")
 os.makedirs(tmpdir, exist_ok=True)
 settings_file = os.path.join(tmpdir, ".whale_settings.json")
@@ -81,11 +81,14 @@ try:
                        "title": "测试会话", "project": "proj"}
     app._today_timeline = lambda: ([("Codex", 3), ("WorkBuddy", 12)], [])
     row1, row2, row3 = app._bubble_lines()
-    check("C1: row3 = 「今天：Codex 3 轮 · WorkBuddy 12 轮 · 双击开看板」",
-          row3 == "今天：Codex 3 轮 · WorkBuddy 12 轮 · 双击开看板", f"row3={row3}")
+    check("C1: 有时间线数据时 row3 仍为空（第三行已下线）",
+          row3 == "", f"row3={row3!r}")
+    check("C1b: row1/row2 仍在（气泡不退化成空）",
+          bool(row1) and bool(row2), f"row1={row1!r} row2={row2!r}")
     app._today_timeline = lambda: ([], [])
     _r1, _r2, row3 = app._bubble_lines()
-    check("C2: 无数据 → 回退「活跃 …」叙述", row3.startswith("活跃 "), f"row3={row3}")
+    check("C2: 无时间线数据 → row3 同样为空（不再回退「活跃 …」叙述）",
+          row3 == "", f"row3={row3!r}")
 
     print("\n[D] P3 pin 锁定 + 手动聚焦")
     saved_gfw = W._user32.GetForegroundWindow

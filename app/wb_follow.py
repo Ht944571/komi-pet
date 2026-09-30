@@ -74,35 +74,56 @@ def resolve(hint_map, proc, title):
 # P4 接续（设计 §5）：刚离开的 agent 若"似乎未结束"→ 角标；摘要用户触发才生成
 # ---------------------------------------------------------------------------
 
-def handoff_last_turn(db_path, agent_key, now, window_s=None):
-    """接续检测：该 agent 最近一轮的结束时刻。
+# 接续检测的 TTL 记忆：{(db_path, agent, window): (查得时刻, 结果)}
+_HANDOFF_CACHE = {}
+
+
+def handoff_last_turn(db_path, agent_key, now, window_s=None, ttl=5.0):
+    """接续检测：该 agent 最近一轮的结束时刻（带 TTL 记忆）。
 
     返回 (last_epoch, title)——最近一轮结束在窗口内（"似乎未结束"）；否则 None。
-    last_time 为 v_turn_total 的本地时间字符串（'YYYY-MM-DD HH:MM:SS'）。
+    last_time 为轮次表的本地时间字符串（'YYYY-MM-DD HH:MM:SS'）。
+
+    🔴 数据源必须走 `wb_hover_core.turn_src()`（优先物化表 `dws_turn`）。
+    原实现直查视图 `v_turn_total`，2026-09-30 实测**单次 10304 ms** —— 而它是在
+    **每次前台切换 agent 时同步调用**的（跟随模式），连切 5 次 = 46 秒 UI 冻结，
+    用户报的"切换不同 agent 时卡顿"就是这个。换物化表后同一查询 **12.7ms**。
+    再加一层 5s 记忆：Alt+Tab 来回切不再重复查库（窗口语义是"2 分钟内算未结束"，
+    5 秒的陈值完全够用）。
     """
-    import sqlite3
     window = MOTION.HANDOFF_WINDOW_S if window_s is None else window_s
+    ck = (db_path, str(agent_key), float(window))
+    hit = _HANDOFF_CACHE.get(ck)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    import sqlite3
+    out = None
     try:
+        try:
+            from wb_hover_core import turn_src      # 只在函数内 import（本模块不依赖 Win32 层）
+        except Exception:
+            turn_src = None
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
         try:
+            src = turn_src(conn, db_path) if turn_src else "v_turn_total"
             row = conn.execute(
-                """SELECT last_time, COALESCE(NULLIF(title, ''),
+                f"""SELECT last_time, COALESCE(NULLIF(title, ''),
                                                  NULLIF(project, ''), '')
-                     FROM v_turn_total WHERE agent = ?
-                    ORDER BY last_time DESC LIMIT 1""", (agent_key,)).fetchone()
+                      FROM {src} WHERE agent = ?
+                     ORDER BY last_time DESC LIMIT 1""", (agent_key,)).fetchone()
         finally:
             conn.close()
-        if not row:
-            return None
-        last_str, title = str(row[0]), str(row[1])
-        st = time.strptime(last_str[:19], "%Y-%m-%d %H:%M:%S")
-        last = time.mktime(st)
-        age = now - last
-        if 0 <= age <= window:
-            return last, title
-        return None
+        if row:
+            last_str, title = str(row[0]), str(row[1])
+            st = time.strptime(last_str[:19], "%Y-%m-%d %H:%M:%S")
+            last = time.mktime(st)
+            age = now - last
+            if 0 <= age <= window:
+                out = (last, title)
     except Exception:
-        return None
+        out = None
+    _HANDOFF_CACHE[ck] = (now, out)
+    return out
 
 
 def linked_should_quit(seen, empty_since, agents, now, grace_s,

@@ -36,15 +36,19 @@ def check(name, cond, detail=""):
 class Stub:
     ok_autodismiss_on = True      # 新状态契约：行为开关是实例标志（Stub 默认出厂值）
     linked_close_on = True
+    # 活跃数防抖（2026-09-29 加）：_sync_bubble_mode 会调它，用真实现（纯逻辑无副作用）
+    _stable_active_n = W.WhalePet._stable_active_n
     """只保留状态机需要的那几个入口，_layout / 音效 / 粒子 / 事件上报全部 stub 掉。"""
 
     def __init__(self):
         self._bub_mode = W.BUBBLE_DEFAULT
         self._prev_active_n = None
-        # 写字本子：_sync_bubble_mode 现在**同一个判据**顺带驱动它（见 wb_notebook 模块头），
-        # 所以 Stub 也要有。给它真状态机，本子的迁移逻辑才能被一起回归到。
-        self._nb = W.NOTEBOOK.NotebookState()
-        self._nb_phase_seen = []
+        self._n_stable = 0            # 防抖的"已生效活跃数"
+        self._n_hold_since = 0.0
+        self._fall_debounce_s = 0.0   # 本文件验状态机迁移 → 关掉下降防抖窗口
+        # 写字动作相位：_sync_bubble_mode 用**同一个判据**顺带驱动它（见 wb_anim 模块头），
+        # 所以 Stub 也要有。给它真状态机，相位迁移才能被一起回归到。
+        self._wr = W.ANIM.PetPhase()
         self._ok_clicks = 0
         self._ok_last_click = 0.0
         self._ok_anim_t0 = 0.0

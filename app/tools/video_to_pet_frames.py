@@ -16,8 +16,8 @@ r"""把一段 AI 生成的视频转成桌宠可播放的**透明帧序列**（�
     assets/anim/<name>/<name>_000.png ... （真透明底）
     assets/anim/<name>/_anim_meta.json    （画布 / 内容框 / fps / 帧数 / 分段）
 
-约定：**画布与 v3 立绘完全一致（1167×1570，底边对齐）**，这样桌宠里
-尺寸归一 / 命中区 / 气泡锚点 / 本子定位全部不用改就能用。
+约定：**画布与桌宠的显示口径一致（1167×1570，底边对齐）**，这样桌宠里
+气泡锚点 / 命中区 / 视线判定全部不用改就能用。
 
 用法：
     python tools/video_to_pet_frames.py <视频> --name write --fps 12 --crop-bottom 40
@@ -38,15 +38,30 @@ from gen_to_asset import background_mask       # noqa: E402
 
 APP = os.path.dirname(HERE)
 ASSETS = os.path.join(APP, "assets")
-V3 = os.path.join(ASSETS, "pet_v3")
 ANIM_DIR = os.path.join(ASSETS, "anim")
+
+# 帧画布尺寸。2026-09-28 起桌宠只有帧序列这一种形态，**没有立绘可参照了** ——
+# 画布尺寸的唯一出处改成「已有素材的 meta」（不写死），读不到才退回这个常量
+# （= 原 v3 立绘的画布，也是当前所有帧素材用的尺寸）。
+CANVAS_FALLBACK = (1167, 1570)
 
 
 def canvas_size():
-    """以 v3 立绘的画布为准（不写死，避免以后立绘改尺寸对不上）。"""
-    p = os.path.join(V3, "pet_idle.png")
-    im = Image.open(p)
-    return im.size
+    """帧画布尺寸：优先读已有素材 `_anim_meta.json` 的 `canvas_source`。
+
+    这样以后改了画布尺寸、重跑本工具时会自动跟随，不必手改常量。
+    """
+    for name in ("write",):
+        mp = os.path.join(ANIM_DIR, name, "_anim_meta.json")
+        try:
+            with open(mp, encoding="utf-8") as f:
+                meta = json.load(f)
+            cs = meta.get("canvas_source")
+            if cs and len(cs) == 2 and all(int(v) > 0 for v in cs):
+                return int(cs[0]), int(cs[1])
+        except Exception:
+            pass
+    return CANVAS_FALLBACK
 
 
 def decode(video, keep):
@@ -103,7 +118,7 @@ def union_bbox(imgs, crop_bottom):
 
 
 def render_to_canvas(im, box, canvas, scale=1.0, bottom_align=True):
-    """裁到统一内容框 → 等比缩放 → 贴进 v3 画布（底边对齐）。"""
+    """裁到统一内容框 → 等比缩放 → 贴进帧画布（底边对齐）。"""
     cw, ch = canvas
     crop = im.crop(box)
     cwpx, chpx = crop.size
@@ -151,7 +166,7 @@ def main():
     args = ap.parse_args()
 
     canvas = canvas_size()
-    print(f"  v3 画布: {canvas[0]}x{canvas[1]}")
+    print(f"  帧画布: {canvas[0]}x{canvas[1]}")
 
     import imageio.v3 as iio
     total = len(iio.imread(args.video, index=0)) * 0  # 只是确认能打开
@@ -166,9 +181,18 @@ def main():
 
     out_dir = os.path.join(ANIM_DIR, args.name)
     os.makedirs(out_dir, exist_ok=True)
+    # 清掉上一轮的旧帧（只清本动作的）。⚠️ 这一步**绝不能让转帧中断**：
+    #   · 沙箱的 safe-delete 在中文路径下会失败（把「古见同学桌宠」解成乱码）
+    #   · 桌宠进程还可能正读着这些帧
+    # 删不掉也无所谓 —— 后面按帧号覆盖写，而读取端只看 `_anim_meta.json` 里的 count，
+    # 多余的老帧（帧号 ≥ count）永远不会被读到。踩过一次：整段转帧因为删文件失败而中断，
+    # 却只在最后抛异常，前面的"抽帧成功"日志照打，看起来像转好了。
     for f in os.listdir(out_dir):
-        if f.endswith(".png"):
-            os.remove(os.path.join(out_dir, f))
+        if f.endswith(".png") and f.startswith(args.name + "_"):
+            try:
+                os.remove(os.path.join(out_dir, f))
+            except Exception:
+                pass
 
     paths, boxes = [], []
     for k, im in enumerate(ims):

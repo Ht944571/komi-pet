@@ -123,6 +123,93 @@ def spawn_whale():
 # 联动关闭兜底：WorkBuddy 退出后，灭杀遗留的桌宠桌宠
 # ---------------------------------------------------------------------------
 
+KILL_CONFIRM_ROUNDS = 6         # 连续 6 轮（5s/轮 ≈ 30s）都"一个 agent 都不剩"才灭杀
+KILL_CONFIRM_S = 25.0           # 且跨度至少这么久 —— 宿主重启/一次快照失败撑不过这个窗口
+WATCH_LOG = os.path.join(os.environ.get("TEMP") or os.environ.get("TMPDIR") or ".",
+                         "komi-watcher.log")
+
+
+def _log(msg):
+    """守望自己的留痕（pythonw 没有控制台，出事只能靠这个文件归因）。
+
+    2026-09-30：桌宠一天内无声消失 4 次，但桌宠/守望都不留任何日志 → 完全没法归因。
+    这个文件记：每轮活跃集合、灭杀计时、灭杀动作、拉起动作、异常。
+    """
+    try:
+        if os.path.exists(WATCH_LOG) and os.path.getsize(WATCH_LOG) > 512 * 1024:
+            os.replace(WATCH_LOG, WATCH_LOG + ".1")
+        with open(WATCH_LOG, "a", encoding="utf-8") as f:
+            f.write("%s pid=%d %s\n" % (time.strftime("%H:%M:%S"), os.getpid(), msg))
+    except Exception:
+        pass
+
+
+WATCH_MUTEX = "KomiPetWhaleWatcher.SingleInstance"
+_MUTEX_HANDLE = None
+
+
+def _mutex_held():
+    """互斥体是否已被某个守望持有（含自己）——API 的兜底拉起靠它判断"守望还在不在"。"""
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+    k = _ct.WinDLL("kernel32", use_last_error=True)
+    k.OpenMutexW.restype = _wt.HANDLE
+    k.OpenMutexW.argtypes = [_wt.DWORD, _wt.BOOL, _wt.LPCWSTR]
+    k.CloseHandle.argtypes = [_wt.HANDLE]
+    h = k.OpenMutexW(0x1F0001, False, WATCH_MUTEX)   # SYNCHRONIZE
+    if h:
+        k.CloseHandle(h)
+        return True
+    return False
+
+
+def _acquire_single_instance():
+    """拿单实例互斥体；拿不到（已有守望）→ 返回 False，调用方退出。"""
+    global _MUTEX_HANDLE
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+    k = _ct.WinDLL("kernel32", use_last_error=True)
+    k.CreateMutexW.restype = _wt.HANDLE
+    k.CreateMutexW.argtypes = [_wt.HANDLE, _wt.BOOL, _wt.LPCWSTR]
+    h = k.CreateMutexW(None, True, WATCH_MUTEX)
+    exists = (h and _ct.get_last_error() == 183)     # ERROR_ALREADY_EXISTS
+    _MUTEX_HANDLE = h or None                        # 句柄持有到进程退出，OS 自动释放
+    return bool(h) and not exists                    # 已有守望 → False（本实例退出）
+
+
+class KillDebounce:
+    """灭杀去抖：连续 N 轮**且**跨度 ≥ S 秒都判"该杀"才确认。
+
+    为什么需要：单轮判空立刻下手，只要出现一次瞬时误判（宿主重启、进程快照失败、
+    L2 日志活动度过期）就会把桌宠杀掉，而桌宠不会自己回来（要在装 agent 的状态下
+    等下一轮 session）。去抖后这类抖动完全无害。
+    """
+
+    def __init__(self, rounds=KILL_CONFIRM_ROUNDS, seconds=KILL_CONFIRM_S):
+        self.rounds = int(rounds)
+        self.seconds = float(seconds)
+        self.since = 0.0
+        self.n = 0
+
+    def feed(self, want, now):
+        """want=本轮纯判定结果（should_kill_on_session_end）。返回 True = 确认灭杀。"""
+        if not want:
+            if self.n:
+                _log("灭杀计时取消（agent 又出现了）")
+            self.since, self.n = 0.0, 0
+            return False
+        if not self.since:
+            self.since = now
+            _log("活跃 agent 集合变空 → 开始灭杀计时")
+        self.n += 1
+        if self.n >= self.rounds and now - self.since >= self.seconds:
+            return True
+        return False
+
+    def reset(self):
+        self.since, self.n = 0.0, 0
+
+
 def should_kill_on_session_end(prev_agents, cur_agents):
     """纯判定：是否由「有 agent 活跃」变为「一个都不剩」。
 
@@ -267,17 +354,22 @@ def watch(interval=POLL_INTERVAL):
     whale_seen = False     # 上一轮桌宠是否存活
     suppressed = False     # 本轮使用内用户已手动退出 → 不再拉起
     last_spawn = 0.0
+    deb = KillDebounce()
+    _log(f"守望启动 interval={interval}s rounds={deb.rounds} seconds={deb.seconds}")
 
     while True:
         time.sleep(interval)
         try:
             cur = active_agents()
             if cur is None:
+                _log("agent 探测未知（None）→ 本轮保持不动")
                 continue                       # 探测未知：保持不动
 
-            if should_kill_on_session_end(prev, cur):
-                # 最后一个 agent 也退出了 → 兜底灭杀遗留桌宠（桌宠自身通常已自关，防卡死/旧版）
+            if deb.feed(should_kill_on_session_end(prev, cur), time.time()):
+                # 最后一个 agent 也退出了（已连续多轮确认）→ 兜底灭杀遗留桌宠
+                _log(f"确认无 agent（{deb.n} 轮 / {int(time.time() - deb.since)}s）→ 灭杀遗留桌宠")
                 kill_whale()
+                deb.reset()
                 suppressed = False
                 whale_seen = False
                 prev = cur
@@ -292,15 +384,19 @@ def watch(interval=POLL_INTERVAL):
                 continue                           # 没有任何 agent → 不拉起
 
             whale = _whale_window_alive()
+            if whale != whale_seen:
+                _log(f"桌宠{'在' if whale else '不在'}了（agents={sorted(cur)}）")
             if not whale and not suppressed and time.time() - last_spawn > SPAWN_COOLDOWN:
                 if whale_seen and _recent_menu_quit():
                     suppressed = True              # 用户手动退出，本轮内不再打扰
+                    _log("用户手动退出过（menu_quit）→ 本轮不拉起")
                 else:
                     spawn_whale()
                     last_spawn = time.time()
+                    _log("拉起桌宠（agents=%s）" % (sorted(cur),))
             whale_seen = whale
-        except Exception:
-            pass  # 守望进程绝不因单轮异常退出
+        except Exception as e:
+            _log(f"单轮异常（不影响后续轮次）：{type(e).__name__}: {e}")
 
 
 def check_once():
@@ -461,6 +557,9 @@ def main(argv=None):
     if os.name != "nt":
         print("本脚本仅适用于 Windows", file=sys.stderr)
         return 2
+    if not _acquire_single_instance():
+        _log("已有守望在跑（互斥体被持有）→ 本实例退出")
+        return 0
     watch()
     return 0
 

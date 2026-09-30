@@ -182,7 +182,7 @@ def preflight():
         _ok(f"版本 {_V.display()}")
     except Exception:
         pass
-    for n, p in (("立绘资源 assets/", os.path.join(RT.bundle_dir(), "assets", "pet_v3")),
+    for n, p in (("写字帧序列 assets/anim/", os.path.join(RT.bundle_dir(), "assets", "anim", "write")),
                  ("看板页面 dashboard.html",
                   os.path.join(RT.bundle_dir(), "wb_usage", "dashboard.html"))):
         if os.path.isdir(p) or os.path.isfile(p):
