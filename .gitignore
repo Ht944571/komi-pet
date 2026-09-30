@@ -17,6 +17,10 @@ app/tools/_tmp_*
 _tmp_*
 *.log
 
+# ---- 诊断 / 预览截图（一次性产物，可重新生成）----
+app/_preview_*.png
+app/tools/_*.png
+
 # ---- 生成式素材源图（不进仓库；可直接重新生成的中间产物）----
 # README「素材与角色说明」声明仓库不含原始生成图 —— 这里保持这条口径。
 # 成品（立绘 / 眨眼贴片）在 app/assets/pet_v3/，那才是运行期资产。
@@ -32,8 +36,9 @@ live2d/shell/models/
 live2d/_work/
 live2d/model/
 
-# 备份文件（*.bak / *.pre_*）不进仓库
+# 备份文件（*.bak / *.bak_时间戳 / *.pre_*）不进仓库
 *.bak
+*.bak_*
 
 # ---- Windows 打包产物（可随时重建，60MB+，绝不进仓库）----
 # 提交的是 packaging/build_win.py + verify_win.py + app.ico；
