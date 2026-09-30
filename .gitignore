@@ -1,6 +1,8 @@
 # ---- 大文件 / 本地状态（绝不上传）----
 # 注意：.gitignore 不支持行内注释，注释必须独立成行（踩过一次）
 app/wb_usage/data/
+# ccusage 采集缓存（npx 拉回来、含 fetched_at，运行期每次采集都变；可重建）
+app/wb_usage/agents/data/ccusage/
 app/.whale_settings.json
 app/.whale_pos.json
 app/wb_paths.json
