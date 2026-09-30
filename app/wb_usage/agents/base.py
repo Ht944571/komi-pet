@@ -170,6 +170,18 @@ class AgentSource:
         """
         return None
 
+    def change_hint(self):
+        """库型源的轻量"变化指纹"（可选覆盖）。
+
+        watch_changes 只能靠 stat jsonl 文件感知文件型源的变化；库型源没有文件
+        可盯，会被"文件静默"饿死（2026-09-28 事故：宿主会话结束后 ZCode 的
+        model_usage 持续增长却无人采集）。覆盖本方法返回一个**极轻量**的指纹
+        （如源库 `MAX(rowid)`），守护循环每轮查询它、变化才跑完整采集。
+        返回 None（默认）= 本源无指纹，只能靠保底周期强制采集。
+        指纹查询必须做到毫秒级、绝不给源库添负担。
+        """
+        return None
+
     # ---- 可选：项目名映射 ----
 
     def project_of(self, cwd):

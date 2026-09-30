@@ -77,6 +77,27 @@ class ZCodeSource(AgentSource):
     def glob_pattern(self):
         return ""               # 库型源不走文件枚举
 
+    def change_hint(self):
+        """变化指纹：model_usage 的 MAX(rowid)（O(1) 索引查询，毫秒级）。
+
+        watch_changes 靠它感知"ZCode 有新调用"，不再依赖其他 jsonl 源的活动
+        搭车触发（2026-09-28 事故：宿主会话静默后本源被饿死 30 分钟）。
+        """
+        zp = self.db_path()
+        if not os.path.isfile(zp):
+            return None
+        try:
+            zc = sqlite3.connect(f"file:{zp.replace(os.sep, '/')}?mode=ro",
+                                 uri=True, timeout=2)
+            try:
+                row = zc.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM model_usage").fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                zc.close()
+        except Exception:
+            return None
+
     # ---- 采集（覆盖 collect → 走库型通道）----
 
     def collect(self, conn, db_path, insert_rows):

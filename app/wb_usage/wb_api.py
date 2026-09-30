@@ -12,13 +12,14 @@ wb_api.py — 多 agent 用量看板·接口服务（前后端分离）
 接口：
   GET  /                  → dashboard.html（静态 UI）
   GET  /chart.umd.min.js  → Chart.js 本地副本
-  GET  /api/agents        → 各 agent 合计 + 元信息（label / has_credit）
+  GET  /api/agents?days=  → 各 agent 合计 + 元信息（label / has_credit）
+                            days 非空且非 all 时按区间现算（对比图用）；否则读全量物化表
   GET  /api/kpi?days=&agent=      → KPI 指标
   GET  /api/daily?days=90&agent=  → 每日趋势（day/credit/total_tokens/cache_hit_rate/api_calls/turns）
   GET  /api/models?days=30&agent= → 模型分布（含 credit_pct 与 token_pct）
-  GET  /api/projects?agent=       → 项目分布
-  GET  /api/clients?agent=        → 客户端分布（WorkBuddy/CodeBuddyIDE/VSCode/…）
-  GET  /api/tops?agent=           → TOP 30 会话
+  GET  /api/projects?days=&agent= → 项目分布
+  GET  /api/clients?days=&agent=  → 客户端分布（WorkBuddy/CodeBuddyIDE/VSCode/…）
+  GET  /api/tops?days=&agent=     → TOP 30 会话
   GET  /api/turns?session_id=xx → 某会话全部轮次（含 user_prompt 原文，前端脱敏）
   GET  /api/calls?turn_id=xx    → 某轮次单次调用明细
   POST /api/rebuild       → 重新采集 + 建模
@@ -29,6 +30,7 @@ wb_api.py — 多 agent 用量看板·接口服务（前后端分离）
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -102,13 +104,38 @@ class Api:
         return val
 
     def _day_cond(self, days, col="day"):
-        """days: 'today'|'7'|'30'|'all' → 日期条件片段（不含 WHERE，'' 表示不过滤）。
-        col 用于多表 JOIN 场景消歧。"""
+        """days → 日期条件片段（不含 WHERE，'' 表示不过滤）。col 用于 JOIN 消歧。
+
+        支持的口径（2026-09-28 扩过一轮，配合前端的日期选择器）：
+          today / yesterday           单日
+          '7' / '30' / 任意数字 N      近 N 天（含今天）
+          month / lastmonth           本自然月 / 上个自然月
+          custom:YYYY-MM-DD:YYYY-MM-DD 闭区间
+          all                         不过滤
+        """
+        days = (days or "").strip()
         if days == "today":
             return f"{col} = date('now','localtime')"
+        if days == "yesterday":
+            return f"{col} = date('now','localtime','-1 days')"
         if days == "all":
             return ""
-        n = max(int(days), 1)
+        if days == "month":
+            return f"strftime('%Y-%m', {col}) = strftime('%Y-%m','now','localtime')"
+        if days == "lastmonth":
+            return (f"strftime('%Y-%m', {col}) = "
+                    f"strftime('%Y-%m','now','localtime','-1 month')")
+        if days.startswith("custom:"):
+            parts = days.split(":")
+            # ⚠️ 这两段会被拼进 SQL，必须白名单校验；不合法就退化成"不过滤"
+            if len(parts) == 3 and all(
+                    re.fullmatch(r"\d{4}-\d{2}-\d{2}", p) for p in parts[1:]):
+                return f"{col} BETWEEN '{parts[1]}' AND '{parts[2]}'"
+            return ""
+        try:
+            n = max(int(days), 1)
+        except (TypeError, ValueError):
+            return ""                     # 认不出来的口径：不过滤，而不是崩掉
         return f"{col} >= date('now','localtime','-{n-1} days')"
 
     def _days_where(self, days):
@@ -156,7 +183,9 @@ class Api:
 
         多 agent：agent 条件进入主 WHERE，所有 FILTER 都是该子集的子集，口径自洽。
         """
-        where, rest = self._conds(self._day_cond(days), self._agent_cond(agent))
+        day_cond = self._day_cond(days)
+        _acond = self._agent_cond(agent)          # 纯 agent 条件（下面补查今日要用）
+        where, rest = self._conds(day_cond, _acond)
         jw = ("source='jsonl' AND " + rest) if rest else "source='jsonl'"
         cw = ("source='official' AND " + rest) if rest else "source='official'"
         today = "day = date('now','localtime')"
@@ -176,9 +205,26 @@ class Api:
                 COALESCE(SUM(api_calls) FILTER (WHERE source='official' AND {today}),0),
                 COALESCE(SUM(credit) FILTER (WHERE source='official' AND {today}),0)
               FROM {src} {where}""").fetchone()
+            # ⚠️ 今日值**不能**依赖主查询的 FILTER：SQL 里 FILTER 在 WHERE 之后生效，
+            #    主查询一旦带时间条件（近7天/昨天/本月…），今天的行已被 WHERE 滤掉，
+            #    `FILTER (WHERE day=today)` 恒为 0 —— 表现为切到「昨天」后副标题写「今日 0.00」。
+            #    所以只要主查询带了时间条件，就**单独再查一次**今日。
+            #    ⚠️ 这里必须用**纯 agent 条件**：`rest` 是 `_conds()` 拼好的「全部条件」，
+            #       里面已经含了 day_cond —— 拿它来拼就会变成
+            #       `WHERE day=today AND day='2026-09-27'`，恒为空集（踩过这个坑）。
+            trow = None
+            if day_cond:
+                trow = c.execute(f"""SELECT
+                    COALESCE(SUM(api_calls),0), COALESCE(SUM(credit),0),
+                    COALESCE(SUM(total_tokens),0),
+                    COALESCE(SUM(api_calls) FILTER (WHERE source='official'),0),
+                    COALESCE(SUM(credit) FILTER (WHERE source='official'),0)
+                  FROM {src} WHERE {today}{(' AND ' + _acond) if _acond else ''}""").fetchone()
         (turns, n_sess, calls, credit, tokens, cached, miss, comp,
          t_calls, t_credit, t_tokens, cb_calls, cb_credit,
          cb_t_calls, cb_t_credit) = row
+        if trow is not None:
+            t_calls, t_credit, t_tokens, cb_t_calls, cb_t_credit = trow
         hit_rate = (cached / (cached + miss)) if (cached + miss) > 0 else None
         # 合计口径：credit/api_calls 已含 CodeBuddy（tokens 仅 jsonl）
         return {"ok": True, "data": {
@@ -194,9 +240,75 @@ class Api:
             "cb_today_requests": cb_t_calls, "cb_today_credit": round(cb_t_credit, 2),
         }}
 
-    def daily(self, days="all", agent="all"):
-        """每日趋势（聚合缓存）：credit 已并入 CodeBuddy（合计口径）。"""
+    @staticmethod
+    def _single_day_date(days):
+        """单日口径 → 'YYYY-MM-DD'；不是单日 → None。
+
+        单日 = today / yesterday / custom:YYYY-MM-DD:同一天。
+        用途：单日改按小时分桶（见 `_daily_hours`），空桶要补零、补零要知道日期。
+        """
+        d = (days or "").strip()
+        if d == "today":
+            return time.strftime("%Y-%m-%d")
+        if d == "yesterday":
+            return time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        if d.startswith("custom:"):
+            parts = d.split(":")
+            if len(parts) == 3 and parts[1] == parts[2] \
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[1] or ""):
+                return parts[1]
+        return None
+
+    def daily(self, days="all", agent="all", gran="day"):
+        """每日趋势（聚合缓存）：credit 已并入 CodeBuddy（合计口径）。
+
+        gran='hour' → 按小时分桶（单日区间用，横轴 00:00–24:00）。
+        ⚠️ 缓存 key 必须带 gran（不带的话切口径会命中错缓存，数据不动也不报错）。
+        """
+        if gran == "hour":
+            return self._cached(f"dailyH:{days}:{agent}", lambda: self._daily_hours(days, agent))
         return self._cached(f"daily:{days}:{agent}", lambda: self._daily(days, agent))
+
+    def _hour_sql(self, where):
+        """小时聚合 SQL（与 `_daily` 同一套聚合表达式，只把 GROUP BY 换成 天+小时）。"""
+        return ("""SELECT day, strftime('%H', first_time) AS hour,
+                          COUNT(*) AS turns, SUM(api_calls) AS api_calls,
+                          SUM(credit) AS credit, SUM(total_tokens) AS total_tokens,
+                          SUM(cached_tokens) AS cached_tokens,
+                          SUM(miss_tokens) AS miss_tokens,
+                          SUM(completion_tokens) AS completion_tokens,
+                          SUM(thinking_tokens) AS thinking_tokens,
+                          CASE WHEN SUM(cached_tokens)+SUM(miss_tokens) > 0
+                               THEN 1.0*SUM(cached_tokens)/(SUM(cached_tokens)+SUM(miss_tokens))
+                               ELSE NULL END AS cache_hit_rate
+                   FROM {src} {where} GROUP BY day, hour ORDER BY day, hour""")
+
+    def _daily_hours(self, days="today", agent="all"):
+        """单日口径的**小时**趋势（00:00–23:00）。
+
+        为什么要它：区间=单日时按天分桶只有 1 根柱子（看不出日内节奏）。单日改按小时
+        分桶，前端横轴就能按 00:00–24:00 铺满一天；空小时**补零**，否则横轴缺格。
+        口径与 `_daily` 完全一致（同一个 where、同一套聚合表达式），只是分桶更细。
+        """
+        where, _ = self._conds(self._day_cond(days), self._agent_cond(agent))
+        with closing(get_conn(self.db_path)) as c:
+            rows = c.execute(self._hour_sql(where).format(where=where,
+                                                          src=self._src())).fetchall()
+        by_key, date = {}, self._single_day_date(days)
+        for r in rows:
+            d = dict(r)
+            d["credit"] = round(d["credit"] or 0, 2)
+            by_key[(d["day"], d["hour"])] = d      # 键带日期：跨天时不能只按小时排
+        if date is None:                      # 非单日：照实返回（前端不会走小时分支）
+            return {"ok": True, "data": [by_key[k] for k in sorted(by_key)]}
+        data = []
+        for h in range(24):
+            hh = f"{h:02d}"
+            data.append(by_key.get((date, hh)) or {
+                "day": date, "hour": hh, "turns": 0, "api_calls": 0, "credit": 0.0,
+                "total_tokens": 0, "cached_tokens": 0, "miss_tokens": 0,
+                "completion_tokens": 0, "thinking_tokens": 0, "cache_hit_rate": None})
+        return {"ok": True, "data": data}
 
     def _daily(self, days="all", agent="all"):
         """每日趋势：v_turn_total 按天聚合（jsonl + CodeBuddy 自动对齐天数）。"""
@@ -213,12 +325,17 @@ class Api:
                    FROM {src} {where} GROUP BY day ORDER BY day""")
         cb_where, _ = self._conds("source='official'", self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
-            if days in ("today", "all", ""):
-                rows = c.execute(sql.format(where=where, src=self._src())).fetchall()
-            else:
+            # ⚠️ 这里曾经自己又解析了一遍 days（`int(days)`），于是 'yesterday' 直接
+            #    ValueError → 接口 500 → 前端 Promise.all 整体 reject → **整个看板都不刷新**。
+            #    现在只有**纯数字**才走 LIMIT 优化，其余全靠 `_day_cond` 的 WHERE 过滤，
+            #    口径只有一个来源（today/yesterday/month/lastmonth/custom/all 都走 else 分支）。
+            if (days or "").strip().isdigit():
                 n = max(int(days), 1)
-                rows = c.execute(sql.format(where=where, src=self._src()) + " DESC LIMIT ?", (n,)).fetchall()
+                rows = c.execute(sql.format(where=where, src=self._src())
+                                 + " DESC LIMIT ?", (n,)).fetchall()
                 rows = list(reversed(rows))
+            else:
+                rows = c.execute(sql.format(where=where, src=self._src())).fetchall()
             # CodeBuddy 按天（前端可查 credit_cb）
             src = self._src(c)
             cbmap = {r["day"]: (r["requests_cb"], r["credit_cb"]) for r in c.execute(
@@ -286,17 +403,49 @@ class Api:
                 rows = c.execute(sql).fetchall()
         return {"ok": True, "data": [dict(r) for r in rows]}
 
-    def projects(self, agent="all"):
+    def projects(self, days="all", agent="all"):
         """项目分布（聚合缓存）：jsonl 项目 + CodeBuddy 各端（以 client 为项目名，积分并入）。"""
-        return self._cached(f"projects:{agent}", lambda: self._projects(agent))
+        return self._cached(f"projects:{days}:{agent}",
+                            lambda: self._projects(days, agent))
 
-    def clients(self, agent="all"):
+    def clients(self, days="all", agent="all"):
         """客户端分布：jsonl → 各 agent 的数据源名；official → 按 client 聚合。"""
-        return self._cached(f"clients:{agent}", lambda: self._clients(agent))
+        return self._cached(f"clients:{days}:{agent}",
+                            lambda: self._clients(days, agent))
 
     def agents(self):
         """全部 agent 的合计 + 元信息（label / 是否含积分）——看板「按 agent 对比」用。"""
         return self._cached("agents", lambda: self._agents())
+
+    def agents_range(self, days="all", agent="all"):
+        """按时间区间现算各 agent 合计（给「多 Agent 用量对比」用）。
+
+        为什么不复用 `agents()`：那个读 `dws_agent` **全量物化表**，滤不了天 ——
+        于是切时间维度时对比图纹丝不动（标题写着「今天」，数值却是全量）。
+        """
+        return self._cached(f"agents_range:{days}:{agent}",
+                            lambda: self._agents_range(days, agent))
+
+    def _agents_range(self, days="all", agent="all"):
+        where, _ = self._conds(self._day_cond(days), self._agent_cond(agent))
+        with closing(get_conn(self.db_path)) as c:
+            src = self._src(c)
+            rows = c.execute(
+                f"""SELECT agent, COUNT(*) AS turns, SUM(api_calls) AS api_calls,
+                           SUM(credit) AS credit, SUM(total_tokens) AS total_tokens,
+                           COUNT(DISTINCT session_id) AS sessions
+                    FROM {src} {where} GROUP BY agent""").fetchall()
+        data = []
+        for r in rows:
+            d = dict(r)
+            s = agent_registry.get_source(d["agent"])
+            d["label"] = s.label if s else ("CodeBuddy" if d["agent"] == "codebuddy"
+                                            else d["agent"])
+            d["has_credit"] = bool(s.has_credit) if s else True
+            d["order"] = s.order if s else 900
+            data.append(d)
+        data.sort(key=lambda x: (x["order"], x["agent"]))
+        return {"ok": True, "data": data}
 
     def _agents(self):
         with closing(get_conn(self.db_path)) as c:
@@ -325,9 +474,13 @@ class Api:
         data.sort(key=lambda x: (x["order"], x["agent"]))
         return {"ok": True, "data": data}
 
-    def _projects(self, agent="all"):
-        """项目分布：v_turn_total 按 project 聚合（jsonl 项目 + CodeBuddy client 同口径）。"""
-        where, _ = self._conds("project != ''", self._agent_cond(agent))
+    def _projects(self, days="all", agent="all"):
+        """项目分布：按 project 聚合（jsonl 项目 + CodeBuddy client 同口径）。
+
+        2026-09-28：加 `days` —— 原来写死全量，切时间维度时这张卡片不动，
+        和旁边会动的卡片放在一起很割裂。
+        """
+        where, _ = self._conds("project != ''", self._day_cond(days), self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
             src = self._src(c)
             rows = c.execute(
@@ -342,9 +495,9 @@ class Api:
             r["credit_pct"] = round(r["credit"] / tot * 100, 1)
         return {"ok": True, "data": all_rows}
 
-    def _clients(self, agent="all"):
+    def _clients(self, days="all", agent="all"):
         """客户端分布：jsonl 一律视为 WorkBuddy 本地客户端，official 按 client 字段聚合。"""
-        where, _ = self._conds("source='jsonl'", self._agent_cond(agent))
+        where, _ = self._conds("source='jsonl'", self._day_cond(days), self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
             src = self._src(c)
             wb = c.execute(
@@ -372,13 +525,13 @@ class Api:
             r["credit_pct"] = round(r["credit"] / tot * 100, 1)
         return {"ok": True, "data": data}
 
-    def tops(self, agent="all"):
-        """全部会话聚合（聚合缓存）：jsonl 会话 + CodeBuddy 官方请求会话。"""
-        return self._cached(f"tops:{agent}", lambda: self._tops(agent))
+    def tops(self, days="all", agent="all"):
+        """会话聚合（聚合缓存）：jsonl 会话 + CodeBuddy 官方请求会话。"""
+        return self._cached(f"tops:{days}:{agent}", lambda: self._tops(days, agent))
 
-    def _tops(self, agent="all"):
-        """全部会话聚合：v_turn_total 按 session 聚合（两条来源统一）。"""
-        where, _ = self._conds(self._agent_cond(agent))
+    def _tops(self, days="all", agent="all"):
+        """会话聚合：按 session 聚合（两条来源统一）。支持按天过滤。"""
+        where, _ = self._conds(self._day_cond(days), self._agent_cond(agent))
         with closing(get_conn(self.db_path)) as c:
             src = self._src(c)
             rows = c.execute(
@@ -632,19 +785,28 @@ class Handler(BaseHTTPRequestHandler):
             self._file(os.path.join(WEB_DIR, "data", "chart.umd.min.js"),
                        "application/javascript")
         elif path == "/api/agents":
-            self._json(self.api.agents())
+            # 带 days/agent 时走「按区间现算」的分支；不带则维持原来的全量物化表
+            _d = qs.get("days", [""])[0]
+            if _d and _d != "all":
+                self._json(self.api.agents_range(_d, qs.get("agent", ["all"])[0]))
+            else:
+                self._json(self.api.agents())
         elif path == "/api/kpi":
             self._json(self.api.kpi(qs.get("days", ["30"])[0], qs.get("agent", ["all"])[0]))
         elif path == "/api/daily":
-            self._json(self.api.daily(qs.get("days", ["all"])[0], qs.get("agent", ["all"])[0]))
+            self._json(self.api.daily(qs.get("days", ["all"])[0], qs.get("agent", ["all"])[0],
+                                      qs.get("gran", ["day"])[0]))
         elif path == "/api/models":
             self._json(self.api.models(qs.get("days", ["30"])[0], qs.get("agent", ["all"])[0]))
         elif path == "/api/projects":
-            self._json(self.api.projects(qs.get("agent", ["all"])[0]))
+            self._json(self.api.projects(qs.get("days", ["all"])[0],
+                                         qs.get("agent", ["all"])[0]))
         elif path == "/api/clients":
-            self._json(self.api.clients(qs.get("agent", ["all"])[0]))
+            self._json(self.api.clients(qs.get("days", ["all"])[0],
+                                        qs.get("agent", ["all"])[0]))
         elif path == "/api/tops":
-            self._json(self.api.tops(qs.get("agent", ["all"])[0]))
+            self._json(self.api.tops(qs.get("days", ["all"])[0],
+                                     qs.get("agent", ["all"])[0]))
         elif path == "/api/sessions":
             self._json(self.api.sessions())
         elif path == "/api/turns":
@@ -694,6 +856,56 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# ---- 兜底：桌宠 + 守望都不在 → 把守望拉起来（守望自己会拉桌宠）----
+# 背景（2026-09-30）：守望进程没了之后桌宠就永远回不来（桌宠的 api_guard 只管 API，
+# 没人管桌宠）。看板 API 是唯一常驻的，顺手补一层：只拉守望，桌宠交给守望。
+WATCHER_MUTEX = "KomiPetWhaleWatcher.SingleInstance"   # 必须与 wb_whale_watcher.WATCH_MUTEX 一致
+
+_watcher_try = [0.0]          # 上次尝试时刻（模块级，跨循环保留）
+
+
+def _watcher_needed(pet_alive, watcher_held, now, last=0.0, gap=600.0):
+    """纯判定：是否该兜底拉守望（可单测）。"""
+    return (not pet_alive) and (not watcher_held) and (now - last >= gap)
+
+
+def _ensure_watcher(min_gap_s=600.0):
+    """桌宠窗口没了 + 守望互斥体没人持有 → 分离进程拉起守望（低频，10 分钟一次）。"""
+    import ctypes as _ct
+    from ctypes import wintypes as _wt
+    now = time.time()
+    try:
+        u = _ct.WinDLL("user32", use_last_error=True)
+        u.FindWindowW.restype = _wt.HWND
+        u.FindWindowW.argtypes = [_wt.LPCWSTR, _wt.LPCWSTR]
+        pet = u.FindWindowW("WBWhalePetClass", None)
+        k = _ct.WinDLL("kernel32", use_last_error=True)
+        k.OpenMutexW.restype = _wt.HANDLE
+        k.OpenMutexW.argtypes = [_wt.DWORD, _wt.BOOL, _wt.LPCWSTR]
+        k.CloseHandle.argtypes = [_wt.HANDLE]
+        h = k.OpenMutexW(0x1F0001, False, WATCHER_MUTEX)   # SYNCHRONIZE
+        held = bool(h)
+        if h:
+            k.CloseHandle(h)
+        if not _watcher_needed(bool(pet), held, now, _watcher_try[0], min_gap_s):
+            return
+        _watcher_try[0] = now
+        exe = sys.executable.replace("python.exe", "pythonw.exe")
+        if not os.path.isfile(exe):
+            exe = sys.executable
+        watch_py = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "wb_whale_watcher.py")
+        if not os.path.isfile(watch_py):
+            return
+        import subprocess as _sp
+        DETACHED = 0x00000008 | 0x00000200                 # 分离 + 新进程组：API 退出也不牵连
+        _sp.Popen([exe, watch_py], creationflags=DETACHED, close_fds=True,
+                  cwd=os.path.dirname(watch_py))
+        print("[api] 兜底：桌宠与守望都不在 → 已分离拉起守望", flush=True)
+    except Exception as e:
+        print(f"[api] 兜底拉守望失败：{type(e).__name__}: {e}", flush=True)
+
+
 def _watchdog(port, interval=30):
     """自检看门狗：每 interval 秒自连 /api/health，连续失败到阈值则自杀退出。
 
@@ -721,6 +933,7 @@ def _watchdog(port, interval=30):
             fails = 0 if ok else fails + 1
         except Exception:
             fails += 1
+        _ensure_watcher()                # 兜底：桌宠+守望都没了 → 拉守望（10 分钟一次）
         if fails >= 6:
             print(f"[api] 看门狗：连续 {fails} 次自检失败，退出"
                   f"（Windows 无 launchd，需下次开看板由桌宠自愈拉起）", flush=True)

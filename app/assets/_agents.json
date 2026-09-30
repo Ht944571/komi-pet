@@ -135,7 +135,7 @@
       "order": 40,
       "accent": "#D97757",
       "caps": {
-        "log": false,
+        "log": true,
         "presence": false,
         "hooks": true
       },
@@ -149,7 +149,7 @@
       "log_paths": [
         "~/.claude/projects/*/*.jsonl"
       ],
-      "notes": "【未验证】有成熟 hooks（Clawd 覆盖 15 个事件）。本机未确认安装，故默认关闭。数据源可参考 ccusage（MIT）实现。"
+      "notes": "数据源已接入（wb_usage/agents/claude_code.py，2026-09-29）：available() 门控，本机未装自动跳过、装上即进 ODS 并触发桌宠写字态（活跃判定=ODS 近窗并入）。prompt_tokens 口径=总输入（含缓存），与其他源的非缓存口径不同，跨源对比时知悉。presence 未配（本机未装），enabled 保持 false；装了 Claude Code 后再开。"
     },
     "gemini-cli": {
       "label": "Gemini CLI",
@@ -174,12 +174,12 @@
     },
     "qwen-code": {
       "label": "Qwen Code",
-      "enabled": false,
+      "enabled": true,
       "verified": false,
       "order": 55,
       "accent": "#615CED",
       "caps": {
-        "log": false,
+        "log": true,
         "presence": false,
         "hooks": true
       },
@@ -190,12 +190,15 @@
       "config_paths": [
         "~/.qwen/settings.json"
       ],
-      "log_paths": [],
-      "notes": "【未验证】Clawd 支持其 PermissionRequest 桌面审批气泡。"
+      "log_paths": [
+        "~/.qwen/projects/*/chats/",
+        "~/.qwen/tmp/*/chats/"
+      ],
+      "notes": "适配器已就位：读 ~/.qwen 下 chats/*.json 里每条消息的 tokens（防御式兼容 tokens/usage 两种键名）。本机该目录还没有会话文件 → 跑过一次 qwen-code 后即可核对字段。"
     },
     "kimi": {
       "label": "Kimi Code",
-      "enabled": false,
+      "enabled": true,
       "verified": false,
       "order": 60,
       "accent": "#0B0B0B",
@@ -209,10 +212,12 @@
         "ports": []
       },
       "config_paths": [
-        "~/.kimi/config.toml"
+        "~/.kimi-code/",
+        "~/.kimi-work/",
+        "~/.kimi-webbridge/"
       ],
       "log_paths": [],
-      "notes": "【未验证】hooks 写成 config.toml 的 [[hooks]] 条目。"
+      "notes": "本机没有可采集的用量日志：只有 ~/.kimi-code/bin、~/.kimi-work/bin（kimi 工具）与桌面版/webbridge，没有 CLI 的会话记录。装上 kimi-code 并跑过一轮后，把它的会话目录告诉我即可接入。"
     },
     "cursor": {
       "label": "Cursor",
@@ -239,24 +244,29 @@
     },
     "opencode": {
       "label": "opencode",
-      "enabled": false,
-      "verified": false,
+      "enabled": true,
+      "verified": true,
       "order": 70,
       "accent": "#6B7280",
       "caps": {
-        "log": false,
-        "presence": false,
+        "log": true,
+        "presence": true,
         "hooks": true
       },
       "presence": {
-        "procs": [],
+        "procs": [
+          "opencode.exe",
+          "opencode-cli.exe"
+        ],
         "ports": []
       },
       "config_paths": [
-        "~/.config/opencode/"
+        "~/.config/opencode/opencode.json"
       ],
-      "log_paths": [],
-      "notes": "【未验证】走插件机制（~/.config/opencode/ 下）。"
+      "log_paths": [
+        "~/.local/share/opencode/opencode.db"
+      ],
+      "notes": "已接入：读 ~/.local/share/opencode/opencode.db 的 session_message —— assistant 消息的 tokens 转成规范用量，轮次按「最近一条用户提问」聚合；前台识别认 opencode.exe / opencode-cli.exe。"
     },
     "codebuddy": {
       "label": "CodeBuddy",

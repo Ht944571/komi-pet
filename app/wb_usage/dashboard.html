@@ -124,6 +124,66 @@ body{
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .spacer{flex:1}
 .loading{color:var(--ink-3);font-size:11px;font-style:italic}
+/* ===== 时间维度选择器（2026-09-28 从四个按钮改成下拉 + 日历）=====
+   原来 segRange 是 4 个平铺按钮，装不下「昨天/本月/上月/自定义」。 */
+.rangesel{position:relative;display:inline-flex}
+.rs-trigger{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 12px;
+  border:1px solid var(--line);border-radius:999px;background:var(--card);
+  font-family:inherit;font-size:13px;font-weight:600;color:var(--ink);
+  cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.rs-trigger:hover{border-color:var(--hina);box-shadow:var(--shadow)}
+.rs-trigger:focus-visible{outline:2px solid var(--crimson);outline-offset:2px}
+.rs-key{color:var(--ink-3);font-weight:500}
+.rs-val{color:var(--violet-d);font-variant-numeric:tabular-nums}
+.rs-caret{transition:transform .2s ease;flex:none}
+.rangesel[data-open="1"] .rs-caret{transform:rotate(180deg)}
+
+.rs-pop{position:absolute;top:calc(100% + 8px);right:0;z-index:60;display:flex;
+  background:var(--card);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow-h);overflow:hidden}
+.rs-pop[hidden]{display:none}
+
+.rs-list{display:flex;flex-direction:column;min-width:130px;padding:7px;gap:1px}
+.rs-list button{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:8px 10px;border:0;border-radius:9px;background:none;text-align:left;
+  font-family:inherit;font-size:13px;font-weight:500;color:var(--ink);cursor:pointer;
+  transition:background .12s}
+.rs-list button:hover{background:var(--bg-soft)}
+.rs-list button:focus-visible{outline:2px solid var(--crimson);outline-offset:-2px}
+.rs-list button[aria-selected="true"]{background:var(--bg-soft);color:var(--violet-d);font-weight:700}
+.rs-check{opacity:0;color:var(--crimson);flex:none}
+.rs-list button[aria-selected="true"] .rs-check{opacity:1}
+
+.rs-cal{padding:10px 12px 12px;border-left:1px solid var(--line);background:var(--card-2)}
+.rs-cal[hidden]{display:none}
+.rs-calhead{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:6px;font-size:11px;color:var(--ink-3)}
+.rs-clear{border:0;background:none;font-family:inherit;font-size:11px;color:var(--ink-3);
+  cursor:pointer;padding:2px 4px;border-radius:6px}
+.rs-clear:hover{color:var(--crimson);background:var(--bg-soft)}
+.rs-months{display:flex;gap:16px}
+.rs-month{width:196px}
+.rs-mtitle{text-align:center;font-size:12.5px;font-weight:700;color:var(--ink);margin-bottom:6px}
+.rs-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.rs-dow{font-size:10.5px;color:var(--ink-3);text-align:center;padding:2px 0;font-weight:600}
+.rs-day{aspect-ratio:1;border:0;background:none;border-radius:50%;cursor:pointer;
+  font-family:inherit;font-size:12px;color:var(--ink);font-variant-numeric:tabular-nums;
+  transition:background .12s,color .12s}
+.rs-day:hover:not(:disabled){background:var(--bg-soft)}
+.rs-day:disabled{color:var(--ink-3);opacity:.35;cursor:default}
+.rs-day:focus-visible{outline:2px solid var(--crimson);outline-offset:-2px}
+/* 区间：两端实心圆，中间淡紫连成一条 */
+.rs-day.in-range{background:var(--bg-soft);border-radius:0}
+.rs-day.edge{background:var(--violet-d);color:#fff;font-weight:700;border-radius:50%}
+.rs-day.today:not(.edge){box-shadow:inset 0 0 0 1.5px var(--crimson)}
+
+@media (prefers-reduced-motion: reduce){
+  .rs-trigger,.rs-caret,.rs-list button,.rs-day{transition:none}
+}
+
+/* 没话说时整块收起 —— 这个位置平时只在出错/重建时才有内容，
+   原来会常年挂一句「切换 today 用时 15ms」，属于开发者信息，不该给用户看 */
+.loading:empty{display:none}
 
 /* ============== 段控（seg）+ 按钮 ============== */
 .seg{
@@ -763,11 +823,27 @@ body > .wrap{position:relative;z-index:10}
          data-page-node-id="komiSegAgent">
       <button data-a="all" class="active" data-page-node-id="komiAgentAll">全部</button>
     </div>
-    <div class="seg" id="segRange" data-page-node-id="LeAz6kWDSctVHLjyExZuYJ">
-      <button data-r="today" class="active" data-page-node-id="MOkWdhTMDbA8K863Z9obmk">今天</button>
-      <button data-r="7" data-page-node-id="iNJMKe5ZVqceDH2NNpHjuR">近 7 天</button>
-      <button data-r="30" data-page-node-id="rZqZVxJxFLJWklFumMesmm">近 30 天</button>
-      <button data-r="all" data-page-node-id="MSec5wHcccGBMPlKKzEGRH">全部</button>
+    <!-- 时间维度：下拉 + 自定义日历（2026-09-28 从 4 个平铺按钮改来） -->
+    <div class="rangesel" id="rangeSel" data-page-node-id="LeAz6kWDSctVHLjyExZuYJ">
+      <button class="rs-trigger" id="rsTrigger" type="button"
+              aria-haspopup="listbox" aria-expanded="false" aria-controls="rsPop">
+        <span class="rs-key">时间维度</span>
+        <span class="rs-val" id="rsVal">今天</span>
+        <svg class="rs-caret" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+          <path d="M1.5 3.5 L5 7 L8.5 3.5" fill="none" stroke="currentColor"
+                stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+      <div class="rs-pop" id="rsPop" hidden>
+        <div class="rs-list" id="rsList" role="listbox" aria-label="时间维度"></div>
+        <div class="rs-cal" id="rsCal" hidden>
+          <div class="rs-calhead">
+            <span id="rsCalHint">选择起止日期</span>
+            <button class="rs-clear" id="rsCalClear" type="button">清除筛选条件</button>
+          </div>
+          <div class="rs-months" id="rsMonths"></div>
+        </div>
+      </div>
     </div>
     <button class="btn primary tip" id="btnRebuild"
             data-tip="重建：重新扫描 jsonl 增量采集 + 全量重建数仓（ODS→ADS）。耗时约数秒，用于数据缺失/异常时强制刷新底层数据。" data-page-node-id="3NkBWYhUSX6bUd6A1Zotwr">重建</button>
@@ -800,7 +876,7 @@ body > .wrap{position:relative;z-index:10}
 <!-- 多 Agent 用量对比（跨数据源，全部时间口径） -->
 <div class="chart-row" style="grid-template-columns:1fr" data-page-node-id="komiAgentRow">
   <div class="card" data-page-node-id="komiAgentCard">
-    <h3 data-page-node-id="komiAgentH3">多 Agent 用量对比 <span class="rng" id="agentRangeLabel" data-page-node-id="komiAgentRng">(全部时间 · Token)</span></h3>
+    <h3 data-page-node-id="komiAgentH3">多 Agent 用量对比 <span class="rng" id="agentRangeLabel" data-page-node-id="komiAgentRng">(今天 · Token)</span></h3>
     <span class="card-note" aria-hidden="true">みんなの きろく</span>
     <div class="chart-wrap" style="height:200px" data-page-node-id="komiAgentWrap"><canvas id="cAgent" data-page-node-id="komiAgentCanvas"></canvas></div>
   </div>
@@ -838,7 +914,7 @@ body > .wrap{position:relative;z-index:10}
 <!-- 行3：项目分布 | 命中率 | 客户端 -->
 <div class="chart-row row3" data-page-node-id="FbWJ1xC4IDKlwxavRCH3AI">
   <div class="card" data-page-node-id="Jkf6FxMj1S3F7oxzze3EmD">
-    <h3 data-page-node-id="hrlnoCad5gPKVDw5KRnX5E">项目分布 · 积分（全部 · 可滚动）</h3>
+    <h3 data-page-node-id="hrlnoCad5gPKVDw5KRnX5E">项目分布 · 积分（可滚动）</h3>
     <div class="chart-scroll" data-page-node-id="OFyCBP5TVO9xcoKErbDG7P"><div class="chart-wrap" id="projWrap" style="height:200px" data-page-node-id="ki6oE4hJFNAoBySiY2ZXVu"><canvas id="cProject" data-page-node-id="UEhafaNbSUGirfKlmASz2K"></canvas></div></div>
   </div>
   <div class="card" data-page-node-id="EV5KFLW8tlVtdWJAy94Uyi">
@@ -962,7 +1038,8 @@ const $=id=>document.getElementById(id);
 /* 默认区间 = 今天：打开看板先看当日用量，需要 7 天 / 30 天再点对应按钮 */
 let range='today', selSession=null, selTurn=null, full=false;
 let agent='all';    // 当前选中的 agent（'all' = 全部数据源合计）
-let AGENTS=[];      // /api/agents：各 agent 合计 + 元信息（label / has_credit）
+let AGENTS=[];      // /api/agents：各 agent 合计 + 元信息（全量，用于筛选用按钮组）
+let AGENTS_RANGE=null;  // /api/agents?days=…：**当前时间区间**的合计（多 Agent 对比图用）
 let sortKey='last_time', sortDir=-1;   // 会话表排序（默认最近活动降序）
 let SESS_META={};   // session_id -> {title, project}
 let TOPS=[];        // 全部会话聚合
@@ -1040,11 +1117,163 @@ const C = {
 
 /* ===== 加载 ===== */
 let MODELS=[], PROJECTS=[], CLIENTS=[];
-function rangeLabel(r){return r==='today'?'今天':(r==='7'?'近 7 天':(r==='30'?'近 30 天':'全部'));}
-/* 当前 agent 是否含「积分」口径：Codex 之类按 token 计费的来源，积分恒为 0，
-   相关卡片/图表要改看 Token，不能显示 0 误导。 */
+/* ===== 时间维度选择器：下拉 + 自定义双月日历 ===== */
+const RS_PRESETS=[['today','今天'],['yesterday','昨天'],['7','近 7 天'],
+                  ['30','近 30 天'],['month','本月'],['lastmonth','上月'],
+                  ['all','全部'],['custom','自定义']];
+let cStart=null, cEnd=null;          /* 自定义区间的起止（YYYY-MM-DD） */
+
+const pad2=n=>String(n).padStart(2,'0');
+const ymd=d=>d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate());
+const md=d=>pad2(d.getMonth()+1)+'/'+pad2(d.getDate());
+function parseYmd(s){ const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); }
+
+/* 当前口径显示成什么字 */
+function rangeText(){
+  if(range!=='custom') { const p=RS_PRESETS.find(x=>x[0]===range); return p?p[1]:'全部'; }
+  if(cStart&&cEnd) return md(parseYmd(cStart))+' - '+md(parseYmd(cEnd));
+  return '自定义';
+}
+/* 传给后端的 days 值 */
+function rangeParam(){
+  return range==='custom' ? (cStart&&cEnd ? ('custom:'+cStart+':'+cEnd) : 'all') : range;
+}
+/* 单日口径？今天 / 昨天 / 自定义里的**同一天**。
+   这种区间按天分桶只有一根柱子 → 日趋势与命中率趋势改按小时（横轴 00:00–24:00）。
+   口径与后端 `_single_day_date` 一致（后端负责补零到 24 桶）。 */
+function isSingleDayRange(){
+  if(range==='today'||range==='yesterday') return true;
+  return range==='custom' && !!cStart && !!cEnd && cStart===cEnd;
+}
+
+function buildRangeList(){
+  const box=$('rsList'); if(!box) return;
+  box.innerHTML=RS_PRESETS.map(([k,lab])=>`
+    <button type="button" role="option" data-r="${k}"
+            aria-selected="${range===k?'true':'false'}">
+      <span>${lab}</span>
+      <svg class="rs-check" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+        <path d="M2 6.4 L4.8 9 L10 3.2" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>`).join('');
+}
+
+/* 渲染「上月 + 本月」两个月 */
+function renderCal(){
+  const box=$('rsMonths'); if(!box) return;
+  const today=new Date(); today.setHours(0,0,0,0);
+  const tstr=ymd(today);
+  const months=[];
+  for(let i=1;i>=0;i--){
+    const base=new Date(today.getFullYear(), today.getMonth()-i, 1);
+    months.push(base);
+  }
+  box.innerHTML=months.map(base=>{
+    const y=base.getFullYear(), m=base.getMonth();
+    const first=new Date(y,m,1), days=new Date(y,m+1,0).getDate();
+    const lead=first.getDay();                       /* 周日开头 */
+    const cells=[];
+    for(let i=0;i<lead;i++) cells.push('<span></span>');
+    for(let d=1;d<=days;d++){
+      const cur=new Date(y,m,d), s=ymd(cur);
+      const isEdge=(s===cStart||s===cEnd);
+      const inR=(cStart&&cEnd&&s>cStart&&s<cEnd);
+      const cls=['rs-day',isEdge?'edge':'',inR?'in-range':'',s===tstr?'today':'']
+                  .filter(Boolean).join(' ');
+      const label=cur.getFullYear()+'年'+(m+1)+'月'+d+'日';
+      cells.push(`<button type="button" class="${cls}" data-d="${s}" aria-label="${label}"
+                   ${isEdge?'aria-current="date"':''}>${d}</button>`);
+    }
+    return `<div class="rs-month"><div class="rs-mtitle">${y}年${m+1}月</div>
+      <div class="rs-grid">${['日','一','二','三','四','五','六'].map(x=>`<span class="rs-dow">${x}</span>`).join('')}
+      ${cells.join('')}</div></div>`;
+  }).join('');
+  const hint=$('rsCalHint');
+  if(hint) hint.textContent=(cStart&&cEnd)?(cStart+' ~ '+cEnd)
+                                         :(cStart?'再点结束日期':'选择起止日期');
+}
+
+function openRangeSel(open){
+  const sel=$('rangeSel'), pop=$('rsPop'), trig=$('rsTrigger');
+  if(!sel||!pop) return;
+  sel.dataset.open=open?'1':'0';
+  pop.hidden=!open;
+  if(trig) trig.setAttribute('aria-expanded',open?'true':'false');
+  if(open){ buildRangeList(); renderCal(); }
+}
+
+async function applyRange(){
+  const v=$('rsVal'); if(v) v.textContent=rangeText();
+  await loadAll();
+}
+
+function bindRangeSel(){
+  const sel=$('rangeSel'), trig=$('rsTrigger'), list=$('rsList'),
+        pop=$('rsPop'), cal=$('rsCal');
+  if(!sel||!trig) return;
+
+  trig.addEventListener('click',e=>{
+    e.stopPropagation();
+    openRangeSel(sel.dataset.open!=='1');
+  });
+
+  /* 预设 */
+  list.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-r]'); if(!b) return;
+    /* 必须挡住冒泡：否则会走到下面 document 的"点外部关闭"，
+       刚展开的日历会被立刻收掉（踩过：点「自定义」后整个弹层消失）。 */
+    e.stopPropagation();
+    const k=b.dataset.r;
+    if(k==='custom'){
+      cal.hidden=false;                 /* 展开日历，先不应用 */
+      buildRangeList();
+      renderCal();
+      $('rsList').querySelectorAll('button').forEach(x=>
+        x.setAttribute('aria-selected', x.dataset.r==='custom'?'true':'false'));
+      return;
+    }
+    range=k; cStart=cEnd=null; cal.hidden=true;
+    openRangeSel(false); applyRange();
+  });
+
+  /* 日历：第一次点=起点，第二次点=终点（顺序反了自动交换），选满即应用 */
+  cal.addEventListener('click',e=>{
+    const b=e.target.closest('button[data-d]'); if(!b) return;
+    e.stopPropagation();                 /* 同上：别被"点外部关闭"收掉 */
+    const s=b.dataset.d;
+    if(cStart&&cEnd){ cStart=s; cEnd=null; }
+    else if(!cStart){ cStart=s; }
+    else { if(s<cStart){ cEnd=cStart; cStart=s; } else { cEnd=s; } }
+    range='custom';
+    renderCal();
+    if(cStart&&cEnd){ openRangeSel(false); applyRange(); }
+  });
+
+  $('rsCalClear').addEventListener('click',e=>{
+    e.stopPropagation();
+    cStart=cEnd=null; range='today'; cal.hidden=true;
+    openRangeSel(false); applyRange();
+  });
+
+  /* 点外面 / Esc 关闭 */
+  document.addEventListener('click',e=>{
+    if(sel.dataset.open==='1' && !sel.contains(e.target)) openRangeSel(false);
+  });
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape' && sel.dataset.open==='1'){ openRangeSel(false); trig.focus(); }
+  });
+}
+
+/* rangeLabel：给各处小标题显示当前口径 */
+function rangeLabel(r){ return r===range ? rangeText() : (RS_PRESETS.find(x=>x[0]===r)||[, '全部'])[1]; }
+/* 当前视图是否用「积分」口径：Codex 之类按 token 计费的来源，积分恒为 0，
+   相关卡片/图表要改看 Token，不能显示 0 误导。
+   「全部」= 混合口径：积分只存在于 WorkBuddy 一家，汇总下别家恒为 0
+   （模型分布只剩一家的 0.00 分）—— Token 才是所有 agent 的公共分母，
+   所以选「全部」一律按 Token 口径（2026-09-29 用户定稿）。 */
 function hasCredit(){
-  if(agent==='all') return true;
+  if(agent==='all') return false;
   const a=AGENTS.find(x=>x.agent===agent);
   return a? !!a.has_credit : true;
 }
@@ -1114,29 +1343,48 @@ async function loadRegistry(){
     });
   });
 }
+document.addEventListener('DOMContentLoaded',bindRangeSel);
+
 async function loadAll(){
-  const [agents,kpi,daily,models,projects,clients,tops,sessions,health]=await Promise.all([
-    api('/api/agents'),
-    api('/api/kpi?days='+range+aq()),
-    api('/api/daily?days='+range+aq()),
-    api('/api/models?days='+range+aq()),
-    api('/api/projects'+'?agent='+encodeURIComponent(agent)),
-    api('/api/clients'+'?agent='+encodeURIComponent(agent)),
-    api('/api/tops'+'?agent='+encodeURIComponent(agent)),
-    api('/api/sessions'),
-    api('/api/health')]);
-  AGENTS=agents; buildAgentChips();
-  SESS_META={}; sessions.forEach(s=>SESS_META[s.session_id]={title:s.title,project:s.project});
-  TOPS=tops; MODELS=models; PROJECTS=projects; CLIENTS=clients;
-  renderKpi(kpi);
-  renderRangeCharts(daily);
+  /* 每个请求各自兜底：任一接口挂了就返回 null，不让整个 Promise.all 一起 reject。
+     原来一个 502（比如 /api/daily 收到没认出来的 days）就会让下面所有 render 都不执行，
+     表现是"点了没反应"，而页面上一点提示都没有 —— 排查成本极高。 */
+  const safe=p=>p.catch(err=>{ console.warn('[dashboard] 接口失败：',err); return null; });
+  const [agents,agentsR,kpi,daily,models,projects,clients,tops,sessions,health]=await Promise.all([
+    safe(api('/api/agents')),                                  /* 全量：agent 筛选按钮组 */
+    safe(api('/api/agents?days='+encodeURIComponent(rangeParam())+aq())),  /* 区间：对比图 */
+    safe(api('/api/kpi?days='+encodeURIComponent(rangeParam())+aq())),
+    /* 单日口径要**小时**粒度（横轴 00:00–24:00）；其余区间仍按天。
+       gran 变化不影响其它接口，也不复用按天的缓存（后端缓存 key 带了 gran）。 */
+    safe(api('/api/daily?days='+encodeURIComponent(rangeParam())+aq()
+             +(isSingleDayRange()?'&gran=hour':''))),
+    safe(api('/api/models?days='+encodeURIComponent(rangeParam())+aq())),
+    /* 这三张也要跟时间维度走 —— 否则旁边的卡片在变、它们不动，很割裂 */
+    safe(api('/api/projects'+'?days='+encodeURIComponent(rangeParam())+aq())),
+    safe(api('/api/clients'+'?days='+encodeURIComponent(rangeParam())+aq())),
+    safe(api('/api/tops'+'?days='+encodeURIComponent(rangeParam())+aq())),
+    safe(api('/api/sessions')),
+    safe(api('/api/health'))]);
+  /* ⚠️ api() 内部已经 `return j.data` —— 这里拿到的就是 data 本身，
+     别再写 `.data`（写错的话每个 if 都不成立，等于所有卡片都不刷新）。 */
+  if(agents){ AGENTS=agents||[]; buildAgentChips(); }
+  AGENTS_RANGE=agentsR||null;        /* null = 这次没拿到，对比图保留旧图 */
+  if(sessions){ SESS_META={}; sessions.forEach(s=>SESS_META[s.session_id]={title:s.title,project:s.project}); }
+  if(tops){ TOPS=tops||[]; renderTop(); refreshSortArrows(); }
+  if(models){ MODELS=models||[]; }
+  if(projects){ PROJECTS=projects||[]; }
+  if(clients){ CLIENTS=clients||[]; }
+  if(kpi) renderKpi(kpi);
+  if(daily) renderRangeCharts(daily);
   renderModelChart();
   renderStaticCharts();
   renderAgentCompare();
-  renderTop();
   refreshSortArrows();
-  $('lastCollect').textContent='最后采集 '+health.last_collect;
-  $('segRange').dataset.applied=range;
+  /* 这个位置平时保持空白（CSS 的 :empty 会整块收起）；
+     只在出错/重建时才有话说 —— 「最后采集 xx」也属于不需要常驻的信息。 */
+  $('lastCollect').textContent='';
+  const _rv=$('rsVal');              /* 下拉按钮上同步当前口径 */
+  if(_rv) _rv.textContent=rangeText();
 }
 
 /* ===== KPI（古见风：5 卡片，每个左侧 4px 彩条 + 右下小图标） ===== */
@@ -1166,14 +1414,26 @@ function renderKpi(k){
     k5:'<svg viewBox="0 0 60 60"><g transform="translate(30,30)" fill="#E89AAE"><ellipse cx="0" cy="-13" rx="7" ry="11"/><ellipse cx="0" cy="-13" rx="7" ry="11" transform="rotate(72)"/><ellipse cx="0" cy="-13" rx="7" ry="11" transform="rotate(144)"/><ellipse cx="0" cy="-13" rx="7" ry="11" transform="rotate(216)"/><ellipse cx="0" cy="-13" rx="7" ry="11" transform="rotate(288)"/><circle cx="0" cy="0" r="6" fill="#D4B6E0"/></g></svg>',
   };
   /* 卡片前缀跟随当前区间：原来选"近 7 天"却写"总积分"，口径与文案不符 */
-  const pf = today ? '今日' : (range==='all' ? '总' : '近'+range+'天');
+  /* 卡片前缀：today→今日、all→总、其余直接用口径名（昨天 / 近 7 天 / 本月 / 上月 / 09-14~09-28）。
+     原来写的是 `'近'+range+'天'`，只对纯数字口径成立 ——
+     选「昨天」会拼出「近yesterday天积分」这种鬼话（2026-09-28 修）。 */
+  const pf = today ? '今日' : (range==='all' ? '总' : rangeText());
   const items=[
-    /* 积分卡片：无积分口径的 agent（如 Codex）显示「—」而不是 0，避免误导 */
-    hasCredit()
-      ? {cls:'k1', lab:pf+'积分', v:FMT2(k.total_credit),
-         sub:today?per(k.total_credit,k.total_turns,2):'今日 '+FMT2(k.today_credit), icon:ICONS.k1, wm:WM.k1}
-      : {cls:'k1', lab:pf+'积分', v:'—',
-         sub:agentLabel()+' 无积分口径（按 Token 计费）', icon:ICONS.k1, wm:WM.k1},
+    /* 第一张卡三态（2026-09-29）：全部=混合口径，积分只反映 WorkBuddy 一家——
+       改看 Token 效率（平均每轮 Token）；单选积分制 agent → 积分卡；
+       单选非积分 agent（Codex）→ 中性「计费方式」说明卡。 */
+    agent==='all'
+      ? {cls:'k1', lab:pf+'Token / 轮次',
+         v:k.total_turns?fmtCN(Math.round(k.total_tokens/k.total_turns)):'0',
+         sub:'平均每轮 Token 消耗（混合口径按 Token）', icon:ICONS.k2, wm:WM.k2}
+      : hasCredit()
+        ? {cls:'k1', lab:pf+'积分', v:FMT2(k.total_credit),
+           sub:today?per(k.total_credit,k.total_turns,2):'今日 '+FMT2(k.today_credit), icon:ICONS.k1, wm:WM.k1}
+        /* 无积分口径的来源（Codex 这类按 Token 计费）：不摆一张写满「—」和
+           「无积分口径」的否定式卡片 —— 改成中性的「计费方式」说明卡，
+           信息是正向的（按 Token 计费），视觉上也还是一张正常的卡。 */
+        : {cls:'k2', lab:'计费方式', v:'Token',
+           sub:agentLabel()+' 按 Token 计费，不折算积分', icon:ICONS.k2, wm:WM.k2},
     {cls:'k2', lab:pf+' Token', v:FMT(k.total_tokens),
       sub:today?per(k.total_tokens,k.total_turns,0):'今日 '+FMT(k.today_tokens),
       tip:'缓存命中: '+FMT(k.total_cached_tokens)+'&#10;缓存未命中: '+FMT(k.total_miss_tokens)+'&#10;输出: '+FMT(k.total_completion_tokens),
@@ -1196,10 +1456,28 @@ function renderKpi(k){
 
 /* ===== 范围相关图表（日趋势 + 命中率） ===== */
 function renderRangeCharts(daily){
-  const d=daily, lab=d.map(x=>x.day.slice(5));
-  const single = d.length < 2;   /* 今天（或空数据）= 单点视图 */
+  const d=daily||[];
+  /* 单日口径（今天/昨天/自定义里的一天）后端改按**小时**分桶
+     （/api/daily?gran=hour）→ 横轴按 00:00–24:00 铺满一天。
+     这里按**数据**判断（带 hour 字段即小时粒度），不依赖前端 range 状态，
+     免得两处口径各说各话。 */
+  const hourly = !!(d.length && d[0].hour!==undefined);
+  /* 末位补一个"只有刻度、没有数据"的空桶，让横轴真的走到 24:00。
+     数值留 null → 折线/柱子在 24:00 不落点（若补 0 会看着像末尾暴跌）。 */
+  const rows = hourly
+    ? d.concat([{hour:'24', day:(d[d.length-1]||{}).day||'', pad:true}])
+    : d;
+  const lab = hourly ? rows.map(x=>x.hour+':00') : d.map(x=>x.day.slice(5));
+  const num = (x,f)=>(x==null?null:f(x));      /* null 透传：空小时不落点 */
+  const single = d.length < 2;    /* 单点视图（今天没数据 / 空数据） */
+  const oneDay = hourly || single;/* 单日口径：日均参考线恒等于当日，画出来只是叠一条虚线 */
   const avgTokens = d.length ? d.reduce((s,x)=>s+x.total_tokens,0)/d.length : 0;
   const avgCredit = d.length ? d.reduce((s,x)=>s+x.credit,0)/d.length : 0;
+  /* 小时粒度下 tooltip 标题带上日期（否则只写 13:00，跨天自定义时看不出去哪天） */
+  const ttitle=(items)=>{
+    const row=rows[items[0].dataIndex];
+    return (hourly && row && row.day) ? (row.day.slice(5)+' '+row.hour+':00') : items[0].label;
+  };
   /* 日趋势：积分柱（领结红） + Token 线（绿色）。
      两点以上才补"日均"参考虚线——单日时日均恒等于当日，虚线没信息量还会压住数据；
      折线在单点下必须给 pointRadius，否则没有线段、点也看不见，整条线会"消失"。
@@ -1209,49 +1487,52 @@ function renderRangeCharts(daily){
   if(h3t) h3t.childNodes[0].nodeValue='日趋势 · '+(cr?'积分 / Token':'Token')+' ';
   const trendDs=[];
   if(cr) trendDs.push(
-    {type:'bar',label:'积分',data:d.map(x=>x.credit),backgroundColor:'rgba(180,54,79,.55)',yAxisID:'y',order:3,borderRadius:4,borderSkipped:false,maxBarThickness:72});
+    {type:'bar',label:'积分',data:rows.map(x=>num(x.credit,v=>v)),backgroundColor:'rgba(180,54,79,.55)',yAxisID:'y',order:3,borderRadius:4,borderSkipped:false,maxBarThickness:72});
   trendDs.push(
-    {type:'line',label:'Tokens(万)',data:d.map(x=>+(x.total_tokens/1e4).toFixed(0)),
+    {type:'line',label:'Tokens(万)',data:rows.map(x=>num(x.total_tokens,v=>+(v/1e4).toFixed(0))),
       borderColor:C.green,backgroundColor:C.green,yAxisID:'y1',tension:.3,order:2,
-      pointRadius:single?4:0,pointBackgroundColor:C.green,pointBorderColor:'#fff',pointBorderWidth:1.5,borderWidth:2.2});
-  if(!single){
+      pointRadius:hourly?2.5:(single?4:0),pointBackgroundColor:C.green,pointBorderColor:'#fff',pointBorderWidth:1.5,borderWidth:2.2});
+  if(!oneDay){
     trendDs.push(
-      {type:'line',label:'日均Tokens',data:d.map(()=>+(avgTokens/1e4).toFixed(0)),
+      {type:'line',label:'日均Tokens',data:rows.map(()=>+(avgTokens/1e4).toFixed(0)),
         borderColor:C.violet,borderDash:[6,4],borderWidth:1.5,pointRadius:0,order:1,yAxisID:'y1'});
     if(cr) trendDs.push(
-      {type:'line',label:'日均积分',data:d.map(()=>+avgCredit.toFixed(1)),
+      {type:'line',label:'日均积分',data:rows.map(()=>+avgCredit.toFixed(1)),
         borderColor:C.crimsonD,borderDash:[6,4],borderWidth:1.5,pointRadius:0,order:1,yAxisID:'y'});
   }
+  /* 小时粒度：横轴按整点排（Chart.js 自己按宽度疏化标签，但**首尾一定保留**，
+     所以 00:00 与 24:00 都看得见） */
+  const xTicks = hourly ? {autoSkip:true,maxRotation:0,maxTicksLimit:25} : {};
   mkChart('cTrend',{type:'bar',data:{labels:lab,datasets:trendDs},options:{responsive:true,maintainAspectRatio:false,
     interaction:{mode:'index',intersect:false},
     plugins:{legend:{labels:{filter:(item)=>item.text!=='日均Tokens'&&item.text!=='日均积分',color:C.ink2,boxWidth:12,font:{size:11}}},
       tooltip:{mode:'index',intersect:false,backgroundColor:'rgba(255,255,255,.96)',titleColor:C.ink,bodyColor:C.ink,borderColor:C.line2,borderWidth:1,
-        callbacks:{title:(items)=>items[0].label,
+        callbacks:{title:ttitle,
           label:()=>null,
           afterBody:(items)=>{
-            const d=daily[items[0].dataIndex];
-            if(!d)return[];
-            const rows=[];
+            const row=rows[items[0].dataIndex];
+            if(!row||row.pad)return[];        /* 24:00 那个空刻度没有数据 */
+            const rowsOut=[];
             if(cr){
-              rows.push(`积分: ${FMT2(d.credit)}`);
-              if(!single) rows.push(`日均积分: ${FMT2(avgCredit)}`);
+              rowsOut.push(`积分: ${FMT2(row.credit)}`);
+              if(!oneDay) rowsOut.push(`日均积分: ${FMT2(avgCredit)}`);
             }
-            rows.push(`Tokens: ${(d.total_tokens/1e4).toFixed(0)}万`);
-            if(!single) rows.push(`日均Tokens: ${(avgTokens/1e4).toFixed(0)}万`);
-            rows.push(' ',
-              `缓存命中: ${FMT(d.cached_tokens)}`,
-              `缓存未命中: ${FMT(d.miss_tokens)}`,
-              `输出: ${FMT(d.completion_tokens)}`);
-            return rows;
+            rowsOut.push(`Tokens: ${(row.total_tokens/1e4).toFixed(0)}万`);
+            if(!oneDay) rowsOut.push(`日均Tokens: ${(avgTokens/1e4).toFixed(0)}万`);
+            rowsOut.push(' ',
+              `缓存命中: ${FMT(row.cached_tokens)}`,
+              `缓存未命中: ${FMT(row.miss_tokens)}`,
+              `输出: ${FMT(row.completion_tokens)}`);
+            return rowsOut;
           }}}}},
-    scales:{x:{ticks:{color:C.ink2,font:{size:10}},grid:{color:C.line}},
+    scales:{x:{ticks:Object.assign({color:C.ink2,font:{size:10}},xTicks),grid:{color:C.line}},
       y:{type:'linear',position:'left',title:{display:true,text:'积分',color:C.ink2,font:{size:12,weight:'600'}},
         ticks:{color:C.ink2,font:{size:10}},grid:{color:C.line}},
       y1:{type:'linear',position:'right',title:{display:true,text:'Tokens(万)',color:C.green,font:{size:12,weight:'600'}},
         grid:{drawOnChartArea:false},
         ticks:{callback:v=>v.toLocaleString('zh-CN')+'万',color:C.green,font:{size:10}}}}}, true);
   applyTrendPostSet(CHARTS['cTrend'], cr);
-  /* 命中率趋势：樱花粉线 + 淡藤紫平均虚线 */
+  /* 命中率趋势：樱花粉线 + 淡藤紫平均虚线（单日不画平均线，理由同上） */
   const avgHit = (()=>{
     const vals=d.map(x=>x.cache_hit_rate).filter(v=>v!=null);
     return vals.length?vals.reduce((s,v)=>s+v,0)/vals.length:null;
@@ -1259,14 +1540,13 @@ function renderRangeCharts(daily){
   mkChart('cHit',{type:'line',data:{labels:lab,
     datasets:(()=>{
       const ds=[
-        {label:'命中率',data:d.map(x=>x.cache_hit_rate==null?null:+x.cache_hit_rate.toFixed(3)),
+        {label:'命中率',data:rows.map(x=>num(x.cache_hit_rate,v=>+v.toFixed(3))),
           borderColor:C.sakura,backgroundColor:C.sakura,tension:.3,spanGaps:true,borderWidth:2.2,
-          pointRadius:single?4:0,pointBackgroundColor:C.sakura,pointBorderColor:'#fff',pointBorderWidth:1.5,
+          pointRadius:hourly?2.5:(single?4:0),pointBackgroundColor:C.sakura,pointBorderColor:'#fff',pointBorderWidth:1.5,
           fill:true,fillColor:'rgba(232,154,174,.12)'},
       ];
-      /* 单点（今天）时"平均命中率"恒等于当日，画出来只是叠一条虚线，去掉 */
-      if(!single) ds.push(
-        {label:'平均命中率',data:d.map(()=>avgHit==null?null:+avgHit.toFixed(3)),
+      if(!oneDay) ds.push(
+        {label:'平均命中率',data:rows.map(()=>avgHit==null?null:+avgHit.toFixed(3)),
           borderColor:C.violet,borderDash:[6,4],borderWidth:1.5,pointRadius:0});
       return ds;
     })()},
@@ -1274,12 +1554,12 @@ function renderRangeCharts(daily){
       interaction:{mode:'index',intersect:false},
       plugins:{legend:{display:false},
         tooltip:{mode:'index',intersect:false,backgroundColor:'rgba(255,255,255,.96)',titleColor:C.ink,bodyColor:C.ink,borderColor:C.line2,borderWidth:1,
-          callbacks:{title:(items)=>items[0].label,
+          callbacks:{title:ttitle,
             label:(ctx)=>ctx.dataset.label==='平均命中率'
               ?` 平均命中率: ${(ctx.parsed.y*100).toFixed(1)}%`
               :` 命中率: ${(ctx.parsed.y*100).toFixed(1)}%`}}},
       scales:{y:{min:.5,max:1,ticks:{callback:v=>(v*100).toFixed(0)+'%',color:C.ink2,font:{size:10}},grid:{color:C.line}},
-        x:{ticks:{color:C.ink2,font:{size:10}},grid:{color:C.line}}}}});
+        x:{ticks:Object.assign({color:C.ink2,font:{size:10}},xTicks),grid:{color:C.line}}}}});
   /* 卡片标题上的区间标注：跟随当前区间，否则"日趋势/命中率趋势"看不出统计窗口 */
   const rl='('+rangeLabel(range)+')';
   const tl=$('trendRangeLabel'); if(tl) tl.textContent=rl;
@@ -1291,7 +1571,8 @@ function renderStaticCharts(){
   const cr=hasCredit();
   /* 项目：横向条形（古见制服蓝主色）；无积分口径时改画 Token */
   const h3p=document.querySelector('[data-page-node-id="hrlnoCad5gPKVDw5KRnX5E"]');
-  if(h3p) h3p.textContent='项目分布 · '+(cr?'积分':'Token')+'（'+agentLabel()+' · 可滚动）';
+  if(h3p) h3p.textContent='项目分布 · '+(cr?'积分':'Token')
+            +'（'+agentLabel()+' · '+rangeText()+' · 可滚动）';
   const pj=[...PROJECTS].sort((a,b)=>cr?(b.credit-a.credit):(b.total_tokens-a.total_tokens));
   $('projWrap').style.height=Math.max(200,pj.length*24+30)+'px';
   mkChart('cProject',{type:'bar',data:{labels:pj.map(x=>x.project),
@@ -1365,6 +1646,41 @@ function renderModelChart(){
         }}}}}});
 }
 
+/* 中文数字习惯：932万 / 1232万 / 7.5亿 / 164.4亿
+   规则：<1亿 → 取整「万」；≥1亿 → 一位小数「亿」（.0 去掉） */
+function fmtCN(n){
+  n=+n;
+  if(!isFinite(n)||n<=0) return '';
+  if(n>=1e8) return (n/1e8).toFixed(1).replace(/\.0$/,'')+'亿';
+  if(n>=1e4) return Math.round(n/1e4)+'万';
+  return String(Math.round(n));
+}
+/* 横向条形末端贴数值标签。
+   不引 chartjs-plugin-datalabels：项目只带本地 chart.umd.min.js（不联网），
+   自己画十来行更稳、也不会因为 CDN 挂了让整张图炸掉。
+   注册方式用「全局注册 + 内部自判 canvas id」—— 比往每个 config 里塞 plugins 数组
+   省事，也不会插错层级（options.plugins 是对象，plugins 数组在 config 顶层）。 */
+const barEndLabels={
+  id:'barEndLabels',
+  afterDatasetsDraw(c,a,opts){
+    if(!c.canvas||c.canvas.id!=='cAgent') return;   /* 只作用于「多 Agent 用量对比」 */
+    const meta=c.getDatasetMeta(0); if(!meta||!meta.data) return;
+    const ctx=c.ctx; ctx.save();
+    ctx.font='700 11.5px "Yu Gothic","Hiragino Kaku Gothic ProN","Microsoft YaHei",system-ui,sans-serif';
+    ctx.textBaseline='middle'; ctx.textAlign='left';
+    ctx.fillStyle=(opts&&opts.color)||'#2A2438';
+    meta.data.forEach((el,i)=>{
+      const raw=c.data.datasets[0].data[i];
+      /* 数据本身以「万」为单位存的，先还原成原始 token 数再格式化 */
+      const txt=fmtCN(raw*1e4);
+      if(txt) ctx.fillText(txt, el.x+8, el.y);
+    });
+    ctx.restore();
+  }
+};
+/* 全局注册：Chart.js 4 的插件可以注册一次、全图生效，插件内部自己挑图 */
+if(window.Chart&&Chart.register) Chart.register(barEndLabels);
+
 /* ===== 多 Agent 用量对比 =====
    跨数据源横向条形，**统一用 Token 作比较基准**——积分只有部分 agent 有
    （Codex 按 token 计费），拿积分对比是拿苹果比橘子。积分/轮次/调用放 tooltip。
@@ -1372,14 +1688,18 @@ function renderModelChart(){
    vs Codex 1134 万），线性轴下小的一方会被压成零宽、完全读不出。 */
 function renderAgentCompare(){
   const lbl=$('agentRangeLabel');
-  if(lbl) lbl.textContent='(全部时间 · Token · 对数轴)';
-  if(!AGENTS.length) return;
-  const ag=[...AGENTS].sort((a,b)=>b.total_tokens-a.total_tokens);
+  if(lbl) lbl.textContent='('+rangeText()+' · Token · 对数轴)';
+  /* 用**当前区间**的数据，而不是全量 AGENTS —— 否则标题写着「今天」、柱子还是全量数 */
+  const src_=AGENTS_RANGE!=null?AGENTS_RANGE:AGENTS;
+  if(!src_.length) return;
+  const ag=[...src_].sort((a,b)=>b.total_tokens-a.total_tokens);
   mkChart('cAgent',{type:'bar',data:{labels:ag.map(x=>x.label),
     datasets:[{label:'Token',data:ag.map(x=>Math.max(1,+((x.total_tokens/1e4).toFixed(0)))),
       backgroundColor:ag.map((_,i)=>C.palette[i%C.palette.length]),borderRadius:4,borderSkipped:false,
       categoryPercentage:.68,barPercentage:.8}]},
     options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      /* 右侧留出标签的位置（barEndLabels 画在条尾 +8px 处） */
+      layout:{padding:{right:62}},
       plugins:{legend:{display:false},
         tooltip:{backgroundColor:'rgba(255,255,255,.96)',titleColor:C.ink,bodyColor:C.ink,borderColor:C.line2,borderWidth:1,
           callbacks:{label:(ctx)=>{
@@ -1503,29 +1823,9 @@ async function openSession(sid){
 
 /* ===== 顶栏事件 ===== */
 let rangeSeq=0, rangeAbort=null;
-$('segRange').addEventListener('click',async e=>{
-  if(e.target.tagName!=='BUTTON')return;
-  document.querySelectorAll('#segRange button').forEach(b=>b.classList.remove('active'));
-  e.target.classList.add('active'); range=e.target.dataset.r;
-  const seq=++rangeSeq;
-  if(rangeAbort)rangeAbort.abort();
-  rangeAbort=new AbortController();
-  const t0=performance.now();
-  try{
-    const [kpi,daily,models]=await Promise.all([
-      api('/api/kpi?days='+range+aq(), rangeAbort.signal),
-      api('/api/daily?days='+range+aq(), rangeAbort.signal),
-      api('/api/models?days='+range+aq(), rangeAbort.signal)]);
-    if(seq!==rangeSeq)return;
-    MODELS=models;
-    renderKpi(kpi); renderRangeCharts(daily); renderModelChart();
-    $('segRange').dataset.applied=range;
-    $('lastCollect').textContent='切换 '+range+' 用时 '+(performance.now()-t0).toFixed(0)+'ms';
-  }catch(err){
-    if(err.name==='AbortError')return;
-    $('lastCollect').textContent='加载失败：'+err.message;
-  }
-});
+/* 旧的四按钮 segRange 绑定已删除（2026-09-28 换成下拉 + 日历）。
+   现在走 applyRange() → loadAll()：一次拉全部接口，比原来只拉 3 个多几个请求，
+   但本地 API 很快，换来的是"任何口径变更都不会漏刷新某张图"。 */
 /* agent 切换：重新拉全部接口（含 /api/agents 重建按钮组） */
 $('segAgent').addEventListener('click',async e=>{
   if(e.target.tagName!=='BUTTON') return;
@@ -1535,7 +1835,7 @@ $('segAgent').addEventListener('click',async e=>{
   const t0=performance.now();
   try{
     await loadAll();
-    $('lastCollect').textContent='切换到 '+agentLabel()+' 用时 '+(performance.now()-t0).toFixed(0)+'ms';
+    $('lastCollect').textContent='';      /* 不再播报切换耗时（开发者信息） */
   }catch(err){
     $('lastCollect').textContent='加载失败：'+err.message;
   }

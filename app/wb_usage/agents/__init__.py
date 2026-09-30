@@ -24,6 +24,9 @@ from .codex import CodexSource
 from .zcode import ZCodeSource
 from .deepseek_harness import DeepSeekHarnessSource
 from .ccusage import CcusageSource
+from .claude_code import ClaudeCodeSource
+from .opencode import OpenCodeSource
+from .qwen_code import QwenCodeSource
 
 # 注册表：越靠前越先采集（order 小的排前面）
 SOURCES = (
@@ -31,7 +34,10 @@ SOURCES = (
     ZCodeSource(),          # SQLite 库源（走 collect() 覆盖通道）
     DeepSeekHarnessSource(),  # zstd 压缩流源（走 collect() 覆盖通道）
     CodexSource(),          # jsonl 文件源
+    ClaudeCodeSource(),     # jsonl 文件源（本机未装时 available()=False 自动跳过）
     CcusageSource(),        # ccusage 覆盖面补充源（collect() 通道；无 Node 自动跳过）
+    OpenCodeSource(),       # SQLite 库源（走 collect() 覆盖通道）
+    QwenCodeSource(),       # 整文件 JSON 源（走 collect() 覆盖通道）
 )
 
 BY_KEY = {s.key: s for s in SOURCES}
@@ -60,7 +66,7 @@ __all__ = [
     "AgentSource", "CANONICAL_USAGE_FIELDS", "canonical_usage", "usage_json",
     "parse_ts_ms", "project_of_cwd",
     "WorkBuddySource", "CodexSource", "ZCodeSource", "DeepSeekHarnessSource",
-    "CcusageSource",
+    "CcusageSource", "ClaudeCodeSource", "OpenCodeSource", "QwenCodeSource",
     "SOURCES", "BY_KEY", "all_sources", "available_sources", "get_source",
     "source_keys",
 ]

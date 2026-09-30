@@ -572,8 +572,17 @@ def collect_once(db_path=None, sources=None, full=False, verbose=True):
 def watch_changes(db_path, sources=None, interval=5, verbose=True, on_change=None):
     """守护：每 interval 秒比对文件 stat 五元组（dev/inode/size/mtime_ns/ctime_ns），
     有变化即增量采集（覆盖/截断判定在 collect_once 内完成）。
-    on_change(db_path, inserted) 可选回调：采集到新数据后调用（VIEW 方案无需物化重建）。"""
+    on_change(db_path, inserted) 可选回调：采集到新数据后调用（VIEW 方案无需物化重建）。
+
+    库型源（覆盖 collect 的，如 ZCode）没有 jsonl 文件可 stat——靠 change_hint()
+    指纹感知变化；指纹不可用时由 FORCE_EVERY 轮的保底强制采集兜底。
+    （2026-09-28 事故：宿主会话静默后 jsonl 永不再变，ZCode 持续产生数据却
+    被饿死 30 分钟无人采集——库型源不能只搭文件源变化的顺风车。）
+    """
     sources = list(sources) if sources else agent_registry.available_sources()
+    lib_sources = [s for s in sources
+                   if type(s).collect is not agent_registry.AgentSource.collect]
+    FORCE_EVERY = 60                    # × interval 秒：保底强制采集周期
     conn = get_conn(db_path)
     known = {}
     for key in (k[0] for k in conn.execute(
@@ -590,13 +599,33 @@ def watch_changes(db_path, sources=None, interval=5, verbose=True, on_change=Non
     if verbose:
         print(f"[daemon] 监听 {', '.join(s.root() for s in sources)}，"
               f"每 {interval}s 检查变更（Ctrl+C 退出）")
+    hints = {}
+    rounds = 0
     while True:
         time.sleep(interval)
+        rounds += 1
+        changed = False
         try:
             cur = {p: st for p, (st, _src) in _stat_files(sources).items()}
-            changed = any(known.get(p) != st for p, st in cur.items())
+            if any(known.get(p) != st for p, st in cur.items()):
+                known = {p: st for p, st in cur.items()}
+                changed = True
+            if not changed:
+                # 库型源指纹轮询：毫秒级查询，变了才跑完整采集
+                for s in lib_sources:
+                    try:
+                        h = s.change_hint()
+                    except Exception:
+                        h = None
+                    if h is not None and hints.get(s.key) != h:
+                        hints[s.key] = h
+                        changed = True
+                        break
+            if not changed and rounds >= FORCE_EVERY:
+                changed = True          # 保底：库型采集幂等，重复跑无副作用
             if changed:
                 inserted, _ = collect_once(db_path, sources, verbose=verbose)
+                rounds = 0
                 if verbose and inserted:
                     print(f"[daemon] 检测到变更，新增 {inserted} 条")
                 if inserted and on_change:
@@ -604,7 +633,6 @@ def watch_changes(db_path, sources=None, interval=5, verbose=True, on_change=Non
                         on_change(db_path, inserted)
                     except Exception as e:
                         print(f"[daemon] on_change 失败（下轮重试）: {e}")
-                known = {p: st for p, st in cur.items()}
         except Exception as e:
             # 自愈：采集异常不杀死监听线程，下轮继续
             print(f"[daemon] 采集异常（自动继续）: {e}")
